@@ -1,0 +1,3441 @@
+#!/usr/bin/env python3
+"""
+Test suite for btc_5m_predictor.
+
+Covers the pure logic end to end, plus a full simulated trading session driven
+by a fake client, so the loop, sizing, settlement and risk limits are exercised
+without touching the network.
+
+    python3 -m unittest test_btc_5m -v
+"""
+
+from __future__ import annotations
+
+import os
+import random
+import tempfile
+import types
+import math
+import sys
+import unittest
+from dataclasses import replace
+from decimal import Decimal
+
+import btc_5m_predictor as m
+from btc_5m_predictor import (
+    Config, Journal, Position, PredictionClient, RiskManager, Round, Side,
+    Signal, TradingHalted, Trader, breakeven_probability,
+    digital_up_probability, evaluate, kelly_stake, settle_pnl, walk_book,
+)
+
+
+def build_trader(client, config, db_path):
+    """
+    Construct a Trader without running __init__ (which does network I/O).
+
+    Mirrors __init__ by reflection rather than by a hand-copied attribute
+    list: five helpers each duplicated that list, so adding one field to
+    Trader broke eleven tests at once. Anything __init__ sets that is not
+    supplied here is initialised to a matching empty value.
+    """
+    t = Trader.__new__(Trader)
+    t._cfg = config
+    t._client = client
+    t._vol = types.SimpleNamespace(sigma_annual=lambda *a: 0.5,
+                                   tail_df=lambda *a: None,
+                                   is_clamped=lambda *a: False,
+                                   raw_sigma=lambda *a: 0.5)
+    t._journal = Journal(db_path, getattr(config, "profile_name", "test"))
+    t._paper_bankroll = config.paper_start_bankroll
+    t._risk = RiskManager(config, config.paper_start_bankroll)
+    t._position = None
+
+    # Fill in everything else __init__ would have set.
+    import ast as _ast, inspect as _inspect, textwrap as _tw
+    src = _tw.dedent(_inspect.getsource(Trader.__init__))
+    for node in _ast.walk(_ast.parse(src)):
+        if not isinstance(node, (_ast.Assign, _ast.AnnAssign)):
+            continue
+        targets = node.targets if isinstance(node, _ast.Assign) else [node.target]
+        for tgt in targets:
+            if not (isinstance(tgt, _ast.Attribute)
+                    and isinstance(tgt.value, _ast.Name)
+                    and tgt.value.id == "self"):
+                continue
+            if hasattr(t, tgt.attr):
+                continue
+            expr = _ast.unparse(node.value) if node.value else "None"
+            if expr.startswith("{"):
+                setattr(t, tgt.attr, {})
+            elif expr.startswith("["):
+                setattr(t, tgt.attr, [])
+            elif expr in ("False", "True"):
+                setattr(t, tgt.attr, expr == "True")
+            elif expr == "None":
+                setattr(t, tgt.attr, None)
+            else:
+                try:
+                    setattr(t, tgt.attr, _ast.literal_eval(expr))
+                except (ValueError, SyntaxError):
+                    setattr(t, tgt.attr, None)
+    return t
+
+
+def cfg(**kw) -> Config:
+    """Balanced profile by default: most legacy tests assume a wide book."""
+    base = dict(api_key="k", api_secret="s", **m.PROFILES["balanced"])
+    base.update(kw)
+    return Config(**base)
+
+
+def convex_cfg(**kw) -> Config:
+    base = dict(api_key="k", api_secret="s", **m.PROFILES["convex"])
+    base.update(kw)
+    return Config(**base)
+
+
+def make_round(**kw) -> Round:
+    base = dict(topic_id=1, market_id=9, vendor="PREDICT_FUN", slug="btc-5m",
+                start_ms=1_700_000_000_000,
+                end_ms=1_700_000_000_000 + (m.DEFAULT_ROUND_SECONDS * 1000),
+                up_token_id="1", down_token_id="2",
+                up_quote=0.50, down_quote=0.50, fee_bps=200,
+                chain_id="56", collateral="USDT", venue_slippage_bps=1200,
+                decimal_precision=4, liquidity=100_000.0,
+                strike=100_000.0, feed_symbol="BTCUSDT")
+    base.update(kw)
+    return Round(**base)
+
+
+# --------------------------------------------------------------------------
+
+
+class TestDigitalPricing(unittest.TestCase):
+
+    def test_at_the_money_is_a_coinflip(self):
+        p = digital_up_probability(100_000, 100_000, 0.5, 60)
+        self.assertAlmostEqual(p, 0.5, places=9)
+
+    def test_deep_in_the_money_approaches_one(self):
+        p = digital_up_probability(101_000, 100_000, 0.5, 5)
+        self.assertGreater(p, 0.999)
+
+    def test_symmetry_up_and_down(self):
+        up = digital_up_probability(100_500, 100_000, 0.6, 90)
+        down = digital_up_probability(100_000, 100_500, 0.6, 90)
+        self.assertAlmostEqual(up + down, 1.0, places=9)
+
+    def test_probability_decays_toward_coinflip_as_time_grows(self):
+        near = digital_up_probability(100_200, 100_000, 0.5, 10)
+        far = digital_up_probability(100_200, 100_000, 0.5, 300)
+        self.assertGreater(near, far)
+        self.assertGreater(far, 0.5)
+
+    def test_expiry_is_deterministic(self):
+        self.assertEqual(digital_up_probability(100_001, 100_000, 0.5, 0), 1.0)
+        self.assertEqual(digital_up_probability(99_999, 100_000, 0.5, 0), 0.0)
+        self.assertEqual(digital_up_probability(100_000, 100_000, 0.5, -5), 0.0)
+
+    def test_always_a_valid_probability(self):
+        rng = random.Random(7)
+        for _ in range(2000):
+            spot = rng.uniform(50_000, 150_000)
+            strike = rng.uniform(50_000, 150_000)
+            p = digital_up_probability(spot, strike, rng.uniform(0.1, 3.0),
+                                       rng.uniform(0, 300))
+            self.assertTrue(0.0 <= p <= 1.0)
+
+    def test_rejects_invalid_input(self):
+        for args in [(0, 100, 0.5, 60), (100, 0, 0.5, 60), (100, 100, 0, 60)]:
+            with self.assertRaises(ValueError):
+                digital_up_probability(*args)
+
+
+class TestBreakeven(unittest.TestCase):
+
+    def test_zero_fee_breakeven_is_the_price(self):
+        self.assertAlmostEqual(breakeven_probability(0.6, 0), 0.6, places=12)
+
+    def test_fee_raises_the_hurdle(self):
+        self.assertGreater(breakeven_probability(0.6, 200), 0.6)
+
+    def test_matches_zero_ev_by_construction(self):
+        """The returned probability must make expected value exactly zero."""
+        for price in (0.15, 0.35, 0.5, 0.72, 0.88):
+            q = breakeven_probability(price, 200)
+            ev = q * (1 - price) / price * 0.98 - (1 - q)
+            self.assertAlmostEqual(ev, 0.0, places=12)
+
+    def test_is_tighter_than_the_naive_approximation(self):
+        price = 0.6
+        naive = price + 0.02 * (1 - price)
+        self.assertLess(breakeven_probability(price, 200), naive)
+
+    def test_rejects_out_of_range(self):
+        for p in (0.0, 1.0, -0.1, 1.5):
+            with self.assertRaises(ValueError):
+                breakeven_probability(p, 200)
+
+
+class TestKelly(unittest.TestCase):
+
+    def test_no_bet_at_fair_price(self):
+        self.assertEqual(kelly_stake(1000, 0.60, 0.60, cfg()), 0.0)
+
+    def test_no_bet_when_negative_edge(self):
+        self.assertEqual(kelly_stake(1000, 0.40, 0.60, cfg()), 0.0)
+
+    def test_bets_when_underpriced(self):
+        self.assertGreater(kelly_stake(1000, 0.85, 0.60, cfg()), 0.0)
+
+    def test_respects_hard_cap(self):
+        c = cfg()
+        stake = kelly_stake(1000, 0.999, 0.10, c)
+        self.assertLessEqual(stake, 1000 * c.max_stake_pct + 1e-9)
+
+    def test_scales_with_edge(self):
+        small = kelly_stake(1000, 0.65, 0.60, cfg(max_stake_pct=0.25))
+        large = kelly_stake(1000, 0.80, 0.60, cfg(max_stake_pct=0.25))
+        self.assertGreater(large, small)
+
+    def test_fraction_reduces_size(self):
+        """Below the cap the ratio is exact; at the cap it is merely smaller."""
+        uncapped = dict(max_stake_pct=0.25)
+        full = kelly_stake(1000, 0.62, 0.60, cfg(kelly_fraction=1.0, **uncapped))
+        quarter = kelly_stake(1000, 0.62, 0.60,
+                              cfg(kelly_fraction=0.25, **uncapped))
+        self.assertAlmostEqual(quarter, full * 0.25, places=9)
+
+    def test_cap_binds_before_the_fraction(self):
+        capped_full = kelly_stake(1000, 0.80, 0.60,
+                                  cfg(kelly_fraction=1.0, max_stake_pct=0.25))
+        capped_quarter = kelly_stake(1000, 0.80, 0.60,
+                                     cfg(kelly_fraction=0.25,
+                                         max_stake_pct=0.25))
+        self.assertAlmostEqual(capped_full, 250.0, places=9)
+        self.assertLess(capped_quarter, capped_full)
+
+    def test_below_minimum_stake_returns_zero(self):
+        self.assertEqual(kelly_stake(5, 0.62, 0.60, cfg(min_stake_usdt=1.5)),
+                         0.0)
+
+    def test_zero_bankroll(self):
+        self.assertEqual(kelly_stake(0, 0.9, 0.5, cfg()), 0.0)
+
+    def test_never_risks_ruin_over_a_long_losing_streak(self):
+        """20 consecutive maximum-size losses must not wipe the account."""
+        c = cfg()
+        bankroll = 100.0
+        for _ in range(20):
+            stake = min(bankroll * c.max_stake_pct, bankroll)
+            bankroll -= stake
+        self.assertGreater(bankroll, 30.0)
+
+
+class TestWalkBook(unittest.TestCase):
+
+    def test_single_level_exact_price(self):
+        self.assertAlmostEqual(walk_book([(0.50, 1000)], 100.0), 0.50)
+
+    def test_multi_level_average_is_between_levels(self):
+        avg = walk_book([(0.50, 100), (0.60, 1000)], 100.0)
+        self.assertIsNotNone(avg)
+        self.assertGreater(avg, 0.50)
+        self.assertLess(avg, 0.60)
+
+    def test_average_is_worse_than_top_of_book(self):
+        top = 0.50
+        avg = walk_book([(0.50, 10), (0.55, 100), (0.70, 100)], 60.0)
+        self.assertGreater(avg, top)
+
+    def test_insufficient_depth_returns_none(self):
+        self.assertIsNone(walk_book([(0.50, 10)], 100.0))
+
+    def test_shares_reconcile_with_spend(self):
+        asks = [(0.40, 50), (0.45, 50), (0.50, 500)]
+        stake = 100.0
+        avg = walk_book(asks, stake)
+        self.assertAlmostEqual(stake / avg * avg, stake, places=9)
+
+    def test_ignores_malformed_levels(self):
+        avg = walk_book([(0.0, 100), (-1.0, 5), (0.50, 1000)], 100.0)
+        self.assertAlmostEqual(avg, 0.50)
+
+    def test_rejects_nonpositive_stake(self):
+        with self.assertRaises(ValueError):
+            walk_book([(0.5, 100)], 0.0)
+
+
+class TestSettlePnl(unittest.TestCase):
+
+    def test_loss_is_the_full_stake(self):
+        self.assertEqual(settle_pnl(10.0, 0.6, False, 200), -10.0)
+
+    def test_win_pays_net_odds_after_fee(self):
+        pnl = settle_pnl(10.0, 0.50, True, 200)
+        self.assertAlmostEqual(pnl, 10.0 * 1.0 * 0.98, places=9)
+
+    def test_high_price_wins_are_small(self):
+        self.assertLess(settle_pnl(100.0, 0.95, True, 200), 6.0)
+
+    def test_low_price_wins_are_large(self):
+        self.assertGreater(settle_pnl(100.0, 0.20, True, 200), 380.0)
+
+    def test_a_95pct_win_rate_at_095_is_barely_profitable(self):
+        """The core arithmetic: high win rate does not imply profit."""
+        wins = settle_pnl(100.0, 0.95, True, 200) * 19
+        loss = settle_pnl(100.0, 0.95, False, 200)
+        self.assertLess(wins + loss, 0.0)   # 19 wins, 1 loss -> net negative
+
+
+class TestParseRound(unittest.TestCase):
+
+    @staticmethod
+    def topic(**over) -> dict:
+        base = {
+            "marketTopicId": 4229564, "chartType": "CRYPTO_UP_DOWN",
+            "symbol": "BTCUSDT", "status": "REGISTERED",
+            "startDate": 1748131200000, "endDate": 1748131500000,
+            "slug": "btc-5m", "feeRateBps": 200, "variantData": None,
+            "vendor": "PREDICT_FUN", "chainId": "56", "collateral": "USDT",
+            "slippageBps": 1200,
+            "markets": [{"marketId": 5567895, "tradingStatus": "OPEN",
+                         "decimalPrecision": 4, "liquidity": "100000",
+                         "outcomes": [
+                             {"name": "YES", "price": "0.52", "tokenId": "1"},
+                             {"name": "NO", "price": "0.48", "tokenId": "2"}]}],
+        }
+        base.update(over)
+        return base
+
+    def test_parses_documented_payload_without_strike(self):
+        """Regression: null variantData must not reject the round."""
+        rnd = PredictionClient._parse_round(self.topic())
+        self.assertIsNotNone(rnd)
+        self.assertIsNone(rnd.strike)
+        self.assertEqual(rnd.up_quote, 0.52)
+        self.assertEqual(rnd.up_token_id, "1")
+
+    def test_uses_strike_when_present(self):
+        rnd = PredictionClient._parse_round(
+            self.topic(variantData={"startPrice": "100000.5",
+                                    "priceFeedSymbol": "BTCUSDT"}))
+        self.assertAlmostEqual(rnd.strike, 100000.5)
+        self.assertEqual(rnd.feed_symbol, "BTCUSDT")
+
+    def test_accepts_up_down_outcome_names(self):
+        t = self.topic()
+        t["markets"][0]["outcomes"] = [
+            {"name": "UP", "price": "0.52", "tokenId": "1"},
+            {"name": "DOWN", "price": "0.48", "tokenId": "2"}]
+        self.assertIsNotNone(PredictionClient._parse_round(t))
+
+    def test_rejects_wrong_symbol(self):
+        self.assertIsNone(PredictionClient._parse_round(
+            self.topic(symbol="ETHUSDT")))
+
+    def test_rejects_wrong_chart_type(self):
+        self.assertIsNone(PredictionClient._parse_round(
+            self.topic(chartType="FLAT")))
+
+    def test_rejects_wrong_duration(self):
+        self.assertIsNone(PredictionClient._parse_round(
+            self.topic(endDate=1748131200000 + 3_600_000)))
+
+    def test_rejects_closed_trading(self):
+        t = self.topic()
+        t["markets"][0]["tradingStatus"] = "CLOSED"
+        self.assertIsNone(PredictionClient._parse_round(t))
+
+    def test_rejects_out_of_range_prices(self):
+        t = self.topic()
+        t["markets"][0]["outcomes"][0]["price"] = "1.5"
+        self.assertIsNone(PredictionClient._parse_round(t))
+
+    def test_survives_garbage(self):
+        for bad in [{}, {"chartType": "CRYPTO_UP_DOWN"},
+                    self.topic(markets=[]), self.topic(startDate="abc"),
+                    self.topic(markets=[{"marketId": 1,
+                                         "tradingStatus": "OPEN"}])]:
+            self.assertIsNone(PredictionClient._parse_round(bad))
+
+
+class TestParseAsks(unittest.TestCase):
+
+    def test_array_shape(self):
+        got = PredictionClient._parse_asks(
+            {"asks": [["0.55", "100"], ["0.50", "50"]]})
+        self.assertEqual(got, [(0.50, 50.0), (0.55, 100.0)])
+
+    def test_dict_shape(self):
+        got = PredictionClient._parse_asks(
+            {"asks": [{"price": "0.6", "size": "10"}]})
+        self.assertEqual(got, [(0.6, 10.0)])
+
+    def test_nested_shape(self):
+        got = PredictionClient._parse_asks(
+            {"data": {"asks": [{"price": "0.4", "quantity": "5"}]}})
+        self.assertEqual(got, [(0.4, 5.0)])
+
+    def test_returns_sorted_ascending(self):
+        got = PredictionClient._parse_asks(
+            {"asks": [["0.9", "1"], ["0.1", "1"], ["0.5", "1"]]})
+        self.assertEqual([p for p, _ in got], [0.1, 0.5, 0.9])
+
+    def test_missing_or_empty(self):
+        self.assertIsNone(PredictionClient._parse_asks({}))
+        self.assertIsNone(PredictionClient._parse_asks({"asks": []}))
+        self.assertIsNone(PredictionClient._parse_asks({"asks": [["x", "y"]]}))
+
+
+class TestEvaluate(unittest.TestCase):
+
+    def setUp(self):
+        self.now = 1_700_000_000_000 + (m.DEFAULT_ROUND_SECONDS * 1000) - 60_000   # 60s left
+
+    def test_no_trade_without_strike(self):
+        rnd = make_round(strike=None)
+        self.assertIsNone(evaluate(rnd, 100_500, 0.5, 1000, self.now, cfg()))
+
+    def test_no_trade_outside_entry_window(self):
+        rnd = make_round()
+        too_early = rnd.end_ms - 280_000
+        self.assertIsNone(evaluate(rnd, 100_500, 0.5, 1000, too_early, cfg()))
+        too_late = rnd.end_ms - 5_000
+        self.assertIsNone(evaluate(rnd, 100_500, 0.5, 1000, too_late, cfg()))
+
+    def test_no_trade_at_fair_prices(self):
+        rnd = make_round(up_quote=0.5, down_quote=0.5)
+        self.assertIsNone(evaluate(rnd, 100_000, 0.5, 1000, self.now, cfg()))
+
+    def test_trades_when_book_is_underpriced(self):
+        rnd = make_round()
+        book = {Side.UP: [(0.55, 10_000)], Side.DOWN: [(0.90, 10_000)]}
+        sig = evaluate(rnd, 100_400, 0.5, 1000, self.now, cfg(), book)
+        self.assertIsNotNone(sig)
+        self.assertIs(sig.side, Side.UP)
+        self.assertGreater(sig.edge, cfg().min_edge)
+
+    def test_picks_the_higher_edge_side(self):
+        rnd = make_round()
+        book = {Side.UP: [(0.90, 10_000)], Side.DOWN: [(0.30, 10_000)]}
+        sig = evaluate(rnd, 99_600, 0.5, 1000, self.now, cfg(), book)
+        self.assertIsNotNone(sig)
+        self.assertIs(sig.side, Side.DOWN)
+
+    def test_fill_price_reflects_book_depth(self):
+        rnd = make_round()
+        thin = {Side.UP: [(0.55, 5), (0.65, 10_000)]}
+        deep = {Side.UP: [(0.55, 10_000)]}
+        s_thin = evaluate(rnd, 100_400, 0.5, 1000, self.now, cfg(), thin)
+        s_deep = evaluate(rnd, 100_400, 0.5, 1000, self.now, cfg(), deep)
+        self.assertIsNotNone(s_thin)
+        self.assertGreater(s_thin.fill_price, s_deep.fill_price)
+        self.assertLess(s_thin.edge, s_deep.edge)
+
+    def test_skips_when_depth_cannot_fill(self):
+        rnd = make_round()
+        book = {Side.UP: [(0.55, 0.5)]}      # ~0.27 USDT of depth
+        self.assertIsNone(
+            evaluate(rnd, 100_400, 0.5, 100_000, self.now, cfg(), book))
+
+    def test_refuses_prices_above_the_cap(self):
+        rnd = make_round()
+        book = {Side.UP: [(0.97, 10_000)]}
+        self.assertIsNone(
+            evaluate(rnd, 101_000, 0.5, 1000, self.now, cfg(), book))
+
+    def test_falls_back_to_haircut_quote_without_book(self):
+        rnd = make_round(up_quote=0.50, down_quote=0.50)
+        sig = evaluate(rnd, 100_600, 0.5, 1000, self.now, cfg(), None)
+        self.assertIsNotNone(sig)
+        self.assertAlmostEqual(sig.fill_price, 0.53, places=9)
+
+    def test_edge_is_measured_against_breakeven_not_raw_price(self):
+        rnd = make_round()
+        book = {Side.UP: [(0.55, 10_000)]}
+        sig = evaluate(rnd, 100_400, 0.5, 1000, self.now, cfg(), book)
+        expected = sig.model_prob - breakeven_probability(0.55, 200)
+        self.assertAlmostEqual(sig.edge, expected, places=12)
+
+    def test_stake_never_exceeds_cap(self):
+        rnd = make_round()
+        book = {Side.UP: [(0.20, 1_000_000)]}
+        sig = evaluate(rnd, 103_000, 0.5, 1000, self.now, cfg(), book)
+        self.assertIsNotNone(sig)
+        self.assertLessEqual(sig.stake_usdt, 1000 * cfg().max_stake_pct + 1e-9)
+
+    def test_is_pure(self):
+        rnd = make_round()
+        book = {Side.UP: [(0.55, 10_000)]}
+        before = (rnd, dict(book))
+        evaluate(rnd, 100_400, 0.5, 1000, self.now, cfg(), book)
+        self.assertEqual(before[0], rnd)
+        self.assertEqual(before[1], book)
+
+
+class TestRiskManager(unittest.TestCase):
+
+    def test_allows_trading_within_limits(self):
+        RiskManager(cfg(), 100.0).check(95.0)
+
+    def test_daily_loss_limit(self):
+        r = RiskManager(cfg(), 100.0)
+        with self.assertRaises(TradingHalted):
+            r.check(79.0)
+
+    def test_consecutive_losses(self):
+        r = RiskManager(cfg(max_consecutive_losses=3), 100.0)
+        for _ in range(3):
+            r.record_result(False)
+        with self.assertRaises(TradingHalted):
+            r.check(100.0)
+
+    def test_a_win_resets_the_streak(self):
+        r = RiskManager(cfg(max_consecutive_losses=3), 100.0)
+        r.record_result(False)
+        r.record_result(False)
+        r.record_result(True)
+        r.check(100.0)
+        self.assertEqual(r.consecutive_losses, 0)
+
+    def test_max_rounds(self):
+        r = RiskManager(cfg(max_rounds_per_day=2), 100.0)
+        for _ in range(2):
+            r.record_result(True)
+        with self.assertRaises(TradingHalted):
+            r.check(100.0)
+
+    def test_halt_is_sticky(self):
+        r = RiskManager(cfg(), 100.0)
+        with self.assertRaises(TradingHalted):
+            r.check(50.0)
+        with self.assertRaises(TradingHalted):
+            r.check(100.0)      # still halted even once bankroll recovers
+
+    def test_bankroll_floor(self):
+        r = RiskManager(cfg(daily_loss_limit_pct=0.99), 100.0)
+        with self.assertRaises(TradingHalted):
+            r.check(0.5)
+
+
+class TestConfigValidation(unittest.TestCase):
+
+    def test_rejects_bad_values(self):
+        bad = [dict(kelly_fraction=0), dict(kelly_fraction=1.5),
+               dict(max_stake_pct=0.9), dict(min_edge=0),
+               dict(entry_window_start_s=10, entry_window_end_s=20),
+               dict(min_entry_price=0.9, max_entry_price=0.5),
+               dict(api_key=""), dict(fee_bps=10_000)]
+        for kw in bad:
+            with self.subTest(**kw):
+                with self.assertRaises(ValueError):
+                    cfg(**kw)
+
+    def test_accepts_defaults(self):
+        self.assertIsInstance(cfg(), Config)
+
+
+# --------------------------------------------------------------------------
+# Simulated session
+# --------------------------------------------------------------------------
+
+
+class FakeClient:
+    """Deterministic stand-in for PredictionClient. No network."""
+
+    def __init__(self, rounds, spot_path, books, winners, balance=100.0):
+        self._rounds = rounds
+        self._spot_path = spot_path
+        self._books = books
+        self._winners = winners
+        self.balance = balance
+        self.orders = []
+        self.redeemed = []
+        self.redeem_fails = False
+        self.redeem_state = "PENDING"
+        self.t = 0
+
+    def sync_clock(self):
+        return 0
+
+    def now_ms(self):
+        return self._spot_path[min(self.t, len(self._spot_path) - 1)][0]
+
+    def market_symbol(self, feed_symbol):
+        return "BTCUSDT"
+
+    def spot_price(self, symbol="BTCUSDT"):
+        return self._spot_path[min(self.t, len(self._spot_path) - 1)][1]
+
+    def hydrate(self, rnd):
+        from dataclasses import replace as _r
+        if rnd.strike is not None:
+            return rnd
+        return _r(rnd, strike=self._spot_path[0][1], feed_symbol="BTCUSDT")
+
+    def settled_outcome(self, rnd):
+        w = self._winners.get(rnd.topic_id)
+        return None if w is None else (w, 0.0)
+
+    def final_price(self, rnd):
+        return self._spot_path[-1][1]
+
+    def balance_usdt(self):
+        return self.balance
+
+    def get_quote(self, rnd, side, stake):
+        return m.Quote("q1", 0.51, stake / 0.51, 0.001, 0.0)
+
+    def batch_redeem(self, token_ids, chain_id="56"):
+        self.redeemed.extend(token_ids)
+        if self.redeem_fails:
+            raise m.ApiError("redeem rejected")
+        return ["0xtx" + t for t in token_ids]
+
+    def redeem_status(self, tx_hash):
+        return self.redeem_state
+
+    def place_order(self, rnd, quote, stake_usdt=None):
+        self.orders.append((quote.quote_id, quote.average_price, stake_usdt))
+        return "order-1"
+
+    def list_rounds(self):
+        return list(self._rounds)
+
+    def asks_for(self, rnd, side):
+        return self._books.get((rnd.topic_id, side))
+
+    def resolved_winner(self, rnd):
+        return self._winners.get(rnd.topic_id)
+
+    def bankroll_usdt(self):
+        return self.balance
+
+    def place_market_buy(self, rnd, side, stake, max_price):
+        self.orders.append((rnd.topic_id, side, stake, max_price))
+        self.balance -= stake
+        return min(max_price, 0.55)
+
+
+class TestSimulatedSession(unittest.TestCase):
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _trader(self, client, **kw):
+        c = cfg(db_path=self.db, **kw)
+        return build_trader(client, c, self.db)
+
+    def test_enters_and_settles_a_winning_round(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0),
+                (start + (m.DEFAULT_ROUND_SECONDS * 1000) + 3_000, 100_400.0)]
+        books = {(1, Side.UP): [(0.55, 10_000)],
+                 (1, Side.DOWN): [(0.95, 10_000)]}
+        client = FakeClient([rnd], path, books, {})
+
+        t = self._trader(client)
+        client.t = 1                       # 60s left
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertIsNotNone(t._position)
+        self.assertIs(t._position.signal.side, Side.UP)
+        self.assertAlmostEqual(t._position.rnd.strike, 100_000.0)
+
+        client.t = 2                       # past resolution
+        client._winners[1] = Side.UP
+        t._settle_open()
+
+        self.assertIsNone(t._position)
+        self.assertGreater(t._paper_bankroll, 100.0)
+        self.assertEqual(t._risk.consecutive_losses, 0)
+
+    def test_settles_a_loss_and_debits_bankroll(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0),
+                (start + (m.DEFAULT_ROUND_SECONDS * 1000) + 3_000, 99_900.0)]
+        books = {(1, Side.UP): [(0.55, 10_000)]}
+        client = FakeClient([rnd], path, books, {})
+
+        t = self._trader(client)
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        staked = t._position.signal.stake_usdt
+
+        client.t = 2
+        client._winners[1] = Side.DOWN
+        t._settle_open()
+
+        self.assertAlmostEqual(t._paper_bankroll, 100.0 - staked, places=9)
+        self.assertEqual(t._risk.consecutive_losses, 1)
+
+    def test_only_one_position_at_a_time(self):
+        start = 1_700_000_000_000
+        r1 = make_round(topic_id=1, strike=None, start_ms=start,
+                        end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        r2 = make_round(topic_id=2, market_id=10, strike=None,
+                        start_ms=start, end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0)]
+        books = {(1, Side.UP): [(0.55, 10_000)],
+                 (2, Side.UP): [(0.55, 10_000)]}
+        client = FakeClient([r1, r2], path, books, {})
+
+        t = self._trader(client)
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        first = t._position.rnd.topic_id
+        t._maybe_enter(100.0, "PAPER")      # must not replace the open one
+        self.assertEqual(t._position.rnd.topic_id, first)
+
+    def test_does_not_reenter_the_same_round(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0),
+                (start + (m.DEFAULT_ROUND_SECONDS * 1000) + 3_000, 100_400.0)]
+        books = {(1, Side.UP): [(0.55, 10_000)]}
+        client = FakeClient([rnd], path, books, {1: Side.UP})
+
+        t = self._trader(client)
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        client.t = 2
+        t._settle_open()
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIsNone(t._position)
+
+    def test_waits_when_settlement_data_is_unavailable(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0),
+                (start + (m.DEFAULT_ROUND_SECONDS * 1000) + 3_000, 100_400.0)]
+        books = {(1, Side.UP): [(0.55, 10_000)]}
+        client = FakeClient([rnd], path, books, {})
+
+        t = self._trader(client)
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIsNotNone(t._position)
+
+        client.final_price = lambda rnd: None   # venue has not resolved yet
+        client.t = 2
+        t._settle_open()
+        self.assertIsNotNone(t._position)    # held, not silently dropped
+
+    def test_live_mode_records_the_actual_fill(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0)]
+        books = {(1, Side.UP): [(0.50, 10_000)]}
+        client = FakeClient([rnd], path, books, {})
+
+        t = self._trader(client, live=True)
+        client.t = 1
+        t._maybe_enter(100.0, "LIVE")
+        self.assertEqual(len(client.orders), 1)
+        self.assertAlmostEqual(t._position.signal.fill_price, 0.51, places=9)
+
+    def test_long_run_never_goes_bankrupt(self):
+        """500 rounds where the model is pure noise: capped, not wiped out."""
+        rng = random.Random(11)
+        c = cfg()
+        bankroll = 100.0
+        for _ in range(500):
+            stake = kelly_stake(bankroll, 0.70, 0.55, c)
+            if stake <= 0:
+                break
+            won = rng.random() < 0.55       # model overstates by 15 points
+            bankroll += settle_pnl(stake, 0.55, won, c.fee_bps)
+            if bankroll < c.min_stake_usdt:
+                break
+        self.assertGreater(bankroll, 0.0)
+
+    def test_prunes_stale_state(self):
+        client = FakeClient([], [(0, 100_000.0)], {}, {})
+        t = self._trader(client)
+        t._seen = {1: 1_000, 2: 10_000_000_000}
+        t._hydrated = {}
+        t._prune(10_000_000_000)
+        self.assertNotIn(1, t._seen)
+        self.assertIn(2, t._seen)
+
+
+class TestWeiUnits(unittest.TestCase):
+    """Amounts are 18-decimal wei; float maths here loses money."""
+
+    def test_one_usdt(self):
+        self.assertEqual(m.to_wei(1), "1000000000000000000")
+
+    def test_fractional(self):
+        self.assertEqual(m.to_wei(1.5), "1500000000000000000")
+
+    def test_round_trip(self):
+        for v in ("0.01", "1.5", "37.42", "1234.567891"):
+            self.assertEqual(m.from_wei(m.to_wei(v)), Decimal(v))
+
+    def test_truncates_never_inflates(self):
+        """Must never round up past the available balance."""
+        self.assertEqual(m.to_wei("1.0000000000000000009"),
+                         "1000000000000000000")
+
+    def test_no_float_drift(self):
+        """0.1+0.2 style error would produce a wrong wei integer."""
+        self.assertEqual(m.to_wei("0.3"), "300000000000000000")
+
+    def test_rejects_nonpositive(self):
+        for v in (0, -1):
+            with self.assertRaises(ValueError):
+                m.to_wei(v)
+
+
+class TestVariantParsing(unittest.TestCase):
+    """The strike is startPrice, and the feed is the venue's own oracle."""
+
+    def test_reads_start_price_and_feed(self):
+        strike, sym = PredictionClient._parse_variant(
+            {"startPrice": "104250.5", "priceFeedSymbol": "BTCUSD",
+             "priceFeedProvider": "PYTH"})
+        self.assertAlmostEqual(strike, 104250.5)
+        self.assertEqual(sym, "BTCUSD")
+
+    def test_missing_start_price(self):
+        self.assertEqual(PredictionClient._parse_variant({}), (None, None))
+
+    def test_rejects_garbage(self):
+        self.assertIsNone(
+            PredictionClient._parse_variant({"startPrice": "abc"})[0])
+        self.assertIsNone(
+            PredictionClient._parse_variant({"startPrice": "0"})[0])
+
+
+class TestLiveQuoteGate(unittest.TestCase):
+    """A venue quote worse than the screen must abort the trade."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _trader(self, client, **kw):
+        c = cfg(db_path=self.db, live=True, **kw)
+        return build_trader(client, c, self.db)
+
+    def test_skips_when_quote_exceeds_price_ceiling(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start, end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0)]
+        books = {(1, Side.UP): [(0.55, 10_000)]}
+        client = FakeClient([rnd], path, books, {})
+        client.get_quote = lambda r, s, st: m.Quote("q", 0.93, 1.0, 0.0, 0.0)
+        # 0.93 is above max_entry_price (0.90): must never execute, even
+        # though at this spot the model still nominally shows an edge.
+
+        t = self._trader(client)
+        client.t = 1
+        t._maybe_enter(100.0, "LIVE")
+        self.assertIsNone(t._position)
+        self.assertEqual(client.orders, [])
+
+    def test_skips_when_quote_erases_the_edge(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start, end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_050.0)]
+        books = {(1, Side.UP): [(0.55, 10_000)]}
+        client = FakeClient([rnd], path, books, {})
+        client.get_quote = lambda r, s, st: m.Quote("q", 0.88, 1.0, 0.0, 0.0)
+
+        t = self._trader(client)
+        client.t = 1
+        t._maybe_enter(100.0, "LIVE")
+        self.assertIsNone(t._position)
+        self.assertEqual(client.orders, [])
+
+    def test_skips_on_excessive_price_impact(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start, end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0)]
+        books = {(1, Side.UP): [(0.55, 10_000)]}
+        client = FakeClient([rnd], path, books, {})
+        client.get_quote = lambda r, s, st: m.Quote("q", 0.55, 1.0, 0.40, 0.0)
+
+        t = self._trader(client)
+        client.t = 1
+        t._maybe_enter(100.0, "LIVE")
+        self.assertIsNone(t._position)
+        self.assertEqual(client.orders, [])
+
+    def test_places_order_and_records_quote_price(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start, end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0)]
+        books = {(1, Side.UP): [(0.55, 10_000)]}
+        client = FakeClient([rnd], path, books, {})
+
+        t = self._trader(client)
+        client.t = 1
+        t._maybe_enter(100.0, "LIVE")
+        self.assertIsNotNone(t._position)
+        self.assertEqual(len(client.orders), 1)
+        self.assertAlmostEqual(t._position.signal.fill_price, 0.51)
+
+
+class TestSymbolMapping(unittest.TestCase):
+    """Oracle feed symbols are not Binance tickers."""
+
+    def _client(self, valid):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg()
+        c._symbol_cache = {}
+        calls = []
+
+        class S:
+            def get(self, url, params=None, timeout=None):
+                calls.append(params["symbol"])
+                return types.SimpleNamespace(
+                    status_code=200 if params["symbol"] in valid else 400)
+
+        c._session = S()
+        return c, calls
+
+    def test_none_defaults_to_btcusdt(self):
+        c, _ = self._client({"BTCUSDT"})
+        self.assertEqual(c.market_symbol(None), "BTCUSDT")
+
+    def test_valid_symbol_passes_through(self):
+        c, _ = self._client({"BTCUSDT", "BTCUSDC"})
+        self.assertEqual(c.market_symbol("BTCUSDC"), "BTCUSDC")
+
+    def test_pyth_style_symbol_is_normalised(self):
+        c, calls = self._client({"BTCUSD"})
+        self.assertEqual(c.market_symbol("BTC/USD"), "BTCUSD")
+        self.assertIn("BTCUSD", calls)
+
+    def test_unknown_feed_falls_back_not_crashes(self):
+        c, _ = self._client({"BTCUSDT"})
+        self.assertEqual(c.market_symbol("Crypto.BTC/USD"), "BTCUSDT")
+
+    def test_result_is_cached(self):
+        c, calls = self._client({"BTCUSD"})
+        c.market_symbol("BTC/USD")
+        c.market_symbol("BTC/USD")
+        self.assertEqual(len(calls), 1)
+
+
+class TestVolatilityCache(unittest.TestCase):
+    """Sigma must be cached per symbol, not globally."""
+
+    def test_separate_symbols_do_not_share_a_cache(self):
+        seen = []
+
+        class S:
+            def get(self, url, params=None, timeout=None):
+                seen.append(params["symbol"])
+                # Distinct, small-amplitude series so neither hits the
+                # volatility ceiling and gets clamped to the same value.
+                amp = 0.0005 if params["symbol"] == "BTCUSDT" else 0.0020
+                rows = [[0, 0, 0, 0, str(100.0 * (1 + amp * (i % 2)))]
+                        for i in range(30)]
+                return types.SimpleNamespace(
+                    raise_for_status=lambda: None, json=lambda: rows)
+
+        v = m.VolatilityEstimator(cfg(), S())
+        a = v.sigma_annual("BTCUSDT")
+        b = v.sigma_annual("BTCUSD")
+        self.assertEqual(seen, ["BTCUSDT", "BTCUSD"])
+        self.assertNotEqual(a, b)
+        v.sigma_annual("BTCUSDT")
+        self.assertEqual(len(seen), 2)      # cached, not refetched
+
+
+class TestRedemption(unittest.TestCase):
+    """Winnings are not auto-credited; unclaimed wins must not look like loss."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _live_trader(self, client):
+        c = cfg(db_path=self.db, live=True)
+        return build_trader(client, c, self.db)
+
+    def _win_once(self, client):
+        t = self._live_trader(client)
+        client.t = 1
+        t._maybe_enter(100.0, "LIVE")
+        client.t = 2
+        client._winners[1] = Side.UP
+        t._settle_open()
+        return t
+
+    @staticmethod
+    def _client():
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start, end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0),
+                (start + (m.DEFAULT_ROUND_SECONDS * 1000) + 3_000, 100_400.0)]
+        return FakeClient([rnd], path, {(1, Side.UP): [(0.50, 10_000)]}, {})
+
+    def test_a_win_triggers_redemption(self):
+        client = self._client()
+        t = self._win_once(client)
+        self.assertEqual(client.redeemed, ["1"])   # UP token
+        self.assertIn("1", t._unredeemed)
+
+    def test_unredeemed_winnings_count_toward_bankroll(self):
+        """The bug this guards: balance falls on stake, rises only on claim."""
+        client = self._client()
+        client.balance = 95.0                      # stake already deducted
+        t = self._win_once(client)
+        payout = t._unredeemed["1"][0]
+        self.assertAlmostEqual(t._bankroll(), 95.0 + payout, places=6)
+        self.assertGreater(t._bankroll(), 100.0)   # a win must look like a win
+
+    def test_a_winning_streak_does_not_trip_the_loss_limit(self):
+        client = self._client()
+        client.balance = 82.0                      # three stakes out, none back
+        t = self._win_once(client)
+        t._risk.check(t._bankroll())               # must not raise
+
+    def test_confirmed_redemption_clears_the_pending_entry(self):
+        client = self._client()
+        t = self._win_once(client)
+        client.redeem_state = "SUCCESS"
+        client.balance = 105.0
+        t._poll_redemptions()
+        self.assertEqual(t._unredeemed, {})
+        self.assertAlmostEqual(t._bankroll(), 105.0, places=6)
+
+    def test_pending_redemption_is_not_cleared_early(self):
+        client = self._client()
+        t = self._win_once(client)
+        client.redeem_state = "PENDING"
+        t._poll_redemptions()
+        self.assertIn("1", t._unredeemed)
+
+    def test_failed_claim_is_still_tracked_and_retried(self):
+        client = self._client()
+        client.redeem_fails = True
+        t = self._win_once(client)
+        self.assertIn("1", t._unredeemed)          # value not lost
+        self.assertEqual(t._unredeemed["1"][1], [])
+        client.redeem_fails = False
+        t._retry_failed_claims()
+        self.assertTrue(t._unredeemed["1"][1])     # tx hash now present
+
+    def test_a_loss_never_redeems(self):
+        client = self._client()
+        t = self._live_trader(client)
+        client.t = 1
+        t._maybe_enter(100.0, "LIVE")
+        client.t = 2
+        client._winners[1] = Side.DOWN
+        t._settle_open()
+        self.assertEqual(client.redeemed, [])
+        self.assertEqual(t._unredeemed, {})
+
+    def test_paper_mode_never_redeems(self):
+        client = self._client()
+        c = cfg(db_path=self.db)
+        t = build_trader(client, c, self.db)
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        client.t = 2
+        client._winners[1] = Side.UP
+        t._settle_open()
+        self.assertEqual(client.redeemed, [])
+
+
+class TestStudentT(unittest.TestCase):
+    """Tail model, verified against scipy where available."""
+
+    def test_matches_scipy(self):
+        try:
+            from scipy import stats
+        except ImportError:
+            self.skipTest("scipy not installed")
+        for x in (-4.0, -1.5, -0.3, 0.0, 0.7, 2.5, 5.0):
+            for df in (2.5, 3.0, 4.0, 7.5, 30.0):
+                self.assertAlmostEqual(m.student_t_cdf(x, df),
+                                       stats.t.cdf(x, df), places=10)
+
+    def test_symmetry(self):
+        for x in (0.5, 1.5, 3.0):
+            self.assertAlmostEqual(m.student_t_cdf(x, 4)
+                                   + m.student_t_cdf(-x, 4), 1.0, places=12)
+
+    def test_converges_to_gaussian_at_high_df(self):
+        for x in (-2.0, 0.5, 1.8):
+            self.assertAlmostEqual(m.standardised_t_cdf(x, 5000),
+                                   m.norm_cdf(x), places=4)
+
+    def test_variance_is_matched(self):
+        """Rescaling means df changes shape, not spread."""
+        self.assertAlmostEqual(m.standardised_t_cdf(0.0, 4), 0.5, places=12)
+
+    def test_fat_tails_raise_far_otm_probability(self):
+        """The whole point: cheap lottery tickets are worth more than Gaussian says."""
+        g = m.digital_up_probability(99_000, 100_000, 0.5, 120, None)
+        t = m.digital_up_probability(99_000, 100_000, 0.5, 120, 3.0)
+        self.assertGreater(t, g)
+        self.assertGreater(t / max(g, 1e-12), 2.0)
+
+    def test_still_a_valid_probability(self):
+        import random
+        rng = random.Random(3)
+        for _ in range(1500):
+            p = m.digital_up_probability(rng.uniform(5e4, 1.5e5),
+                                         rng.uniform(5e4, 1.5e5),
+                                         rng.uniform(0.1, 3.0),
+                                         rng.uniform(0, 300),
+                                         rng.choice([None, 2.5, 4.0, 12.0]))
+            self.assertTrue(0.0 <= p <= 1.0)
+
+    def test_rejects_degenerate_df(self):
+        with self.assertRaises(ValueError):
+            m.standardised_t_cdf(1.0, 2.0)
+
+
+class TestTailEstimation(unittest.TestCase):
+
+    def _est(self, rets):
+        v = m.VolatilityEstimator(cfg(), None)
+        import statistics as st
+        return v._estimate_df(rets, st.pstdev(rets))
+
+    def test_gaussian_data_yields_no_fat_tail(self):
+        import random
+        rng = random.Random(5)
+        self.assertIsNone(self._est([rng.gauss(0, 0.001) for _ in range(500)]))
+
+    def test_fat_data_yields_low_df(self):
+        import random
+        rng = random.Random(5)
+        rets = [rng.gauss(0, 0.001) * (6 if rng.random() < 0.03 else 1)
+                for _ in range(2000)]
+        df = self._est(rets)
+        self.assertIsNotNone(df)
+        self.assertLess(df, 12.0)
+
+    def test_clamped_to_configured_bounds(self):
+        import random
+        rng = random.Random(5)
+        rets = [rng.gauss(0, 0.001) * (60 if rng.random() < 0.002 else 1)
+                for _ in range(3000)]
+        df = self._est(rets)
+        self.assertGreaterEqual(df, cfg().tail_df_floor)
+
+    def test_short_series_is_ignored(self):
+        self.assertIsNone(self._est([0.001, -0.002, 0.003]))
+
+    def test_noise_threshold_scales_with_sample_size(self):
+        """Repeated Gaussian draws must not produce false fat-tail signals."""
+        import random
+        rng = random.Random(21)
+        false_positives = sum(
+            self._est([rng.gauss(0, 0.001) for _ in range(400)]) is not None
+            for _ in range(30))
+        self.assertLessEqual(false_positives, 2)
+
+    def test_below_200_samples_refuses_to_guess(self):
+        import random
+        rng = random.Random(4)
+        rets = [rng.gauss(0, 0.001) * (8 if rng.random() < 0.05 else 1)
+                for _ in range(150)]
+        self.assertIsNone(self._est(rets))
+
+
+class TestEdgeThresholds(unittest.TestCase):
+    """Both an absolute floor and a relative margin must clear."""
+
+    def test_relative_margin_blocks_thin_cheap_edges(self):
+        c = convex_cfg()
+        be = breakeven_probability(0.10, c.fee_bps)
+        self.assertFalse(m.clears_edge(be + 0.021, 0.10, c))   # abs ok, rel not
+
+    def test_absolute_floor_blocks_noise_at_tiny_prices(self):
+        c = convex_cfg(min_edge=0.02, min_edge_ratio=0.0)
+        be = breakeven_probability(0.05, c.fee_bps)
+        self.assertFalse(m.clears_edge(be + 0.005, 0.05, c))
+
+    def test_clears_when_both_satisfied(self):
+        c = convex_cfg()
+        be = breakeven_probability(0.20, c.fee_bps)
+        self.assertTrue(m.clears_edge(be * 1.5, 0.20, c))
+
+    def test_threshold_is_consistent_across_price_levels(self):
+        """A 40% margin should pass at both ends of the book."""
+        c = convex_cfg(min_edge=0.001, min_edge_ratio=0.30)
+        for price in (0.06, 0.15, 0.30):
+            be = breakeven_probability(price, c.fee_bps)
+            self.assertTrue(m.clears_edge(be * 1.40, price, c), price)
+
+
+class TestConvexProfile(unittest.TestCase):
+
+    def test_refuses_expensive_contracts(self):
+        c = convex_cfg()
+        rnd = make_round()
+        now = rnd.end_ms - 60_000
+        book = {Side.UP: [(0.80, 10_000)]}
+        self.assertIsNone(evaluate(rnd, 103_000, 0.5, 1000, now, c, book))
+
+    def test_buys_cheap_underpriced_contracts(self):
+        c = convex_cfg()
+        rnd = make_round()
+        now = rnd.end_ms - 120_000
+        book = {Side.UP: [(0.10, 100_000)]}
+        sig = evaluate(rnd, 100_120, 0.5, 1000, now, c, book, tail_df=3.0)
+        self.assertIsNotNone(sig)
+        self.assertLessEqual(sig.fill_price, c.max_entry_price)
+
+    def test_losses_are_bounded_and_small(self):
+        c = convex_cfg()
+        self.assertLessEqual(m.kelly_stake(1000, 0.60, 0.20, c),
+                             1000 * c.max_stake_pct + 1e-9)
+
+    def test_wins_are_multiples_of_the_stake(self):
+        win = settle_pnl(10.0, 0.12, True, 200)
+        loss = settle_pnl(10.0, 0.12, False, 200)
+        self.assertGreater(win, 6 * abs(loss) / 10 * 10 / 10 * 6)
+        self.assertAlmostEqual(loss, -10.0)
+        self.assertGreater(win / abs(loss), 6.0)
+
+    def test_survives_a_long_losing_streak(self):
+        """Convex strategies lose most rounds; that must not be ruin."""
+        c = convex_cfg()
+        bank = 100.0
+        for _ in range(40):
+            stake = min(bank * c.max_stake_pct, bank)
+            bank -= stake
+        self.assertGreater(bank, 40.0)
+
+
+class TestCalibrationBreaker(unittest.TestCase):
+    """Streak counting is wrong for low win rates; use significance instead."""
+
+    def test_long_streak_on_cheap_bets_is_not_a_halt(self):
+        c = convex_cfg()
+        r = RiskManager(c, 100.0)
+        for _ in range(40):
+            r.record_result(False, 0.12)      # 12% bets losing 40x: expected
+        r.check(100.0)                        # must not raise
+        self.assertGreater(r.calibration_z(), c.calibration_z_halt)
+
+    def test_losing_high_probability_bets_does_halt(self):
+        r = RiskManager(convex_cfg(), 100.0)
+        for _ in range(40):
+            r.record_result(False, 0.75)      # 75% bets never winning: broken
+        with self.assertRaises(TradingHalted):
+            r.check(100.0)
+
+    def test_no_verdict_before_minimum_samples(self):
+        r = RiskManager(convex_cfg(), 100.0)
+        for _ in range(5):
+            r.record_result(False, 0.75)
+        self.assertIsNone(r.calibration_z())
+        r.check(100.0)
+
+    def test_results_matching_the_model_never_halt(self):
+        import random
+        rng = random.Random(9)
+        r = RiskManager(convex_cfg(), 100.0)
+        for _ in range(150):
+            p = rng.uniform(0.05, 0.35)
+            r.record_result(rng.random() < p, p)
+        r.check(100.0)
+        self.assertGreater(r.calibration_z(), -2.5)
+
+    def test_z_is_signed_correctly(self):
+        r = RiskManager(convex_cfg(), 100.0)
+        for _ in range(50):
+            r.record_result(True, 0.20)       # far better than predicted
+        self.assertGreater(r.calibration_z(), 0)
+
+    def test_streak_backstop_applies_only_before_enough_data(self):
+        """Crude instrument, used only while the good one is unavailable."""
+        r = RiskManager(convex_cfg(max_consecutive_losses=5), 100.0)
+        for _ in range(5):
+            r.record_result(False, 0.10)
+        self.assertIsNone(r.calibration_z())      # too few samples to judge
+        with self.assertRaises(TradingHalted):
+            r.check(100.0)
+
+    def test_streak_is_ignored_once_calibration_is_available(self):
+        c = convex_cfg(max_consecutive_losses=5, calibration_min_samples=10)
+        r = RiskManager(c, 100.0)
+        for _ in range(40):
+            r.record_result(False, 0.10)          # 40-loss streak at 10% odds
+        self.assertIsNotNone(r.calibration_z())
+        r.check(100.0)                            # statistically fine
+
+
+class TestRequestSigning(unittest.TestCase):
+    """The signed bytes and the sent bytes must be byte-identical."""
+
+    def _client(self):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg()
+        c._clock_offset_ms = 0
+        c._symbol_cache = {}
+        c._wallet = None
+        return c
+
+    def test_signature_covers_exactly_the_sent_string(self):
+        import hmac, hashlib
+        c = self._client()
+        q = c._signed_query({"b": "2", "a": "1", "limit": 50})
+        sent, sig = q.rsplit("&signature=", 1)
+        expected = hmac.new(b"s", sent.encode(), hashlib.sha256).hexdigest()
+        self.assertEqual(sig, expected)
+
+    def test_parameters_are_sorted_in_the_sent_string(self):
+        c = self._client()
+        sent = c._signed_query({"zeta": 1, "alpha": 2}).rsplit("&signature=", 1)[0]
+        keys = [kv.split("=")[0] for kv in sent.split("&")]
+        self.assertEqual(keys, sorted(keys))
+
+    def test_timestamp_and_recvwindow_are_included(self):
+        c = self._client()
+        q = c._signed_query({})
+        self.assertIn("timestamp=", q)
+        self.assertIn("recvWindow=", q)
+
+    def test_none_values_are_dropped(self):
+        self.assertNotIn("skipme",
+                         self._client()._signed_query({"skipme": None}))
+
+    def test_list_params_repeat_rather_than_stringify(self):
+        """Regression: tokenIds must not serialise as a Python repr."""
+        c = self._client()
+        q = c._signed_query({"tokenIds": ["111", "222"]})
+        self.assertIn("tokenIds=111", q)
+        self.assertIn("tokenIds=222", q)
+        self.assertNotIn("%5B", q)      # no "["
+
+    def test_signature_changes_when_a_parameter_changes(self):
+        c = self._client()
+        a = c._signed_query({"x": "1"}).rsplit("&signature=", 1)[1]
+        b = c._signed_query({"x": "2"}).rsplit("&signature=", 1)[1]
+        self.assertNotEqual(a, b)
+
+
+class TestErrorSurfacing(unittest.TestCase):
+    """Binance puts the diagnosis in the body; it must reach the user."""
+
+    def _client_returning(self, status, body, text="{}"):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg(); c._clock_offset_ms = 0
+        c._symbol_cache = {}; c._wallet = None
+
+        class S:
+            def request(self, method, url, timeout=None):
+                return types.SimpleNamespace(
+                    status_code=status, text=text,
+                    json=lambda: body if body is not None else (_ for _ in ()).throw(ValueError()))
+        c._session = S()
+        return c
+
+    def test_signature_error_is_explained(self):
+        c = self._client_returning(400, {"code": -1022, "msg": "Signature invalid"})
+        with self.assertRaises(m.ApiError) as ctx:
+            c._request("market_list")
+        msg = str(ctx.exception)
+        self.assertIn("-1022", msg)
+        self.assertIn("signed and sent", msg)
+
+    def test_permission_error_is_explained(self):
+        c = self._client_returning(401, {"code": -2015, "msg": "Invalid API-key"})
+        with self.assertRaises(m.ApiError) as ctx:
+            c._request("market_list")
+        self.assertIn("permissions", str(ctx.exception))
+
+    def test_unknown_code_still_surfaces_the_message(self):
+        c = self._client_returning(400, {"code": -9999, "msg": "Weird failure"})
+        with self.assertRaises(m.ApiError) as ctx:
+            c._request("market_list")
+        self.assertIn("Weird failure", str(ctx.exception))
+
+    def test_non_json_error_body_is_not_swallowed(self):
+        c = self._client_returning(500, None, text="upstream exploded")
+        with self.assertRaises(m.ApiError) as ctx:
+            c._request("market_list")
+        self.assertIn("upstream exploded", str(ctx.exception))
+
+    def test_quota_failure_propagates_rather_than_returning_none(self):
+        """Regression: preflight printed 'OK None' for a failing endpoint."""
+        c = self._client_returning(400, {"code": -1102, "msg": "bad param"})
+        with self.assertRaises(m.ApiError):
+            c.remaining_quota_usdt()
+
+
+class TestEndpointMethods(unittest.TestCase):
+    """The verb must travel with the path."""
+
+    def test_trading_endpoints_are_post(self):
+        for name in ("get_quote", "place_order", "batch_redeem"):
+            self.assertEqual(m.DEFAULT_ENDPOINTS[name][0], "POST", name)
+
+    def test_read_endpoints_are_get(self):
+        for name in ("market_list", "market_detail", "order_book",
+                     "wallet_list", "balances", "quota_status",
+                     "settled_history", "redeem_status", "positions"):
+            self.assertEqual(m.DEFAULT_ENDPOINTS[name][0], "GET", name)
+
+    def test_every_endpoint_declares_a_valid_verb(self):
+        for name, (verb, path) in m.DEFAULT_ENDPOINTS.items():
+            self.assertIn(verb, ("GET", "POST"), name)
+            self.assertTrue(path.startswith("/sapi/"), name)
+
+    def test_override_accepts_bare_path_and_keeps_method(self):
+        import json, tempfile, os as _os
+        fd, fp = tempfile.mkstemp(suffix=".json"); _os.close(fd)
+        with open(fp, "w") as fh:
+            json.dump({"get_quote": "/new/path"}, fh)
+        eps = m.load_endpoints(fp); _os.unlink(fp)
+        self.assertEqual(eps["get_quote"], ("POST", "/new/path"))
+
+    def test_override_accepts_method_path_pair(self):
+        import json, tempfile, os as _os
+        fd, fp = tempfile.mkstemp(suffix=".json"); _os.close(fd)
+        with open(fp, "w") as fh:
+            json.dump({"order_book": ["POST", "/x"]}, fh)
+        eps = m.load_endpoints(fp); _os.unlink(fp)
+        self.assertEqual(eps["order_book"], ("POST", "/x"))
+
+    def test_override_rejects_bad_method(self):
+        import json, tempfile, os as _os
+        fd, fp = tempfile.mkstemp(suffix=".json"); _os.close(fd)
+        with open(fp, "w") as fh:
+            json.dump({"order_book": ["FETCH", "/x"]}, fh)
+        with self.assertRaises(SystemExit):
+            m.load_endpoints(fp)
+        _os.unlink(fp)
+
+
+class TestClampedSigmaGuard(unittest.TestCase):
+    """A clamped sigma is an assertion, not a measurement."""
+
+    def test_malformed_closes_do_not_crash(self):
+        rows = [[0, 0, 0, 0, v] for v in
+                ["100", "0", "101", "-5", "102", "103"] * 40]
+
+        class S:
+            def get(self, url, params=None, timeout=None):
+                return types.SimpleNamespace(raise_for_status=lambda: None,
+                                             json=lambda: rows)
+        est = m.VolatilityEstimator(cfg(), S())
+        self.assertGreater(est.sigma_annual(), 0.0)   # survives, no exception
+
+    def _est(self, per_min_sd):
+        import random
+        rng = random.Random(2)
+        rows = []
+        px = 100.0
+        for _ in range(500):
+            px *= math.exp(rng.gauss(0, per_min_sd))   # stays positive
+            rows.append([0, 0, 0, 0, str(px)])
+
+        class S:
+            def get(self, url, params=None, timeout=None):
+                return types.SimpleNamespace(raise_for_status=lambda: None,
+                                             json=lambda: rows)
+        return m.VolatilityEstimator(cfg(), S())
+
+    def test_normal_volatility_is_not_clamped(self):
+        est = self._est(0.0008)
+        est.sigma_annual()
+        self.assertFalse(est.is_clamped())
+
+    def test_dead_market_is_flagged_as_clamped(self):
+        est = self._est(1e-9)
+        sigma = est.sigma_annual()
+        self.assertTrue(est.is_clamped())
+        self.assertAlmostEqual(sigma, cfg().vol_floor_annual)
+
+    def test_extreme_volatility_is_flagged_as_clamped(self):
+        est = self._est(0.5)
+        est.sigma_annual()
+        self.assertTrue(est.is_clamped())
+
+    def test_clamped_flag_is_per_symbol(self):
+        est = self._est(0.0008)
+        est.sigma_annual("BTCUSDT")
+        self.assertFalse(est.is_clamped("BTCUSDT"))
+        self.assertFalse(est.is_clamped("NEVERQUERIED"))
+
+    def test_overstated_sigma_inflates_cheap_contracts(self):
+        """The reason the guard exists, stated as an assertion."""
+        true_p = 1 - m.digital_up_probability(65006.5, 64990.0, 0.08, 120, 4.76)
+        floor_p = 1 - m.digital_up_probability(65006.5, 64990.0, 0.15, 120, 4.76)
+        self.assertGreater(floor_p / true_p, 3.0)
+
+
+class TestBalanceLookup(unittest.TestCase):
+    """Regression: a funded account reported 0.00 because of a hard filter."""
+
+    def _client(self, items, account_type="AUTO"):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg(account_type=account_type)
+        c._clock_offset_ms = 0; c._symbol_cache = {}; c._wallet = None
+
+        class S:
+            def request(self, method, url, timeout=None):
+                return types.SimpleNamespace(
+                    status_code=200, text="", json=lambda: {"items": items})
+        c._session = S()
+        return c
+
+    def test_finds_funds_under_an_unexpected_account_type(self):
+        """The actual failure: money in FUNDING, code only looked at SPOT."""
+        c = self._client([
+            {"accountType": "SPOT", "availableBalanceDisplay": "0", "enabled": True},
+            {"accountType": "FUNDING", "availableBalanceDisplay": "6.64", "enabled": True}])
+        self.assertAlmostEqual(c.balance_usdt(), 6.64)
+
+    def test_breakdown_lists_every_option(self):
+        c = self._client([
+            {"accountType": "SPOT", "availableBalanceDisplay": "0", "enabled": True},
+            {"accountType": "FUNDING", "availableBalanceDisplay": "6.64", "enabled": False}])
+        opts = c.payment_options()
+        self.assertEqual(len(opts), 2)
+        self.assertIn(("FUNDING", 6.64, False), opts)
+
+    def test_disabled_options_are_not_used(self):
+        c = self._client([
+            {"accountType": "SPOT", "availableBalanceDisplay": "1.0", "enabled": True},
+            {"accountType": "FUNDING", "availableBalanceDisplay": "99", "enabled": False}])
+        self.assertAlmostEqual(c.balance_usdt(), 1.0)
+
+    def test_explicit_account_type_is_respected(self):
+        c = self._client([
+            {"accountType": "SPOT", "availableBalanceDisplay": "1.0", "enabled": True},
+            {"accountType": "FUNDING", "availableBalanceDisplay": "99", "enabled": True}],
+            account_type="SPOT")
+        self.assertAlmostEqual(c.balance_usdt(), 1.0)
+
+    def test_explicit_missing_type_names_what_is_available(self):
+        c = self._client([
+            {"accountType": "FUNDING", "availableBalanceDisplay": "9", "enabled": True}],
+            account_type="SPOT")
+        with self.assertRaises(m.ApiError) as ctx:
+            c.balance_usdt()
+        self.assertIn("FUNDING=9.00", str(ctx.exception))
+
+    def test_malformed_balance_is_treated_as_zero_not_a_crash(self):
+        c = self._client([
+            {"accountType": "SPOT", "availableBalanceDisplay": "abc", "enabled": True},
+            {"accountType": "FUNDING", "availableBalanceDisplay": "5", "enabled": True}])
+        self.assertAlmostEqual(c.balance_usdt(), 5.0)
+
+    def test_empty_response_raises(self):
+        with self.assertRaises(m.ApiError):
+            self._client([]).balance_usdt()
+
+
+class TestBankrollViability(unittest.TestCase):
+    """
+    Viability is decided by kelly_stake, not by a percentage rule of thumb.
+
+    These tests previously asserted that a 6.64 balance CANNOT trade, which
+    encoded the idle-forever bug as correct behaviour. Sizing is now bounded
+    by the 2x-full-Kelly limit rather than by max_stake_pct alone.
+    """
+
+    def test_a_conservative_profile_declines_a_tiny_bankroll(self):
+        """
+        Correct, not a bug: convex risks 2% per trade, so its hard cap is 5%.
+        Forcing a 1.00 minimum on 6.64 would be 15% of bankroll -- far past
+        what that profile's own risk shape allows. It declines rather than
+        quietly trading three times its intended size.
+        """
+        self.assertEqual(m.kelly_stake(6.64, 0.90, 0.10, convex_cfg()), 0.0)
+
+    def test_a_profile_built_for_small_accounts_does_trade(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["micro"])
+        self.assertGreater(m.kelly_stake(6.64, 0.70, 0.60, c, 0), 0.0)
+
+    def test_larger_bankroll_also_trades(self):
+        c = convex_cfg()
+        self.assertGreater(m.kelly_stake(500.0, 0.90, 0.10, c), 0.0)
+
+    def test_stake_never_exceeds_the_hard_cap(self):
+        for prof in ("convex", "balanced", "micro"):
+            c = Config(api_key="k", api_secret="s", **m.PROFILES[prof])
+            for bank in (2.0, 6.64, 30.0, 1000.0):
+                st = m.kelly_stake(bank, 0.99, 0.05, c)
+                self.assertLessEqual(st, bank * c.hard_max_stake_pct + 1e-9,
+                                     f"{prof} @ {bank}")
+
+    def test_a_bankroll_below_the_order_minimum_cannot_trade(self):
+        c = convex_cfg()
+        self.assertEqual(m.kelly_stake(0.80, 0.90, 0.10, c), 0.0)
+
+
+class TestRawSigmaDiagnostic(unittest.TestCase):
+
+    def _est(self, sd):
+        import random
+        rng = random.Random(2); rows = []; px = 100.0
+        for _ in range(500):
+            px *= math.exp(rng.gauss(0, sd))
+            rows.append([0, 0, 0, 0, str(px)])
+
+        class S:
+            def get(self, url, params=None, timeout=None):
+                return types.SimpleNamespace(raise_for_status=lambda: None,
+                                             json=lambda: rows)
+        return m.VolatilityEstimator(cfg(), S())
+
+    def test_raw_sigma_is_recorded_below_the_floor(self):
+        est = self._est(1e-7)
+        used = est.sigma_annual()
+        raw = est.raw_sigma()
+        self.assertTrue(est.is_clamped())
+        self.assertLess(raw, used)
+
+    def test_raw_equals_used_when_not_clamped(self):
+        est = self._est(0.0008)
+        used = est.sigma_annual()
+        self.assertAlmostEqual(est.raw_sigma(), used, places=12)
+
+
+class TestPerMarketFee(unittest.TestCase):
+    """The market's published fee wins over the config fallback."""
+
+    def test_kelly_uses_the_supplied_fee(self):
+        c = cfg(fee_bps=200)
+        low = m.kelly_stake(1000, 0.65, 0.60, c, fee_bps=1)
+        high = m.kelly_stake(1000, 0.65, 0.60, c, fee_bps=200)
+        self.assertGreater(low, high)      # smaller fee -> larger edge -> bigger
+
+    def test_clears_edge_uses_the_supplied_fee(self):
+        c = cfg(min_edge=0.045, min_edge_ratio=0.0)
+        self.assertTrue(m.clears_edge(0.6460, 0.60, c, fee_bps=1))
+        self.assertFalse(m.clears_edge(0.6460, 0.60, c, fee_bps=200))
+
+    def test_evaluate_reads_fee_from_the_round(self):
+        rnd_free = make_round(fee_bps=1)
+        rnd_paid = make_round(fee_bps=900)
+        now = rnd_free.end_ms - 60_000
+        book = {Side.UP: [(0.55, 10_000)]}
+        c = cfg(min_edge=0.04, min_edge_ratio=0.05)
+        s_free = evaluate(rnd_free, 100_150, 0.5, 1000, now, c, book)
+        s_paid = evaluate(rnd_paid, 100_150, 0.5, 1000, now, c, book)
+        self.assertIsNotNone(s_free)
+        if s_paid is not None:
+            self.assertGreater(s_free.edge, s_paid.edge)
+
+    def test_settle_pnl_honours_a_zero_fee(self):
+        self.assertAlmostEqual(settle_pnl(1.0, 0.5, True, 0), 1.0, places=9)
+        self.assertAlmostEqual(settle_pnl(1.0, 0.5, True, 200), 0.98, places=9)
+
+    def test_fallback_used_when_no_fee_supplied(self):
+        c = cfg(fee_bps=500)
+        self.assertAlmostEqual(m.kelly_stake(1000, 0.65, 0.60, c),
+                               m.kelly_stake(1000, 0.65, 0.60, c, 500))
+
+
+class TestMicroProfile(unittest.TestCase):
+    """Small accounts: the venue minimum forces the risk fraction."""
+
+    def test_micro_can_trade_a_small_balance(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["micro"])
+        self.assertGreaterEqual(6.64 * c.max_stake_pct, c.min_stake_usdt)
+
+    def test_one_dollar_minimum_is_accepted(self):
+        c = Config(api_key="k", api_secret="s", min_stake_usdt=1.0)
+        self.assertEqual(c.min_stake_usdt, 1.0)
+
+    def test_implausibly_small_minimum_still_rejected(self):
+        with self.assertRaises(ValueError):
+            Config(api_key="k", api_secret="s", min_stake_usdt=0.1)
+
+    def test_micro_targets_the_mid_price_band(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["micro"])
+        self.assertGreaterEqual(c.min_entry_price, 0.30)
+        self.assertLessEqual(c.max_entry_price, 0.80)
+
+    def test_bounded_loss_survives_a_long_streak(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["micro"])
+        bank = 100.0
+        for _ in range(20):
+            bank -= min(bank * c.max_stake_pct, bank)
+        self.assertGreater(bank, 1.0)
+
+
+class TestVenueDerivedParameters(unittest.TestCase):
+    """Nothing routing-related may be assumed when the venue publishes it."""
+
+    def test_chain_collateral_precision_come_from_payload(self):
+        t = TestParseRound.topic()
+        t["chainId"] = "97"; t["collateral"] = "USDC"
+        t["markets"][0]["decimalPrecision"] = 6
+        r = PredictionClient._parse_round(t)
+        self.assertEqual((r.chain_id, r.collateral, r.decimal_precision),
+                         ("97", "USDC", 6))
+
+    def test_missing_chain_id_rejects_the_market(self):
+        t = TestParseRound.topic(); del t["chainId"]
+        self.assertIsNone(PredictionClient._parse_round(t))
+
+    def test_missing_collateral_rejects_the_market(self):
+        t = TestParseRound.topic(); del t["collateral"]
+        self.assertIsNone(PredictionClient._parse_round(t))
+
+    def test_missing_vendor_rejects_the_market(self):
+        t = TestParseRound.topic(); del t["vendor"]
+        self.assertIsNone(PredictionClient._parse_round(t))
+
+    def test_missing_fee_rejects_rather_than_defaulting(self):
+        """Regression: a missing fee used to silently become 200 bps."""
+        t = TestParseRound.topic(); del t["feeRateBps"]
+        self.assertIsNone(PredictionClient._parse_round(t))
+
+    def test_zero_fee_is_honoured_not_overridden(self):
+        t = TestParseRound.topic(); t["feeRateBps"] = 0
+        self.assertEqual(PredictionClient._parse_round(t).fee_bps, 0)
+
+    def test_slippage_takes_the_tighter_of_ours_and_the_venue(self):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg(max_slippage_bps=300)
+        self.assertEqual(c.effective_slippage_bps(make_round(venue_slippage_bps=1200)), 300)
+        self.assertEqual(c.effective_slippage_bps(make_round(venue_slippage_bps=100)), 100)
+        self.assertEqual(c.effective_slippage_bps(make_round(venue_slippage_bps=0)), 300)
+
+    def test_price_snaps_to_published_precision(self):
+        self.assertEqual(make_round(decimal_precision=2).round_price(0.123456), 0.12)
+        self.assertEqual(make_round(decimal_precision=4).round_price(0.123456), 0.1235)
+
+    def test_round_duration_is_derived_not_assumed(self):
+        r = make_round()
+        self.assertEqual(r.duration_ms, r.end_ms - r.start_ms)
+
+    def test_duration_tolerance_scales_with_the_target(self):
+        base = 1_700_000_000_000
+        t = TestParseRound.topic(startDate=base, endDate=base + 300_000)
+        self.assertIsNotNone(PredictionClient._parse_round(t))
+        t2 = TestParseRound.topic(startDate=base, endDate=base + 360_000)
+        self.assertIsNone(PredictionClient._parse_round(t2))   # 20% off target
+
+
+class TestMinimumDiscovery(unittest.TestCase):
+    """The minimum is not a published field, so it is measured."""
+
+    def _client(self, true_min, balance=50.0):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg()
+        c.calls = []
+        c.balance_usdt = lambda: balance
+
+        def fake_quote(rnd, side, amount):
+            c.calls.append(amount)
+            if amount > balance:
+                raise m.ApiError("Please ensure your account has enough USDT.",
+                                 code=-9000)
+            if amount < true_min:
+                raise m.ApiError("amount below minimum order size", code=None)
+            return m.Quote("q", 0.5, amount / 0.5, 0.0, 0.0)
+
+        c.get_quote = fake_quote
+        return c
+
+    def test_finds_the_threshold(self):
+        c = self._client(1.5)
+        found = c.discover_min_stake(make_round(), Side.UP, tolerance=0.01)
+        self.assertAlmostEqual(found, 1.5, delta=0.05)
+
+    def test_finds_a_one_dollar_minimum(self):
+        c = self._client(1.0)
+        found = c.discover_min_stake(make_round(), Side.UP, tolerance=0.01)
+        self.assertAlmostEqual(found, 1.0, delta=0.05)
+
+    def test_returns_low_when_everything_is_quotable(self):
+        c = self._client(0.0)
+        self.assertEqual(c.discover_min_stake(make_round(), Side.UP, low=0.25), 0.25)
+
+    def test_returns_none_when_no_size_is_quotable(self):
+        """Every size in range is rejected as too small -> no answer."""
+        c = self._client(999.0, balance=100.0)
+        self.assertIsNone(c.discover_min_stake(make_round(), Side.UP))
+
+    def test_finds_a_high_floor_when_balance_allows(self):
+        """With enough balance the real floor is found, however high."""
+        c = self._client(999.0, balance=5000.0)
+        found = c.discover_min_stake(make_round(), Side.UP, tolerance=0.5)
+        self.assertAlmostEqual(found, 999.0, delta=1.0)
+
+    def test_upper_bound_derives_from_balance(self):
+        """Regression: a fixed 10.0 ceiling crashed on a 6.64 balance."""
+        c = self._client(1.0, balance=6.64)
+        found = c.discover_min_stake(make_round(), Side.UP, tolerance=0.01)
+        self.assertAlmostEqual(found, 1.0, delta=0.05)
+        self.assertTrue(all(a <= 6.64 + 1e-9 for a in c.calls),
+                        f"probed above balance: {c.calls}")
+
+    def test_funds_error_rebounds_instead_of_crashing(self):
+        c = self._client(1.0, balance=6.64)
+        found = c.discover_min_stake(make_round(), Side.UP, low=0.25,
+                                     high=25.0, tolerance=0.01)
+        self.assertIsNotNone(found)
+        self.assertLessEqual(found, 6.64)
+
+    def test_probing_is_logarithmic_not_linear(self):
+        """Probe count must scale with log(range/tolerance), not the range."""
+        import math as _math
+        low, tol, balance = 0.25, 0.05, 50.0
+        c = self._client(1.5, balance=balance)
+        c.discover_min_stake(make_round(), Side.UP, low=low, tolerance=tol)
+        bound = _math.ceil(_math.log2((balance - low) / tol)) + 2
+        self.assertLessEqual(len(c.calls), bound)
+        self.assertLess(len(c.calls), (balance - low) / tol)   # not linear
+
+    def test_rejects_invalid_bounds(self):
+        c = self._client(1.5)
+        with self.assertRaises(ValueError):
+            c.discover_min_stake(make_round(), Side.UP, low=5.0, high=1.0)
+
+
+class TestSmallAccountSizing(unittest.TestCase):
+    """Regression: every profile returned 0.00 on a small balance."""
+
+    def _c(self, **kw):
+        return Config(api_key="k", api_secret="s", **{**m.PROFILES["micro"], **kw})
+
+    def test_small_balance_with_real_edge_now_trades(self):
+        self.assertEqual(m.kelly_stake(6.64, 0.70, 0.60, self._c(), 0), 1.0)
+
+    def test_profiles_either_trade_a_small_balance_or_decline_it(self):
+        """No profile may silently exceed its own hard cap to trade."""
+        for name, prof in m.PROFILES.items():
+            c = Config(api_key="k", api_secret="s", **prof)
+            stake = m.kelly_stake(6.64, 0.70, 0.60, c, 0)
+            if stake > 0:
+                self.assertLessEqual(stake / 6.64, c.hard_max_stake_pct + 1e-9,
+                                     name)
+
+    def test_weak_edge_is_refused_not_forced(self):
+        self.assertEqual(m.kelly_stake(6.64, 0.63, 0.60, self._c(), 0), 0.0)
+
+    def test_no_edge_never_triggers_the_override(self):
+        self.assertEqual(m.kelly_stake(6.64, 0.55, 0.60, self._c(), 0), 0.0)
+        self.assertEqual(m.kelly_stake(6.64, 0.60, 0.60, self._c(), 0), 0.0)
+
+    def test_override_respects_the_two_times_kelly_limit(self):
+        """Beyond 2x full Kelly, expected log growth is negative."""
+        c = self._c()
+        for bank in (2.0, 3.0, 5.0, 10.0, 50.0):
+            stake = m.kelly_stake(bank, 0.70, 0.60, c, 0)
+            if stake > 0:
+                mult = m.kelly_multiple(stake, bank, 0.70, 0.60, 0)
+                self.assertLessEqual(mult, 2.0 + 1e-9, f"bankroll {bank}")
+
+    def test_override_respects_the_hard_cap(self):
+        # $1 of $6.64 is 15%. With a 5% soft cap the hard cap is 12.5%,
+        # so the forced minimum exceeds it and the trade is refused.
+        c = self._c(max_stake_pct=0.05, hard_stake_multiple=2.5)
+        self.assertEqual(m.kelly_stake(6.64, 0.70, 0.60, c, 0), 0.0)
+
+    def test_override_can_be_disabled(self):
+        c = self._c(round_up_to_minimum=False)
+        self.assertEqual(m.kelly_stake(6.64, 0.70, 0.60, c, 0), 0.0)
+
+    def test_large_balance_is_unaffected_by_the_override(self):
+        """On a large balance Kelly binds and the minimum is irrelevant."""
+        c = self._c()
+        stake = m.kelly_stake(10_000.0, 0.70, 0.60, c, 0)
+        expected = 10_000.0 * min(0.25 * c.kelly_fraction, c.max_stake_pct)
+        self.assertAlmostEqual(stake, expected, places=6)
+        self.assertGreater(stake, c.min_stake_usdt)
+
+    def test_kelly_multiple_reports_under_betting_correctly(self):
+        mult = m.kelly_multiple(1.0, 6.64, 0.70, 0.60, 0)
+        self.assertLess(mult, 1.0)      # $1 of $6.64 is BELOW full Kelly here
+
+    def test_hard_cap_can_never_be_below_the_soft_cap(self):
+        """The invariant now holds by construction, not by validation."""
+        for soft in (0.01, 0.05, 0.10, 0.20, 0.25):
+            for mult in (1.0, 1.5, 2.5, 10.0):
+                c = Config(api_key="k", api_secret="s", max_stake_pct=soft,
+                           hard_stake_multiple=mult)
+                self.assertGreaterEqual(c.hard_max_stake_pct, soft,
+                                        f"soft={soft} mult={mult}")
+
+    def test_hard_cap_respects_the_ceiling(self):
+        c = Config(api_key="k", api_secret="s", max_stake_pct=0.25,
+                   hard_stake_multiple=10.0, hard_stake_ceiling=0.35)
+        self.assertEqual(c.hard_max_stake_pct, 0.35)
+
+    def test_growth_is_positive_at_the_forced_size(self):
+        """Sanity: the accepted override must still compound upward."""
+        import math
+        q, p, f = 0.70, 0.60, 1.0 / 6.64
+        b = (1 - p) / p
+        g = q * math.log(1 + b * f) + (1 - q) * math.log(1 - f)
+        self.assertGreater(g, 0.0)
+
+
+class TestQuoteErrorClassification(unittest.TestCase):
+    """A broken request must not be reported as 'book too thin'."""
+
+    def _client(self, raiser, balance=50.0):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg()
+        c.get_quote = raiser
+        c.balance_usdt = lambda: balance
+        return c
+
+    def test_size_rejection_is_treated_as_below_minimum(self):
+        def q(rnd, side, amount):
+            if amount < 2.0:
+                raise m.ApiError("amount below minimum order size")
+            return m.Quote("q", 0.5, 1.0, 0.0, 0.0)
+        found = self._client(q).discover_min_stake(make_round(), Side.UP,
+                                                   tolerance=0.01)
+        self.assertAlmostEqual(found, 2.0, delta=0.05)
+
+    def test_signature_error_is_raised_not_swallowed(self):
+        """Regression: any error used to look like 'amount too small'."""
+        def q(rnd, side, amount):
+            raise m.ApiError("HTTP 400: Signature invalid", code=-1022)
+        with self.assertRaises(m.ApiError):
+            self._client(q).discover_min_stake(make_round(), Side.UP)
+
+    def test_method_not_supported_is_raised(self):
+        def q(rnd, side, amount):
+            raise m.ApiError("Request method 'GET' is not supported",
+                             code=-1104)
+        with self.assertRaises(m.ApiError):
+            self._client(q).discover_min_stake(make_round(), Side.UP)
+
+    def test_permission_error_is_raised(self):
+        def q(rnd, side, amount):
+            raise m.ApiError("invalid API key", code=-2015)
+        with self.assertRaises(m.ApiError):
+            self._client(q).discover_min_stake(make_round(), Side.UP)
+
+    def test_liquidity_error_counts_as_a_size_problem(self):
+        def q(rnd, side, amount):
+            if amount < 3.0:
+                raise m.ApiError("insufficient liquidity for this amount")
+            return m.Quote("q", 0.5, 1.0, 0.0, 0.0)
+        found = self._client(q).discover_min_stake(make_round(), Side.UP,
+                                                   tolerance=0.01)
+        self.assertAlmostEqual(found, 3.0, delta=0.05)
+
+
+class TestFavoriteProfile(unittest.TestCase):
+    """Buying favourites: the opposite side of the market from convex."""
+
+    def _c(self):
+        return Config(api_key="k", api_secret="s", **m.PROFILES["favorite"])
+
+    def test_band_matches_a_25pct_return_rule(self):
+        c = self._c()
+        self.assertLessEqual(c.max_entry_price, 0.80)
+        self.assertAlmostEqual((1 - c.max_entry_price) / c.max_entry_price,
+                               0.25, places=2)
+
+    def test_refuses_longshots(self):
+        c = self._c()
+        rnd = make_round()
+        now = rnd.end_ms - 60_000
+        book = {Side.UP: [(0.15, 100_000)]}
+        self.assertIsNone(evaluate(rnd, 101_500, 0.5, 1000, now, c, book, 4.0))
+
+    def test_buys_an_underpriced_favourite(self):
+        c = self._c()
+        rnd = make_round(fee_bps=0)
+        now = rnd.end_ms - 60_000
+        book = {Side.UP: [(0.60, 100_000)]}
+        sig = evaluate(rnd, 100_250, 0.5, 1000, now, c, book)
+        self.assertIsNotNone(sig)
+        self.assertGreaterEqual(sig.fill_price, c.min_entry_price)
+        self.assertLessEqual(sig.fill_price, c.max_entry_price)
+
+    def test_is_disjoint_from_convex(self):
+        fav = self._c()
+        cvx = Config(api_key="k", api_secret="s", **m.PROFILES["convex"])
+        self.assertGreater(fav.min_entry_price, cvx.max_entry_price)
+
+    def test_enters_later_than_convex(self):
+        fav = self._c()
+        cvx = Config(api_key="k", api_secret="s", **m.PROFILES["convex"])
+        self.assertLess(fav.entry_window_start_s, cvx.entry_window_start_s)
+
+
+class TestBiasReport(unittest.TestCase):
+    """The report must measure which side of the market is mispriced."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        self.j = Journal(self.db)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _add(self, price, won, n=1, model=None):
+        rnd = make_round()
+        for _ in range(n):
+            sig = Signal(Side.UP, model if model else price + 0.05,
+                         price, 0.05, 1.0, 60.0)
+            tid = self.j.record("PAPER", rnd, sig, 100_000, 0.5, 100.0)
+            self.j.resolve(tid, won, 1.0 if won else -1.0, "venue")
+
+    def test_detects_underpriced_favourites(self):
+        self._add(0.70, True, 90)
+        self._add(0.70, False, 10)      # 90% actual vs 70% implied
+        self.assertIn("<-- underpriced", self.j.calibration_report())
+
+    def test_detects_overpriced_longshots(self):
+        self._add(0.15, True, 2)
+        self._add(0.15, False, 98)      # 2% actual vs 15% implied
+        self.assertIn("<-- overpriced", self.j.calibration_report())
+
+    def test_fair_pricing_is_not_flagged(self):
+        """The explanatory text mentions both words; only flags count."""
+        self._add(0.60, True, 60)
+        self._add(0.60, False, 40)
+        report = self.j.calibration_report()
+        self.assertNotIn("<-- underpriced", report)
+        self.assertNotIn("<-- overpriced", report)
+
+    def test_report_includes_the_bias_section(self):
+        self._add(0.60, True, 5)
+        self.assertIn("Favourite-longshot bias", self.j.calibration_report())
+
+
+class TestNoSilentFailures(unittest.TestCase):
+    """
+    Meta-tests over the source. These exist because every serious bug in this
+    project so far was an error being swallowed and reported as something
+    benign -- a signature failure read as 'endpoint missing', an auth failure
+    read as 'book too thin', a wrong-account lookup read as 'zero balance'.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import ast, inspect
+        cls.src = inspect.getsource(m)
+        cls.tree = ast.parse(cls.src)
+
+    def test_no_bare_except(self):
+        import ast
+        bare = [n.lineno for n in ast.walk(self.tree)
+                if isinstance(n, ast.ExceptHandler) and n.type is None]
+        self.assertEqual(bare, [], f"bare except at lines {bare}")
+
+    def test_no_handler_silently_passes(self):
+        import ast
+        bad = []
+        for n in ast.walk(self.tree):
+            if isinstance(n, ast.ExceptHandler) and len(n.body) == 1:
+                if isinstance(n.body[0], (ast.Pass, ast.Continue)):
+                    bad.append(n.lineno)
+        self.assertEqual(bad, [], f"silent pass/continue at lines {bad}")
+
+    def test_no_handler_returns_without_explaining(self):
+        """
+        An except that returns must log first, or re-raise.
+
+        Exempt: functions named `*_or_none`, whose contract is explicitly to
+        report absence rather than to hide a failure. The naming convention
+        keeps the exemption visible instead of hidden in a test allowlist.
+        """
+        import ast
+        bad = []
+        for fn in ast.walk(self.tree):
+            if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            if fn.name.endswith("_or_none"):
+                continue
+            for n in ast.walk(fn):
+                if not isinstance(n, ast.ExceptHandler):
+                    continue
+                body = " ".join(ast.unparse(st) for st in n.body)
+                returns = any(isinstance(st, ast.Return) for st in n.body)
+                explains = ("LOG." in body or "raise" in body
+                            or "print" in body)
+                if returns and not explains:
+                    bad.append((fn.name, n.lineno))
+        self.assertEqual(bad, [], f"unexplained early return at {bad}")
+
+    def test_the_exemption_is_not_abused(self):
+        """Only genuinely trivial parsers may use the `_or_none` exemption."""
+        import ast
+        for fn in ast.walk(self.tree):
+            if isinstance(fn, ast.FunctionDef) and fn.name.endswith("_or_none"):
+                self.assertLessEqual(
+                    len(fn.body), 3,
+                    f"{fn.name} is too complex to be exempt from logging")
+
+    def test_venue_fields_are_not_defaulted_with_or(self):
+        """`x.get('f') or 5` turns a real 0 into 5 -- the fee-rate bug."""
+        import re
+        offenders = re.findall(
+            r'\.get\(\s*["\'](feeRateBps|decimalPrecision|chainId|collateral'
+            r'|startPrice|endPrice|amountOut|realizedPnl|priceImpact)["\']'
+            r'\s*\)\s+or\s+[^\s)]', self.src)
+        self.assertEqual(offenders, [], f"silent defaults for {offenders}")
+
+    def test_every_apierror_handler_mentions_the_error(self):
+        import ast
+        bad = []
+        for n in ast.walk(self.tree):
+            if not isinstance(n, ast.ExceptHandler) or n.type is None:
+                continue
+            if "ApiError" not in ast.unparse(n.type):
+                continue
+            body = " ".join(ast.unparse(st) for st in n.body)
+            if not ("LOG." in body or "raise" in body or "print" in body
+                    or "append" in body):
+                bad.append(n.lineno)
+        self.assertEqual(bad, [], f"ApiError handled without a trace at {bad}")
+
+
+class TestStrictFieldParsing(unittest.TestCase):
+    """Missing venue fields reject the market instead of being invented."""
+
+    def test_missing_decimal_precision_rejects(self):
+        t = TestParseRound.topic()
+        del t["markets"][0]["decimalPrecision"]
+        self.assertIsNone(PredictionClient._parse_round(t))
+
+    def test_unknown_liquidity_is_none_not_zero(self):
+        t = TestParseRound.topic()
+        del t["markets"][0]["liquidity"]
+        t.pop("liquidity", None)
+        r = PredictionClient._parse_round(t)
+        self.assertIsNotNone(r)
+        self.assertIsNone(r.liquidity)
+
+    def test_real_zero_liquidity_is_preserved(self):
+        t = TestParseRound.topic()
+        t["markets"][0]["liquidity"] = "0"
+        self.assertEqual(PredictionClient._parse_round(t).liquidity, 0.0)
+
+    def test_precision_zero_is_honoured(self):
+        t = TestParseRound.topic()
+        t["markets"][0]["decimalPrecision"] = 0
+        self.assertEqual(PredictionClient._parse_round(t).decimal_precision, 0)
+
+
+class TestQuoteValidation(unittest.TestCase):
+    """A malformed quote must fail loudly, not be coerced into plausibility."""
+
+    def _client(self, payload):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg(); c._clock_offset_ms = 0
+        c._symbol_cache = {}; c._wallet = m.WalletRef("0xabc", "w1")
+        c._request = lambda name, params=None: payload
+        c.resolved_funding_source = lambda: "MPC"
+        return c
+
+    def _quote(self, payload):
+        return self._client(payload).get_quote(make_round(), Side.UP, 5.0)
+
+    def test_valid_quote_parses(self):
+        q = self._quote({"quoteId": "q", "averagePrice": "0.6",
+                         "amountOut": "8333333333333333333",
+                         "priceImpact": "0.01", "feeAmount": "0"})
+        self.assertAlmostEqual(q.average_price, 0.6)
+        self.assertGreater(q.amount_out_shares, 8.0)
+
+    def test_missing_amount_out_raises(self):
+        with self.assertRaises(m.ApiError):
+            self._quote({"quoteId": "q", "averagePrice": "0.6"})
+
+    def test_zero_shares_raises(self):
+        with self.assertRaises(m.ApiError):
+            self._quote({"quoteId": "q", "averagePrice": "0.6",
+                         "amountOut": "0"})
+
+    def test_missing_price_impact_is_infinite_not_zero(self):
+        """Unknown impact must not silently pass the impact guard."""
+        q = self._quote({"quoteId": "q", "averagePrice": "0.6",
+                         "amountOut": "8333333333333333333"})
+        self.assertEqual(q.price_impact, float("inf"))
+        self.assertGreater(q.price_impact, cfg().max_price_impact)
+
+    def test_implausible_price_raises(self):
+        for bad in ("0", "1", "1.5", "-0.2"):
+            with self.assertRaises(m.ApiError):
+                self._quote({"quoteId": "q", "averagePrice": bad,
+                             "amountOut": "1000000000000000000"})
+
+    def test_missing_quote_id_raises(self):
+        with self.assertRaises(m.ApiError):
+            self._quote({"averagePrice": "0.6", "amountOut": "1"})
+
+
+class TestErrorClassification(unittest.TestCase):
+    """Errors are classified by the venue's numeric code, not by wording."""
+
+    def test_observed_insufficient_funds_code(self):
+        e = m.ApiError("Please ensure your account has enough USDT.", code=-9000)
+        self.assertIs(e.kind, m.ErrorKind.INSUFFICIENT_FUNDS)
+
+    def test_auth_codes(self):
+        for c in (-1022, -2014, -2015, -1002):
+            self.assertIs(m.ApiError("x", code=c).kind, m.ErrorKind.AUTH, c)
+
+    def test_timing_code(self):
+        self.assertIs(m.ApiError("x", code=-1021).kind, m.ErrorKind.TIMING)
+
+    def test_parameter_codes(self):
+        for c in (-1102, -1104, -1121):
+            self.assertIs(m.ApiError("x", code=c).kind, m.ErrorKind.PARAMETER, c)
+
+    def test_unknown_code_is_not_guessed_from_text(self):
+        """A code we do not know must not be inferred from wording."""
+        e = m.ApiError("minimum order size not met", code=-4321)
+        self.assertIs(e.kind, m.ErrorKind.UNKNOWN)
+
+    def test_message_fallback_only_without_a_code(self):
+        self.assertIs(m.ApiError("order below the minimum").kind,
+                      m.ErrorKind.SIZE)
+        self.assertIs(m.ApiError("account has enough USDT? no").kind,
+                      m.ErrorKind.INSUFFICIENT_FUNDS)
+        self.assertIs(m.ApiError("Signature for this request").kind,
+                      m.ErrorKind.AUTH)
+
+    def test_unrecognised_text_is_unknown(self):
+        self.assertIs(m.ApiError("something odd happened").kind,
+                      m.ErrorKind.UNKNOWN)
+
+    def test_code_and_status_are_retained(self):
+        e = m.ApiError("x", code=-9000, status=400)
+        self.assertEqual((e.code, e.status), (-9000, 400))
+
+    def test_request_attaches_the_code(self):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg(); c._clock_offset_ms = 0
+        c._symbol_cache = {}; c._wallet = None
+
+        class S:
+            def request(self, method, url, timeout=None):
+                return types.SimpleNamespace(
+                    status_code=400, text="",
+                    json=lambda: {"code": -9000, "msg": "not enough USDT"})
+        c._session = S()
+        with self.assertRaises(m.ApiError) as ctx:
+            c._request("market_list")
+        self.assertEqual(ctx.exception.code, -9000)
+        self.assertIs(ctx.exception.kind, m.ErrorKind.INSUFFICIENT_FUNDS)
+
+
+class TestNoRawTracebacks(unittest.TestCase):
+    """CLI commands must fail with a message, never a traceback."""
+
+    def test_every_command_dispatch_is_wrapped(self):
+        import ast, inspect
+        tree = ast.parse(inspect.getsource(m))
+        main_fn = next(n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == "main")
+        src = ast.unparse(main_fn)
+        self.assertIn("except ApiError", src)
+        self.assertIn("except KeyboardInterrupt", src)
+
+    def test_trader_run_is_wrapped(self):
+        import ast, inspect
+        tree = ast.parse(inspect.getsource(m))
+        main_fn = next(n for n in ast.walk(tree)
+                       if isinstance(n, ast.FunctionDef) and n.name == "main")
+        src = ast.unparse(main_fn)
+        idx = src.find("Trader(cfg).run()")
+        self.assertGreater(idx, 0)
+        self.assertIn("except ApiError", src[idx - 200:idx + 300])
+
+
+class TestSchemaConformance(unittest.TestCase):
+    """
+    Every API call must conform to the connector's schema.
+
+    This is the check that does not depend on my model of the API: the
+    connector is generated from Binance's own OpenAPI spec, so it catches
+    assumptions that the unit tests share with the code under test.
+    """
+
+    def test_all_calls_conform(self):
+        import subprocess, os as _os
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        conf = _os.path.join(here, "conformance.py")
+        if not _os.path.exists(conf):
+            self.skipTest("conformance.py not present")
+        r = subprocess.run(
+            [sys.executable, conf, "--source",
+             _os.path.join(here, "btc_5m_predictor.py")],
+            capture_output=True, text=True, cwd=here)
+        if r.returncode == 2:
+            self.skipTest("connector not installed")
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:])
+
+
+class TestBoundaryConditions(unittest.TestCase):
+    """
+    Boundaries surfaced by mutation testing: each of these lines could be
+    changed without any test noticing, which means they were never checked.
+    """
+
+    def test_exactly_zero_edge_does_not_trade(self):
+        c = cfg()
+        be = breakeven_probability(0.60, 200)
+        self.assertEqual(m.kelly_stake(1000, be, 0.60, c, 200), 0.0)
+
+    def test_edge_a_hair_above_breakeven_does_trade(self):
+        c = cfg(min_stake_usdt=0.5, max_stake_pct=0.25)
+        be = breakeven_probability(0.60, 200)
+        self.assertGreater(m.kelly_stake(10_000, be + 0.05, 0.60, c, 200), 0.0)
+
+    def test_zero_bankroll_does_not_trade(self):
+        self.assertEqual(m.kelly_stake(0.0, 0.99, 0.10, cfg()), 0.0)
+
+    def test_negative_bankroll_does_not_trade(self):
+        self.assertEqual(m.kelly_stake(-50.0, 0.99, 0.10, cfg()), 0.0)
+
+    def test_hundred_percent_fee_leaves_no_odds(self):
+        self.assertEqual(m.kelly_stake(1000, 0.99, 0.60, cfg(), 10_000), 0.0)
+
+    def test_negative_fee_from_payload_is_rejected(self):
+        """A negative rate would inflate net odds and therefore stake size."""
+        t = TestParseRound.topic(feeRateBps=-100)
+        self.assertIsNone(PredictionClient._parse_round(t))
+
+    def test_fee_at_or_above_100pct_is_rejected(self):
+        for bad in (10_000, 20_000):
+            self.assertIsNone(
+                PredictionClient._parse_round(TestParseRound.topic(feeRateBps=bad)))
+
+    def test_zero_fee_is_accepted(self):
+        self.assertEqual(
+            PredictionClient._parse_round(TestParseRound.topic(feeRateBps=0)).fee_bps, 0)
+
+    def test_tie_at_expiry_resolves_down_locally(self):
+        self.assertEqual(digital_up_probability(100_000, 100_000, 0.5, 0), 0.0)
+
+    def test_a_hair_above_strike_resolves_up(self):
+        self.assertEqual(digital_up_probability(100_000.01, 100_000, 0.5, 0), 1.0)
+
+    def test_book_level_at_price_one_is_ignored(self):
+        self.assertIsNone(m.walk_book([(1.0, 1000)], 10.0))
+
+    def test_book_level_above_one_is_ignored(self):
+        self.assertIsNone(m.walk_book([(1.5, 1000)], 10.0))
+
+    def test_book_mixes_valid_and_degenerate_levels(self):
+        avg = m.walk_book([(1.0, 500), (0.50, 1000), (0.0, 10)], 100.0)
+        self.assertAlmostEqual(avg, 0.50)
+
+    def test_stake_exactly_at_minimum_is_accepted(self):
+        c = cfg(min_stake_usdt=1.0, max_stake_pct=0.25, kelly_fraction=1.0)
+        self.assertGreater(m.kelly_stake(4.0, 0.99, 0.05, c, 0), 0.0)
+
+    def test_round_target_is_applied_from_config(self):
+        """Regression: round_seconds was never exercised end to end."""
+        c = cfg(round_seconds=600)
+        PredictionClient(c)                     # sets the class attribute
+        try:
+            base = 1_700_000_000_000
+            ok = TestParseRound.topic(startDate=base, endDate=base + 600_000)
+            bad = TestParseRound.topic(startDate=base, endDate=base + 300_000)
+            self.assertIsNotNone(PredictionClient._parse_round(ok))
+            self.assertIsNone(PredictionClient._parse_round(bad))
+        finally:
+            PredictionClient(cfg())             # restore the 300s default
+
+    def test_config_stake_bounds_are_enforced_at_the_edges(self):
+        Config(api_key="k", api_secret="s", max_stake_pct=0.25)
+        with self.assertRaises(ValueError):
+            Config(api_key="k", api_secret="s", hard_stake_ceiling=0.6)
+        with self.assertRaises(ValueError):
+            Config(api_key="k", api_secret="s", hard_stake_multiple=0.5)
+        with self.assertRaises(ValueError):
+            Config(api_key="k", api_secret="s", max_stake_pct=0.26)
+
+    def test_tail_df_floor_must_exceed_two(self):
+        Config(api_key="k", api_secret="s", tail_df_floor=2.01)
+        with self.assertRaises(ValueError):
+            Config(api_key="k", api_secret="s", tail_df_floor=2.0)
+
+
+class TestOrderResponseHandling(unittest.TestCase):
+    """place_order paths, which mutation testing showed were unexercised."""
+
+    def _client(self, payload):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg(); c._clock_offset_ms = 0
+        c._symbol_cache = {}; c._wallet = m.WalletRef("0xabc", "w1")
+        c._request = lambda name, params=None: payload
+        c._resolved_account_type = lambda: "SPOT"
+        c.resolved_funding_source = lambda: "CEX"
+        return c
+
+    def test_successful_order_returns_the_id(self):
+        c = self._client({"orderId": "12345"})
+        q = m.Quote("q", 0.6, 8.0, 0.0, 0.0)
+        self.assertEqual(c.place_order(make_round(), q), "12345")
+
+    def test_missing_order_id_raises(self):
+        c = self._client({"status": "ACCEPTED"})
+        q = m.Quote("q", 0.6, 8.0, 0.0, 0.0)
+        with self.assertRaises(m.ApiError):
+            c.place_order(make_round(), q)
+
+    def test_empty_order_id_raises(self):
+        c = self._client({"orderId": ""})
+        q = m.Quote("q", 0.6, 8.0, 0.0, 0.0)
+        with self.assertRaises(m.ApiError):
+            c.place_order(make_round(), q)
+
+
+class TestTieSettlement(unittest.TestCase):
+    """An exact close at the strike must not be guessed on a real position."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _trader(self, client):
+        c = cfg(db_path=self.db)
+        return build_trader(client, c, self.db)
+
+    def test_exact_tie_is_left_unsettled(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start,
+                         end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0),
+                (start + m.DEFAULT_ROUND_SECONDS * 1000 + 3_000, 100_000.0)]
+        client = FakeClient([rnd], path, {(1, Side.UP): [(0.55, 10_000)]}, {})
+        t = self._trader(client)
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIsNotNone(t._position)
+
+        client.t = 2
+        client.final_price = lambda r: 100_000.0    # exactly the strike
+        t._settle_open()
+        self.assertIsNotNone(t._position)           # held, not guessed
+
+
+class TestHostilePayloads(unittest.TestCase):
+    """
+    Regressions from property-based fuzzing. Every case here was a real crash
+    found by random input, not by anyone imagining it.
+    """
+
+    def test_asks_as_a_scalar_does_not_crash(self):
+        self.assertIsNone(PredictionClient._parse_asks({"asks": 4477054861}))
+
+    def test_asks_as_a_string_does_not_crash(self):
+        self.assertIsNone(PredictionClient._parse_asks({"asks": "0.5"}))
+
+    def test_asks_as_a_dict_does_not_crash(self):
+        self.assertIsNone(PredictionClient._parse_asks({"asks": {"a": 1}}))
+
+    def test_infinite_numeric_does_not_crash_parsing(self):
+        """OverflowError is not a ValueError; int(inf) raises it."""
+        t = TestParseRound.topic()
+        t["markets"][0]["marketId"] = float("inf")
+        self.assertIsNone(PredictionClient._parse_round(t))
+
+    def test_scientific_overflow_string_is_rejected(self):
+        t = TestParseRound.topic()
+        t["markets"][0]["outcomes"][0]["price"] = "1e999"   # parses to inf
+        self.assertIsNone(PredictionClient._parse_round(t))
+
+    def test_nan_price_is_rejected(self):
+        t = TestParseRound.topic()
+        t["markets"][0]["outcomes"][0]["price"] = "nan"
+        self.assertIsNone(PredictionClient._parse_round(t))
+
+    def test_infinite_liquidity_becomes_unknown(self):
+        t = TestParseRound.topic()
+        t["markets"][0]["liquidity"] = "1e999"
+        r = PredictionClient._parse_round(t)
+        self.assertIsNotNone(r)
+        self.assertIsNone(r.liquidity)
+
+    def test_infinite_start_price_is_rejected(self):
+        strike, _ = PredictionClient._parse_variant({"startPrice": "1e999"})
+        self.assertIsNone(strike)
+
+    def test_nan_start_price_is_rejected(self):
+        strike, _ = PredictionClient._parse_variant({"startPrice": "nan"})
+        self.assertIsNone(strike)
+
+    def test_non_finite_book_levels_are_skipped(self):
+        got = PredictionClient._parse_asks(
+            {"asks": [["nan", "10"], ["1e999", "5"], ["0.4", "100"]]})
+        self.assertEqual(got, [(0.4, 100.0)])
+
+    def test_null_bytes_in_strings_do_not_crash(self):
+        t = TestParseRound.topic()
+        t["slug"] = "btc\x00updown"
+        self.assertIsNotNone(PredictionClient._parse_round(t))
+
+    def test_deeply_nested_garbage_does_not_crash(self):
+        for payload in ({"markets": [{"outcomes": [{"price": {"a": [1]}}]}]},
+                        {"markets": "not-a-list"},
+                        {"markets": [None]},
+                        {"variantData": [1, 2, 3]}):
+            self.assertIsNone(PredictionClient._parse_round(payload))
+
+
+class TestPropertyInvariants(unittest.TestCase):
+    """A fast in-suite slice of the fuzzer, so CI enforces the invariants."""
+
+    def test_fuzz_suite_passes(self):
+        import subprocess, os as _os
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        fz = _os.path.join(here, "fuzz.py")
+        if not _os.path.exists(fz):
+            self.skipTest("fuzz.py not present")
+        r = subprocess.run([sys.executable, fz, "--trials", "400"],
+                           capture_output=True, text=True, cwd=here)
+        self.assertEqual(r.returncode, 0, r.stdout[-2000:])
+
+
+class TestFundingSourceDerivation(unittest.TestCase):
+    """
+    Regression for -3026.
+
+    Three places can hold collateral. `accountType` on place-order accepts
+    only SPOT|FUNDING; the prediction wallet is not a legal value there and
+    passing it through is what the venue rejected.
+    """
+
+    def _client(self, options, cfg_funding="AUTO", cfg_account="AUTO"):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg(funding_source=cfg_funding, account_type=cfg_account)
+        c.payment_options = lambda: options
+        return c
+
+    def test_spot_account_funds_from_cex(self):
+        c = self._client([("SPOT", 50.0, True)])
+        self.assertEqual(c.funding_plan()[:2], ("SPOT", "CEX"))
+
+    def test_funding_account_funds_from_cex(self):
+        c = self._client([("FUNDING", 50.0, True)])
+        self.assertEqual(c.funding_plan()[:2], ("FUNDING", "CEX"))
+
+    def test_prediction_wallet_funds_from_mpc(self):
+        """The reported bug: funds in the prediction account."""
+        c = self._client([("SPOT", 0.0, True),
+                          ("PREDICTION", 6.64, True)])
+        account, funding, holder = c.funding_plan()
+        self.assertEqual(funding, "MPC")
+        self.assertEqual(holder, "PREDICTION")
+        self.assertIn(account, m.CEX_ACCOUNT_TYPES)   # never the raw holder
+
+    def test_prediction_holder_never_leaks_into_account_type(self):
+        for name in ("PREDICTION", "MPC", "PREDICTION_WALLET", "WEB3"):
+            c = self._client([(name, 9.0, True)])
+            self.assertIn(c.funding_plan()[0], m.CEX_ACCOUNT_TYPES, name)
+
+    def test_no_options_at_all_still_yields_a_legal_account(self):
+        c = self._client([])
+        account, funding, holder = c.funding_plan()
+        self.assertIn(account, m.CEX_ACCOUNT_TYPES)
+        self.assertEqual(funding, "MPC")
+        self.assertIsNone(holder)
+
+    def test_explicit_override_is_respected(self):
+        c = self._client([("SPOT", 50.0, True)], cfg_funding="MPC")
+        self.assertEqual(c.funding_plan()[1], "MPC")
+
+    def test_explicit_invalid_account_type_is_rejected(self):
+        c = self._client([("SPOT", 50.0, True)], cfg_account="FUNDING")
+        self.assertEqual(c.funding_plan()[0], "FUNDING")
+
+    def test_disabled_options_are_ignored_when_planning(self):
+        c = self._client([("SPOT", 100.0, False), ("FUNDING", 5.0, True)])
+        self.assertEqual(c.funding_plan()[0], "FUNDING")
+
+    def test_default_config_is_auto(self):
+        self.assertEqual(cfg().funding_source, "AUTO")
+
+    def test_invalid_funding_source_rejected(self):
+        with self.assertRaises(ValueError):
+            cfg(funding_source="WALLET")
+
+    def _order_client(self, options):
+        sent = {}
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg(); c._wallet = m.WalletRef("0xa", "w1")
+        c.payment_options = lambda: options
+        c._request = lambda name, params=None: (sent.update(params or {}),
+                                                {"orderId": "1"})[1]
+        return c, sent
+
+    def test_cex_order_includes_a_fund_transfer(self):
+        c, sent = self._order_client([("SPOT", 50.0, True)])
+        c.place_order(make_round(), m.Quote("q", 0.6, 8.0, 0.0, 0.0), 1.5)
+        self.assertEqual(sent["fundingSource"], "CEX")
+        self.assertEqual(sent["fundTransferAmount"], m.to_wei(1.5))
+
+    def test_prediction_wallet_order_omits_the_transfer(self):
+        """Funds already in place: nothing to move."""
+        c, sent = self._order_client([("PREDICTION", 6.64, True)])
+        c.place_order(make_round(), m.Quote("q", 0.6, 8.0, 0.0, 0.0), 1.5)
+        self.assertEqual(sent["fundingSource"], "MPC")
+        self.assertNotIn("fundTransferAmount", sent)
+        self.assertIn(sent["accountType"], m.CEX_ACCOUNT_TYPES)
+
+    def test_order_never_sends_an_illegal_account_type(self):
+        for holder in ("PREDICTION", "MPC", "WEB3", "SPOT", "FUNDING"):
+            c, sent = self._order_client([(holder, 9.0, True)])
+            c.place_order(make_round(), m.Quote("q", 0.6, 8.0, 0.0, 0.0), 1.0)
+            self.assertIn(sent["accountType"], m.CEX_ACCOUNT_TYPES, holder)
+
+    def test_time_in_force_matches_market_order_type(self):
+        c, sent = self._order_client([("SPOT", 50.0, True)])
+        c.place_order(make_round(), m.Quote("q", 0.6, 8.0, 0.0, 0.0), 1.0)
+        self.assertEqual((sent["orderType"], sent["timeInForce"]),
+                         ("MARKET", "FOK"))
+
+
+class TestProfileDefaults(unittest.TestCase):
+
+    def test_micro_is_the_cli_default(self):
+        import inspect, re as _re
+        src = inspect.getsource(m.main)
+        hit = _re.search(r'"--profile".*?default="(\w+)"', src, _re.S)
+        self.assertEqual(hit.group(1), "micro")
+
+    def test_micro_simulates_a_small_account(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["micro"])
+        self.assertLessEqual(c.paper_start_bankroll, 10.0)
+
+    def test_each_profile_declares_its_own_paper_bankroll(self):
+        for name, prof in m.PROFILES.items():
+            self.assertIn("paper_start_bankroll", prof, name)
+
+    def test_micro_paper_bankroll_can_actually_trade(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["micro"])
+        self.assertGreater(
+            m.kelly_stake(c.paper_start_bankroll, 0.70, 0.60, c, 0), 0.0)
+
+    def test_every_profile_paper_bankroll_can_trade(self):
+        for name, prof in m.PROFILES.items():
+            c = Config(api_key="k", api_secret="s", **prof)
+            mid = (c.min_entry_price + c.max_entry_price) / 2
+            stake = m.kelly_stake(c.paper_start_bankroll, min(mid * 1.6, 0.99),
+                                  mid, c, 0)
+            self.assertGreater(stake, 0.0, f"{name} cannot trade its own "
+                                           f"paper bankroll")
+
+
+class TestPerProfileReport(unittest.TestCase):
+    """Pooling profiles averages disjoint price bands into a meaningless bias."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _fill(self, profile, price, wins, losses):
+        j = Journal(self.db, profile)
+        for i in range(wins + losses):
+            sig = Signal(Side.UP, price + 0.05, price, 0.05, 1.0, 60.0)
+            t = j.record("PAPER", make_round(), sig, 1e5, 0.5, 10.0)
+            j.resolve(t, i < wins, 1.0 if i < wins else -1.0, "venue")
+
+    def test_profiles_are_reported_separately(self):
+        self._fill("micro", 0.60, 30, 20)
+        self._fill("convex", 0.15, 5, 45)
+        report = Journal(self.db).calibration_report()
+        self.assertIn("PROFILE: micro", report)
+        self.assertIn("PROFILE: convex", report)
+
+    def test_single_profile_can_be_selected(self):
+        self._fill("micro", 0.60, 30, 20)
+        self._fill("convex", 0.15, 5, 45)
+        report = Journal(self.db).calibration_report("convex")
+        self.assertIn("convex", report)
+        self.assertNotIn("PROFILE: micro", report)
+
+    def test_hit_rates_do_not_bleed_between_profiles(self):
+        self._fill("micro", 0.60, 40, 0)        # 100%
+        self._fill("convex", 0.15, 0, 40)       # 0%
+        micro = Journal(self.db).calibration_report("micro")
+        convex = Journal(self.db).calibration_report("convex")
+        self.assertIn("100.0%", micro)
+        self.assertIn("0.0%", convex)
+
+    def test_small_sample_is_not_given_a_verdict(self):
+        self._fill("micro", 0.60, 3, 2)
+        self.assertIn("too few", Journal(self.db).calibration_report("micro"))
+
+    def test_unknown_profile_reports_cleanly(self):
+        self._fill("micro", 0.60, 5, 5)
+        self.assertIn("No resolved trades",
+                      Journal(self.db).calibration_report("nonexistent"))
+
+    def test_legacy_journal_without_profile_column_still_reads(self):
+        import sqlite3 as sq
+        conn = sq.connect(self.db)
+        conn.execute("DROP TABLE IF EXISTS trades")
+        conn.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, ts INTEGER,"
+                     " mode TEXT, slug TEXT, topic_id INTEGER, side TEXT,"
+                     " strike REAL, spot REAL, sigma REAL, seconds_left REAL,"
+                     " end_ms INTEGER, model_prob REAL, fill_price REAL,"
+                     " edge REAL, stake REAL, bankroll_before REAL,"
+                     " order_id TEXT, resolved INTEGER, won INTEGER, pnl REAL,"
+                     " settle_source TEXT)")
+        conn.execute("INSERT INTO trades (model_prob, fill_price, won, pnl,"
+                     " stake, resolved) VALUES (0.7, 0.6, 1, 1.0, 1.0, 1)")
+        conn.commit(); conn.close()
+        self.assertIn("unknown", Journal(self.db).calibration_report())
+
+
+class TestPredictionWalletBalance(unittest.TestCase):
+    """
+    payment-options covers the CEX accounts only. A prediction wallet funded
+    directly does not appear there, which reported 0.00 for a funded account.
+    """
+
+    def _client(self, options, wallet_value):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg(account_type="AUTO")
+        c.payment_options = lambda: options
+        c.prediction_wallet_value = lambda: wallet_value
+        return c
+
+    def test_prediction_wallet_balance_is_found(self):
+        c = self._client([("SPOT", 0.0, True)], 6.64)
+        self.assertAlmostEqual(c.balance_usdt(), 6.64)
+
+    def test_larger_cex_balance_wins(self):
+        c = self._client([("SPOT", 500.0, True)], 6.64)
+        self.assertAlmostEqual(c.balance_usdt(), 500.0)
+
+    def test_unreadable_portfolio_falls_back_to_cex(self):
+        c = self._client([("SPOT", 12.0, True)], None)
+        self.assertAlmostEqual(c.balance_usdt(), 12.0)
+
+    def test_nothing_anywhere_raises(self):
+        c = self._client([], None)
+        with self.assertRaises(m.ApiError):
+            c.balance_usdt()
+
+    def test_empty_options_with_funded_wallet_still_works(self):
+        c = self._client([], 6.64)
+        self.assertAlmostEqual(c.balance_usdt(), 6.64)
+
+    def test_portfolio_parses_total_current_value(self):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg(); c._wallet = m.WalletRef("0xa", "w1")
+        c._request = lambda name, params=None: {"totalCurrentValue": "6.64"}
+        self.assertAlmostEqual(c.prediction_wallet_value(), 6.64)
+
+    def test_portfolio_rejects_non_finite_value(self):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg(); c._wallet = m.WalletRef("0xa", "w1")
+        c._request = lambda name, params=None: {"totalCurrentValue": "1e999"}
+        self.assertIsNone(c.prediction_wallet_value())
+
+    def test_portfolio_missing_field_is_none(self):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg(); c._wallet = m.WalletRef("0xa", "w1")
+        c._request = lambda name, params=None: {"walletAddress": "0xa"}
+        self.assertIsNone(c.prediction_wallet_value())
+
+
+class TestBufferGate(unittest.TestCase):
+    """'Big buffer, late in the round' expressed as sigmas of time remaining."""
+
+    def test_buffer_grows_as_time_runs_out(self):
+        a = m.buffer_sigmas(65_130, 65_000, 0.5, 240)
+        b = m.buffer_sigmas(65_130, 65_000, 0.5, 30)
+        self.assertGreater(b, a)
+
+    def test_buffer_sign_follows_direction(self):
+        self.assertGreater(m.buffer_sigmas(65_100, 65_000, 0.5, 60), 0)
+        self.assertLess(m.buffer_sigmas(64_900, 65_000, 0.5, 60), 0)
+
+    def test_at_the_money_is_zero_buffer(self):
+        self.assertAlmostEqual(m.buffer_sigmas(65_000, 65_000, 0.5, 60), 0.0)
+
+    def test_expiry_is_infinite_buffer(self):
+        self.assertEqual(m.buffer_sigmas(65_001, 65_000, 0.5, 0), math.inf)
+        self.assertEqual(m.buffer_sigmas(64_999, 65_000, 0.5, 0), -math.inf)
+
+    def test_buffer_matches_the_pricing_z(self):
+        """The gate and the model must use the same quantity."""
+        z = m.buffer_sigmas(65_130, 65_000, 0.5, 60)
+        self.assertAlmostEqual(m.digital_up_probability(65_130, 65_000, 0.5, 60),
+                               m.norm_cdf(z), places=12)
+
+    def test_gate_blocks_small_buffers(self):
+        c = cfg(min_buffer_sigmas=2.0, **{k: v for k, v in
+                m.PROFILES["buffer"].items() if k != "min_buffer_sigmas"})
+        rnd = make_round(strike=65_000.0, fee_bps=0)
+        now = rnd.end_ms - 60_000
+        book = {Side.UP: [(0.85, 100_000)]}
+        self.assertIsNone(evaluate(rnd, 65_010, 0.5, 1000, now, c, book))
+
+    def test_gate_allows_large_buffers(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        rnd = make_round(strike=65_000.0, fee_bps=0)
+        now = rnd.end_ms - 60_000
+        book = {Side.UP: [(0.90, 100_000)]}
+        sig = evaluate(rnd, 65_180, 0.5, 1000, now, c, book)
+        self.assertIsNotNone(sig)
+        self.assertGreaterEqual(abs(sig.buffer_z), c.min_buffer_sigmas)
+
+    def test_never_bets_against_the_buffer(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        rnd = make_round(strike=65_000.0, fee_bps=0)
+        now = rnd.end_ms - 60_000
+        book = {Side.UP: [(0.90, 1e5)], Side.DOWN: [(0.82, 1e5)]}
+        sig = evaluate(rnd, 65_180, 0.5, 1000, now, c, book)
+        if sig is not None:
+            self.assertIs(sig.side, Side.UP)
+
+    def test_buffer_profile_trades_the_high_band(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        self.assertGreaterEqual(c.min_entry_price, 0.80)
+        self.assertLessEqual(c.max_entry_price, 0.97)
+
+    def test_other_profiles_still_refuse_that_band(self):
+        for name in ("convex", "favorite", "micro"):
+            c = Config(api_key="k", api_secret="s", **m.PROFILES[name])
+            self.assertLess(c.max_entry_price, 0.90, name)
+
+    def test_gate_disabled_by_default_elsewhere(self):
+        for name in ("convex", "favorite", "micro", "balanced"):
+            c = Config(api_key="k", api_secret="s", **m.PROFILES[name])
+            self.assertEqual(c.min_buffer_sigmas, 0.0, name)
+
+    def test_negative_gate_rejected(self):
+        with self.assertRaises(ValueError):
+            cfg(min_buffer_sigmas=-1.0)
+
+
+class TestBufferReport(unittest.TestCase):
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def test_report_buckets_by_buffer(self):
+        j = Journal(self.db, "buffer")
+        for z, won, pnl in [(2.5, True, 0.05)] * 40 + [(2.5, False, -1.0)] * 3:
+            sig = Signal(Side.UP, 0.97, 0.95, 0.02, 1.0, 40.0, z)
+            t = j.record("PAPER", make_round(), sig, 65_000, 0.5, 25.0)
+            j.resolve(t, won, pnl, "venue")
+        report = j.calibration_report("buffer")
+        self.assertIn("By buffer", report)
+        self.assertIn("2-3", report)
+
+    def test_high_win_rate_with_negative_pnl_is_visible(self):
+        """The failure mode of trading near-certainties."""
+        j = Journal(self.db, "buffer")
+        for won, pnl in [(True, 0.05)] * 40 + [(False, -1.0)] * 3:
+            sig = Signal(Side.UP, 0.97, 0.95, 0.02, 1.0, 40.0, 2.5)
+            t = j.record("PAPER", make_round(), sig, 65_000, 0.5, 25.0)
+            j.resolve(t, won, pnl, "venue")
+        report = j.calibration_report("buffer")
+        self.assertIn("-1.00", report)      # 40*0.05 - 3*1.00 = -1.00
+
+
+class TestHostingReadiness(unittest.TestCase):
+    """Behaviours a hosted deployment depends on."""
+
+    def test_sigterm_handler_is_installed(self):
+        import signal as _sig
+        c = cfg()
+        t = Trader.__new__(Trader)
+        t._cfg = c; t._stopping = False
+        previous = _sig.getsignal(_sig.SIGTERM)
+        try:
+            t._install_signal_handlers()
+            self.assertNotEqual(_sig.getsignal(_sig.SIGTERM), previous)
+        finally:
+            _sig.signal(_sig.SIGTERM, previous)
+
+    def test_sigterm_sets_stopping_rather_than_dying(self):
+        import signal as _sig
+        t = Trader.__new__(Trader)
+        t._cfg = cfg(); t._stopping = False
+        previous = _sig.getsignal(_sig.SIGTERM)
+        try:
+            t._install_signal_handlers()
+            _sig.getsignal(_sig.SIGTERM)(_sig.SIGTERM, None)
+            self.assertTrue(t._stopping)
+        finally:
+            _sig.signal(_sig.SIGTERM, previous)
+
+    def test_second_sigterm_exits_immediately(self):
+        import signal as _sig
+        t = Trader.__new__(Trader)
+        t._cfg = cfg(); t._stopping = True
+        previous = _sig.getsignal(_sig.SIGTERM)
+        try:
+            t._install_signal_handlers()
+            with self.assertRaises(SystemExit):
+                _sig.getsignal(_sig.SIGTERM)(_sig.SIGTERM, None)
+        finally:
+            _sig.signal(_sig.SIGTERM, previous)
+
+    def test_451_is_classified_as_geo_blocked(self):
+        e = m.ApiError("Unavailable For Legal Reasons", status=451)
+        self.assertIs(e.kind, m.ErrorKind.GEO_BLOCKED)
+
+    def test_451_beats_any_code_present(self):
+        e = m.ApiError("x", code=-1102, status=451)
+        self.assertIs(e.kind, m.ErrorKind.GEO_BLOCKED)
+
+    def test_public_endpoint_reports_geo_block(self):
+        c = PredictionClient.__new__(PredictionClient)
+        c._cfg = cfg()
+
+        class S:
+            def get(self, url, params=None, timeout=None):
+                return types.SimpleNamespace(status_code=451, text="")
+        c._session = S()
+        with self.assertRaises(m.ApiError) as ctx:
+            c.spot_price()
+        self.assertIs(ctx.exception.kind, m.ErrorKind.GEO_BLOCKED)
+
+    def test_shutdown_is_not_a_trading_halt(self):
+        """A restart must not be recorded as a risk-limit breach."""
+        self.assertFalse(issubclass(m.Shutdown, TradingHalted))
+
+
+class TestPeriodicReport(unittest.TestCase):
+    """Hosted workers cannot easily read the journal file."""
+
+    def test_report_every_is_off_by_default(self):
+        self.assertEqual(cfg().report_every, 0)
+
+    def test_negative_report_every_rejected(self):
+        with self.assertRaises(ValueError):
+            cfg(report_every=-1)
+
+    def test_report_every_accepted(self):
+        self.assertEqual(cfg(report_every=25).report_every, 25)
+
+    def test_report_is_logged_on_the_interval(self):
+        """
+        Drives the real settlement path rather than re-implementing it.
+
+        The previous version copied the counter logic into the test, so it
+        asserted that the test's own code worked -- it would have passed even
+        if the feature had been deleted from the bot.
+        """
+        import logging as _log
+        fd, db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            c = cfg(db_path=db, report_every=2, profile_name="micro")
+            start = 1_700_000_000_000
+            rnd = make_round(strike=65_000.0, start_ms=start,
+                             end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
+            path = [(start, 65_000.0), (start + 240_000, 65_200.0),
+                    (start + m.DEFAULT_ROUND_SECONDS * 1000 + 3_000, 65_200.0)]
+            client = FakeClient([rnd], path, {}, {1: Side.UP})
+            t = build_trader(client, c, db)
+
+            records = []
+
+            class Cap(_log.Handler):
+                def emit(self, rec):
+                    records.append(rec.getMessage())
+
+            handler = Cap()
+            previous = m.LOG.level
+            m.LOG.setLevel(_log.INFO)      # default is WARNING; INFO is filtered
+            m.LOG.addHandler(handler)
+            try:
+                for _ in range(2):
+                    sig = Signal(Side.UP, 0.80, 0.60, 0.05, 1.0, 40.0, 2.4)
+                    tid = t._journal.record("PAPER", rnd, sig, 65_200, 0.5, 10.0)
+                    t._position = Position(tid, rnd, sig)
+                    client.t = 2
+                    t._settle_open()
+            finally:
+                m.LOG.removeHandler(handler)
+                m.LOG.setLevel(previous)
+
+            self.assertTrue(any(r.startswith("| ") for r in records),
+                            "no calibration report emitted by _settle_open")
+        finally:
+            os.unlink(db)
+
+    def test_report_not_logged_when_disabled(self):
+        import logging as _log
+        fd, db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            c = cfg(db_path=db, report_every=0)
+            start = 1_700_000_000_000
+            rnd = make_round(strike=65_000.0, start_ms=start,
+                             end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
+            path = [(start, 65_000.0), (start + 240_000, 65_200.0),
+                    (start + m.DEFAULT_ROUND_SECONDS * 1000 + 3_000, 65_200.0)]
+            client = FakeClient([rnd], path, {}, {1: Side.UP})
+            t = build_trader(client, c, db)
+            records = []
+
+            class Cap(_log.Handler):
+                def emit(self, rec):
+                    records.append(rec.getMessage())
+
+            handler = Cap()
+            previous = m.LOG.level
+            m.LOG.setLevel(_log.INFO)
+            m.LOG.addHandler(handler)
+            try:
+                sig = Signal(Side.UP, 0.80, 0.60, 0.05, 1.0, 40.0, 2.4)
+                tid = t._journal.record("PAPER", rnd, sig, 65_200, 0.5, 10.0)
+                t._position = Position(tid, rnd, sig)
+                client.t = 2
+                t._settle_open()
+            finally:
+                m.LOG.removeHandler(handler)
+                m.LOG.setLevel(previous)
+            self.assertFalse(any(r.startswith("| ") for r in records))
+        finally:
+            os.unlink(db)
+
+
+class TestDiagnose(unittest.TestCase):
+    """Is the edge real? The one question that decides everything."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _fill(self, price, true_rate, n, seed=1):
+        import random as _r
+        rng = _r.Random(seed)
+        j = Journal(self.db, "buffer")
+        for _ in range(n):
+            won = rng.random() < true_rate
+            sig = Signal(Side.UP, 0.80, price, 0.05, 2.5, 40.0, 2.4)
+            t = j.record("PAPER", make_round(), sig, 65_000, 0.5, 25.0)
+            j.resolve(t, won, settle_pnl(2.5, price, won, 200), "venue")
+        return j
+
+    def test_clear_edge_is_reported(self):
+        j = self._fill(0.714, 0.90, 300)
+        out = j.diagnose("buffer")
+        self.assertIn("EDGE", out)
+        self.assertIn("Kelly", out)
+
+    def test_clear_absence_of_edge_is_reported(self):
+        j = self._fill(0.714, 0.45, 300)
+        out = j.diagnose("buffer")
+        self.assertIn("NO EDGE", out)
+        self.assertIn("cannot change its sign", out)
+
+    def test_marginal_case_is_called_unclear_not_guessed(self):
+        """A 4-point shortfall needs ~525 trades; 200 must not be a verdict."""
+        j = self._fill(0.714, 0.68, 200)
+        out = j.diagnose("buffer")
+        self.assertIn("Inconclusive", out)
+
+    def test_tiny_sample_is_never_given_a_verdict(self):
+        j = self._fill(0.714, 0.20, 10)
+        out = j.diagnose("buffer")
+        self.assertIn("too few", out)
+
+    def test_losing_advice_never_suggests_raising_stake(self):
+        j = self._fill(0.714, 0.45, 300)
+        out = j.diagnose("buffer").lower()
+        self.assertIn("bigger buffer", out)
+        self.assertNotIn("increase the stake", out)
+
+    def test_winning_advice_warns_against_manual_sizing_up(self):
+        j = self._fill(0.714, 0.90, 300)
+        self.assertIn("Do NOT raise the stake cap", j.diagnose("buffer"))
+
+    def test_breakeven_used_matches_the_price_paid(self):
+        j = self._fill(0.60, 0.90, 100)
+        out = j.diagnose("buffer")
+        expected = f"{breakeven_probability(0.60, 200):.1%}"
+        self.assertIn(expected, out)
+
+    def test_empty_journal_is_handled(self):
+        self.assertIn("No resolved trades", Journal(self.db).diagnose())
+
+    def test_scaling_stake_cannot_flip_expectancy(self):
+        """The claim the advice rests on, asserted directly."""
+        q, price, fee = 0.68, 0.714, 200
+        signs = set()
+        for stake in (0.5, 2.5, 10.0, 100.0, 1000.0):
+            ev = (q * settle_pnl(stake, price, True, fee)
+                  + (1 - q) * settle_pnl(stake, price, False, fee))
+            signs.add(ev > 0)
+        self.assertEqual(len(signs), 1)      # stake never changes the sign
+
+    def test_lower_price_improves_the_win_loss_ratio(self):
+        hi = settle_pnl(10, 0.90, True, 0) / 10
+        lo = settle_pnl(10, 0.60, True, 0) / 10
+        self.assertGreater(lo, hi)
+
+
+class TestScaleIn(unittest.TestCase):
+    """
+    Top up while winning -- the opposite of martingale, which adds after
+    losses. The target is recomputed from the current probability, so total
+    exposure to one round stays bounded by Kelly.
+    """
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _setup(self, spot_now, **over):
+        settings = dict(m.PROFILES["buffer"]); settings.update(over)
+        c = cfg(db_path=self.db, **settings)
+        start = 1_700_000_000_000
+        rnd = make_round(strike=65_000.0, start_ms=start, fee_bps=0,
+                         end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
+        path = [(start, 65_000.0), (start + 120_000, spot_now),
+                (start + m.DEFAULT_ROUND_SECONDS * 1000 + 3_000, spot_now)]
+        book = {(1, Side.UP): [(0.88, 1e6)], (1, Side.DOWN): [(0.90, 1e6)]}
+        client = FakeClient([rnd], path, book, {})
+        t = build_trader(client, c, self.db)
+        sig = Signal(Side.UP, 0.90, 0.88, 0.02, 2.0, 120.0, 1.8)
+        tid = t._journal.record("PAPER", rnd, sig, 65_000, 0.5, 100.0)
+        t._position = Position(tid, rnd, sig, 2.0, 1)
+        client.t = 1
+        return t, client
+
+    def test_tops_up_when_the_round_moves_further_ahead(self):
+        t, _ = self._setup(65_260.0)          # large buffer now
+        before = t._position.committed_usdt
+        t._maybe_scale_in(100.0)
+        self.assertGreater(t._position.committed_usdt, before)
+        self.assertEqual(t._position.tranches, 2)
+
+    def test_never_adds_when_the_round_turns_against_us(self):
+        """The martingale test: a losing position must not be topped up."""
+        t, _ = self._setup(64_800.0)          # spot below strike now
+        before = t._position.committed_usdt
+        t._maybe_scale_in(100.0)
+        self.assertEqual(t._position.committed_usdt, before)
+        self.assertEqual(t._position.tranches, 1)
+
+    def test_never_adds_when_probability_merely_holds(self):
+        t, _ = self._setup(65_040.0)
+        t._position = replace(t._position,
+                              signal=replace(t._position.signal, model_prob=0.999))
+        before = t._position.committed_usdt
+        t._maybe_scale_in(100.0)
+        self.assertEqual(t._position.committed_usdt, before)
+
+    def test_total_exposure_stays_within_the_kelly_cap(self):
+        t, _ = self._setup(65_400.0)
+        for _ in range(8):
+            t._maybe_scale_in(100.0)
+        c = t._cfg
+        self.assertLessEqual(t._position.committed_usdt,
+                             (100.0 + t._position.committed_usdt)
+                             * c.hard_max_stake_pct + 1e-6)
+
+    def test_no_topup_after_the_entry_window_closes(self):
+        t, client = self._setup(65_400.0)
+        client.t = 2                          # past resolution
+        before = t._position.committed_usdt
+        t._maybe_scale_in(100.0)
+        self.assertEqual(t._position.committed_usdt, before)
+
+    def test_disabled_by_default_for_other_profiles(self):
+        for name in ("convex", "balanced", "favorite", "micro"):
+            c = Config(api_key="k", api_secret="s", **m.PROFILES[name])
+            self.assertFalse(c.scale_in, name)
+
+    def test_blended_price_is_share_weighted(self):
+        pos = Position(1, make_round(),
+                       Signal(Side.UP, 0.9, 0.80, 0.02, 10.0, 60.0, 2.0),
+                       10.0, 1)
+        blended = pos.average_price(10.0, 0.90)
+        shares = 10.0 / 0.80 + 10.0 / 0.90
+        self.assertAlmostEqual(blended, 20.0 / shares)
+
+    def test_first_tranche_is_smaller_when_scaling_in(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        self.assertLess(c.scale_in_initial_pct, 1.0)
+
+    def test_invalid_initial_fraction_rejected(self):
+        for bad in (0.0, 1.5, -0.2):
+            with self.assertRaises(ValueError):
+                cfg(scale_in_initial_pct=bad)
+
+
+class TestProfileRiskCoherence(unittest.TestCase):
+    """Risk limits must match each profile's own loss shape."""
+
+    def test_daily_limit_allows_more_than_two_losses(self):
+        for name, prof in m.PROFILES.items():
+            c = Config(api_key="k", api_secret="s", **prof)
+            losses = c.daily_loss_limit_pct / c.max_stake_pct
+            self.assertGreaterEqual(losses, 2.5,
+                                    f"{name}: halts after {losses:.1f} losses")
+
+    def test_every_profile_sets_its_own_daily_limit(self):
+        for name, prof in m.PROFILES.items():
+            self.assertIn("daily_loss_limit_pct", prof, name)
+
+    def test_every_profile_sets_its_own_spread_assumption(self):
+        for name, prof in m.PROFILES.items():
+            self.assertIn("assumed_spread_pct", prof, name)
+
+    def test_spread_is_proportional_not_absolute(self):
+        """A flat haircut is 60% of a longshot and 3% of a near-certainty."""
+        c = cfg(assumed_spread_pct=0.05)
+        cheap = 0.05 * (1 + c.assumed_spread_pct)
+        dear = 0.95 * (1 + c.assumed_spread_pct)
+        self.assertAlmostEqual(cheap / 0.05, dear / 0.95)
+
+    def test_default_price_band_is_not_convex_shaped(self):
+        self.assertGreaterEqual(cfg().max_entry_price, 0.90)
+
+
+class TestNoBakedInValues(unittest.TestCase):
+    """Values that belong to configuration must not be literals in logic."""
+
+    def test_symbol_is_configurable(self):
+        c = cfg(symbol="ETHUSDT")
+        PredictionClient(c)
+        try:
+            t = TestParseRound.topic(symbol="ETHUSDT")
+            self.assertIsNotNone(PredictionClient._parse_round(t))
+            self.assertIsNone(PredictionClient._parse_round(
+                TestParseRound.topic(symbol="BTCUSDT")))
+        finally:
+            PredictionClient(cfg())
+
+    def test_round_duration_tolerance_is_configurable(self):
+        base = 1_700_000_000_000
+        PredictionClient(cfg(round_duration_tolerance=0.5))
+        try:
+            t = TestParseRound.topic(startDate=base, endDate=base + 400_000)
+            self.assertIsNotNone(PredictionClient._parse_round(t))
+        finally:
+            PredictionClient(cfg())
+
+    def test_timing_constants_exist_as_config(self):
+        c = cfg()
+        for name in ("clock_resync_s", "settle_grace_s", "settle_timeout_s",
+                     "drain_timeout_s", "drain_poll_s", "prune_after_s",
+                     "vol_cache_s", "error_backoff_max_s"):
+            self.assertGreater(getattr(c, name), 0, name)
+
+    def test_timing_constants_are_validated(self):
+        for name in ("clock_resync_s", "settle_grace_s", "prune_after_s"):
+            with self.assertRaises(ValueError, msg=name):
+                cfg(**{name: 0})
+
+    def test_settled_history_limit_exceeds_fifty(self):
+        """50 could miss an older settlement and strand a position."""
+        self.assertGreater(cfg().settled_history_limit, 50)
+
+    def test_quote_tolerance_is_configurable(self):
+        self.assertEqual(cfg(quote_consistency_tolerance=0.02)
+                         .quote_consistency_tolerance, 0.02)
+
+    def test_no_literal_symbol_in_parsing_logic(self):
+        import inspect
+        src = inspect.getsource(PredictionClient._parse_round)
+        self.assertNotIn('"BTCUSDT"', src)
+
+
+class TestPerMarketFeeInDiagnostics(unittest.TestCase):
+    """The breakeven bar must use each market's own published fee."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _fill(self, fee_bps, n=60, price=0.714, win_rate=0.75):
+        import random as _r
+        rng = _r.Random(2)
+        j = Journal(self.db, "buffer")
+        rnd = make_round(fee_bps=fee_bps)
+        for _ in range(n):
+            won = rng.random() < win_rate
+            sig = Signal(Side.UP, 0.80, price, 0.05, 2.5, 40.0, 2.4)
+            t = j.record("PAPER", rnd, sig, 65_000, 0.5, 25.0)
+            j.resolve(t, won, settle_pnl(2.5, price, won, fee_bps), "venue")
+        return j
+
+    def test_zero_fee_market_uses_a_lower_bar(self):
+        out = self._fill(0).diagnose("buffer")
+        self.assertIn(f"{breakeven_probability(0.714, 0):.1%}", out)
+
+    def test_high_fee_market_uses_a_higher_bar(self):
+        out = self._fill(500).diagnose("buffer")
+        self.assertIn(f"{breakeven_probability(0.714, 500):.1%}", out)
+
+    def test_fee_is_recorded_per_trade(self):
+        j = self._fill(137, n=5)
+        row = j._conn.execute(
+            "SELECT fee_bps FROM trades LIMIT 1").fetchone()
+        self.assertEqual(row[0], 137)
+
+    def test_legacy_rows_without_fee_fall_back(self):
+        import sqlite3 as sq
+        self._fill(200, n=40)
+        conn = sq.connect(self.db)
+        conn.execute("UPDATE trades SET fee_bps = NULL")
+        conn.commit(); conn.close()
+        self.assertIn("Realised win rate", Journal(self.db).diagnose("buffer"))
+
+
+class TestMainEntryPoint(unittest.TestCase):
+    """
+    Actually invoke main().
+
+    Every other test constructs Config directly, so main() was never executed
+    by the suite at all. That is how a duplicate keyword argument -- profiles
+    setting kelly_fraction while main() also passed it explicitly -- shipped
+    and crashed on the first real run with 384 tests green.
+    """
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        self._env = dict(os.environ)
+        os.environ["BINANCE_API_KEY"] = "k"
+        os.environ["BINANCE_API_SECRET"] = "s"
+
+    def tearDown(self):
+        os.environ.clear(); os.environ.update(self._env)
+        if os.path.exists(self.db):
+            os.unlink(self.db)
+
+    def _run(self, *argv):
+        """Run main() with stdout captured; returns (code, output)."""
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            code = m.main([*argv, "--db", self.db])
+        return code, buf.getvalue()
+
+    def test_every_profile_constructs_through_main(self):
+        """The exact failure: Config() got two values for kelly_fraction."""
+        for profile in sorted(m.PROFILES):
+            code, out = self._run("--profile", profile,
+                                  "--calibration-report")
+            self.assertEqual(code, 0, f"{profile}: {out}")
+
+    def test_every_profile_accepts_a_kelly_override(self):
+        for profile in sorted(m.PROFILES):
+            code, out = self._run("--profile", profile, "--kelly", "0.5",
+                                  "--calibration-report")
+            self.assertEqual(code, 0, f"{profile}: {out}")
+
+    def test_kelly_defaults_to_the_profile_not_the_flag(self):
+        """--kelly defaulted to 0.25, silently overriding every profile."""
+        import inspect, re as _re
+        src = inspect.getsource(m.main)
+        hit = _re.search(r'"--kelly".*?default=(\w+)', src, _re.S)
+        self.assertEqual(hit.group(1), "None")
+
+    def test_all_override_flags_work_together(self):
+        code, out = self._run("--profile", "buffer", "--kelly", "0.3",
+                              "--min-edge", "0.02", "--fee-bps", "0",
+                              "--min-buffer", "1.0", "--paper-bankroll", "50",
+                              "--scale-in", "--calibration-report")
+        self.assertEqual(code, 0, out)
+
+    def test_diagnose_runs_for_every_profile(self):
+        for profile in sorted(m.PROFILES):
+            code, out = self._run("--profile", profile, "--diagnose")
+            self.assertEqual(code, 0, f"{profile}: {out}")
+
+    def test_reading_a_report_needs_no_credentials(self):
+        """Reading the journal is not an API call, so keys are not required."""
+        del os.environ["BINANCE_API_KEY"]
+        code, _ = self._run("--profile", "micro", "--calibration-report")
+        self.assertEqual(code, 0)
+
+    def test_missing_credentials_exits_cleanly_for_api_commands(self):
+        del os.environ["BINANCE_API_KEY"]
+        code, out = self._run("--profile", "micro")
+        self.assertEqual(code, 1)
+        self.assertIn("BINANCE_API_KEY", out)
+
+    def test_invalid_config_exits_cleanly_not_with_a_traceback(self):
+        code, out = self._run("--profile", "micro", "--kelly", "9")
+        self.assertEqual(code, 1)
+        self.assertIn("Invalid configuration", out)
+
+    def test_no_config_key_is_passed_twice(self):
+        """Structural guard: one mapping, so a collision cannot recur."""
+        import ast, inspect
+        tree = ast.parse(inspect.getsource(m.main))
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Name)
+                    and node.func.id == "Config"):
+                continue
+            explicit = [k.arg for k in node.keywords if k.arg is not None]
+            starred = [k for k in node.keywords if k.arg is None]
+            self.assertFalse(explicit and starred,
+                             "Config() mixes explicit kwargs with **settings; "
+                             "a profile field can collide with one of them")
+
+
+class TestJournal(unittest.TestCase):
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.j = Journal(self.db)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def test_empty_report(self):
+        self.assertIn("No resolved trades", self.j.calibration_report())
+
+    def test_records_and_resolves(self):
+        rnd = make_round()
+        sig = Signal(Side.UP, 0.72, 0.55, 0.16, 5.0, 60.0)
+        tid = self.j.record("PAPER", rnd, sig, 100_400, 0.5, 100.0)
+        self.j.resolve(tid, True, 4.0, "venue")
+        report = self.j.calibration_report()
+        self.assertIn("Resolved trades : 1", report)
+        self.assertIn("+4.00", report)
+
+    def test_calibration_detects_overconfidence(self):
+        rnd = make_round()
+        for i in range(100):
+            sig = Signal(Side.UP, 0.90, 0.55, 0.16, 1.0, 60.0)
+            tid = self.j.record("PAPER", rnd, sig, 100_400, 0.5, 100.0)
+            self.j.resolve(tid, i < 50, 1.0 if i < 50 else -1.0, "venue")
+        report = self.j.calibration_report()
+        self.assertIn("<-- off", report)    # 90% predicted, 50% actual
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

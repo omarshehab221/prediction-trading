@@ -80,6 +80,13 @@ BASE = "https://api.binance.com"
 DEFAULT_ROUND_SECONDS = 300
 WEI = Decimal(10) ** 18
 
+# Tolerance for float comparisons on money and probabilities. One name so a
+# later change cannot leave some comparisons stricter than others.
+EPS = 1e-9
+
+# Fallback only, for journal rows written before the fee column existed.
+DEFAULT_FEE_BPS = 200
+
 # Verified against @binance/w3w-prediction. Overridable via endpoints.json.
 # (HTTP method, path). The verb travels WITH the path: keeping them apart is
 # what produced "Request method 'GET' is not supported" on trade/get-quote.
@@ -100,9 +107,8 @@ DEFAULT_ENDPOINTS: dict[str, tuple[str, str]] = {
     "batch_redeem": ("POST", "/sapi/v1/w3w/wallet/prediction/batch-redeem"),
     "redeem_status": ("GET", "/sapi/v1/w3w/wallet/prediction/redeem/status"),
     "portfolio": ("GET", "/sapi/v1/w3w/wallet/prediction/pnl/portfolio"),
-    "transfer_in": ("POST", "/sapi/v1/w3w/wallet/prediction/transfer/outbound"),
-    "transfer_out": ("POST", "/sapi/v1/w3w/wallet/prediction/transfer/inbound"),
-    "transfer_status": ("GET", "/sapi/v1/w3w/wallet/prediction/transfer/status"),
+    # Transfers are handled inline by place-order's fundTransferAmount, so
+    # the standalone transfer endpoints are deliberately not wired up.
 }
 
 
@@ -190,9 +196,14 @@ class Config:
     # wins. Assuming 2% when the real rate is near zero silently demands about
     # a point of extra edge that does not exist, and suppresses valid trades.
     fee_bps: int = 200
-    max_entry_price: float = 0.35     # convex: buy cheap, lose small
+    # Deliberately permissive defaults. Every profile sets these explicitly;
+    # a convex-shaped default silently narrowed any custom config that did not.
+    max_entry_price: float = 0.95
     min_entry_price: float = 0.05
-    assumed_spread: float = 0.03
+    # Haircut on an indicative quote when the book cannot be read, as a
+    # FRACTION of the price. A flat 0.03 is 60% of a 0.05 longshot but 3% of
+    # a 0.95 near-certainty -- one absolute number cannot serve both ends.
+    assumed_spread_pct: float = 0.05
     max_price_impact: float = 0.05      # reject quotes that move the book far
 
     # --- Timing ------------------------------------------------------------
@@ -205,7 +216,22 @@ class Config:
     # Small accounts: allow betting the venue minimum when Kelly sizes below
     # it, bounded by the 2x-full-Kelly limit inside kelly_stake.
     round_up_to_minimum: bool = True
-    hard_max_stake_pct: float = 0.25
+    # Absolute ceiling for the small-account override, as a MULTIPLE of
+    # max_stake_pct rather than an independent number. Expressed absolutely
+    # it had to be kept >= max_stake_pct by every caller, and any config that
+    # raised one without the other failed validation. As a multiple the
+    # invariant holds by construction and cannot be violated.
+    hard_stake_multiple: float = 2.5
+    hard_stake_ceiling: float = 0.35
+    # Scale-in: start small, then top up as the round moves in our favour.
+    # This is NOT martingale -- martingale adds after LOSSES, chasing. This
+    # adds only when the position is winning and the model's probability has
+    # risen, and it tops up toward the Kelly stake for the CURRENT
+    # probability rather than stacking independent bets. Total exposure to a
+    # single round is therefore still governed by Kelly, not multiplied by it.
+    scale_in: bool = False
+    scale_in_initial_pct: float = 0.4     # first tranche, as a share of target
+    scale_in_min_topup: float = 1.0       # skip top-ups below the order min
     # The connector documents ~1.5 USDT as an APPROXIMATE MARKET-order
     # minimum that "varies by market depth"; the account minimum is 1.00.
     # Small MARKET orders may be rejected on a thin book -- that surfaces as a
@@ -237,6 +263,9 @@ class Config:
     auto_fund_transfer: bool = True      # move collateral for CEX-funded orders
     open_statuses: tuple[str, ...] = ("REGISTERED", "OPEN", "ACTIVE")
     tradable_status: str = "OPEN"
+    # The instrument traded. Previously a literal inside _parse_round, which
+    # made "BTC only" a property of the source rather than the configuration.
+    symbol: str = "BTCUSDT"
 
     # --- Model -------------------------------------------------------------
     # Fat tails, estimated from realised kurtosis at runtime. None => Gaussian.
@@ -258,7 +287,29 @@ class Config:
     halt_on_clamped_sigma: bool = True
 
     # --- Plumbing ----------------------------------------------------------
+    # --- Timing (previously hardcoded inside the loop) ------------------
+    clock_resync_s: float = 300.0        # re-sync the server clock this often
+    settle_grace_s: float = 2.0          # wait after end before settling
+    settle_timeout_s: float = 600.0      # give up settling and log the gap
+    drain_timeout_s: float = 600.0       # wait for an open position on exit
+    drain_poll_s: float = 5.0
+    prune_after_s: float = 3600.0        # forget rounds this long past expiry
+    vol_cache_s: float = 60.0
+    error_backoff_max_s: float = 30.0
+
+    # --- Tolerances and paging (previously hardcoded) -------------------
+    round_duration_tolerance: float = 0.10    # fraction of the target length
+    quote_consistency_tolerance: float = 0.10
+    market_list_limit: int = 50
+    # 50 could silently miss an older settlement and leave a position
+    # looking unresolved when the venue had already settled it.
+    settled_history_limit: int = 200
+
     db_path: str = "btc5m_journal.db"
+    # Print the calibration report to the log every N settled trades. On a
+    # hosted worker the journal sits on a disk you cannot easily read, so
+    # without this the only record is one you have to go and fetch.
+    report_every: int = 0
     poll_interval_s: float = 2.0
     recv_window_ms: int = 5000
     http_timeout_s: float = 10.0
@@ -273,16 +324,33 @@ class Config:
             raise ValueError("kelly_fraction must be in (0, 1]")
         if not 0 < self.max_stake_pct <= 0.25:
             raise ValueError("max_stake_pct must be in (0, 0.25]")
-        if not 0 < self.hard_max_stake_pct <= 0.35:
-            raise ValueError("hard_max_stake_pct must be in (0, 0.35]")
-        if self.hard_max_stake_pct < self.max_stake_pct:
-            raise ValueError("hard_max_stake_pct must be >= max_stake_pct")
+        if self.hard_stake_multiple < 1.0:
+            raise ValueError("hard_stake_multiple must be >= 1.0")
+        if not 0 < self.hard_stake_ceiling <= 0.5:
+            raise ValueError("hard_stake_ceiling must be in (0, 0.5]")
         if not 0 < self.min_edge < 1:
             raise ValueError("min_edge must be in (0, 1)")
         if self.min_edge_ratio < 0:
             raise ValueError("min_edge_ratio must be non-negative")
         if self.min_buffer_sigmas < 0:
             raise ValueError("min_buffer_sigmas must be non-negative")
+        if not 0 < self.scale_in_initial_pct <= 1.0:
+            raise ValueError("scale_in_initial_pct must be in (0, 1]")
+        if not 0 < self.assumed_spread_pct < 1.0:
+            raise ValueError("assumed_spread_pct must be in (0, 1)")
+        if not self.symbol:
+            raise ValueError("symbol must not be empty")
+        if not 0 < self.round_duration_tolerance < 1.0:
+            raise ValueError("round_duration_tolerance must be in (0, 1)")
+        if self.settled_history_limit < 1:
+            raise ValueError("settled_history_limit must be positive")
+        for name in ("clock_resync_s", "settle_grace_s", "settle_timeout_s",
+                     "drain_timeout_s", "drain_poll_s", "prune_after_s",
+                     "vol_cache_s", "error_backoff_max_s"):
+            if getattr(self, name) <= 0:
+                raise ValueError(f"{name} must be positive")
+        if self.report_every < 0:
+            raise ValueError("report_every must be non-negative")
         if self.use_fat_tails and self.tail_df_floor <= 2.0:
             raise ValueError("tail_df_floor must exceed 2 for finite variance")
         if self.calibration_z_halt >= 0:
@@ -308,6 +376,14 @@ class Config:
         if self.funding_source not in ("AUTO", "MPC", "CEX"):
             raise ValueError("funding_source must be AUTO, MPC or CEX")
 
+    @property
+    def hard_max_stake_pct(self) -> float:
+        """
+        Ceiling for the venue-minimum override. Never below max_stake_pct.
+        """
+        return min(max(self.max_stake_pct * self.hard_stake_multiple,
+                       self.max_stake_pct), self.hard_stake_ceiling)
+
     def ep(self, name: str) -> tuple[str, str]:
         """(method, path) for a named endpoint."""
         return (dict(self.endpoints) or DEFAULT_ENDPOINTS)[name]
@@ -320,6 +396,13 @@ PROFILES: dict[str, dict] = {
                    min_edge=0.02, min_edge_ratio=0.30,
                    max_stake_pct=0.02, entry_window_start_s=280,
                    entry_window_end_s=30, max_consecutive_losses=60,
+                   # Longshots: many small losses, so the default fits.
+                   daily_loss_limit_pct=0.20, assumed_spread_pct=0.10,
+                   # Tail probabilities are the least reliable part of the
+                   # model, and this profile lives on them, so size more
+                   # cautiously than a mid-price strategy would.
+                   kelly_fraction=0.20,
+                   min_liquidity=0.0, max_rounds_per_day=200,
                    paper_start_bankroll=100.0),
     # Symmetric: trades anywhere it finds an edge. Higher hit rate, smaller
     # payoffs, and correspondingly larger individual losses.
@@ -327,6 +410,9 @@ PROFILES: dict[str, dict] = {
                      min_edge=0.04, min_edge_ratio=0.10,
                      max_stake_pct=0.05, entry_window_start_s=150,
                      entry_window_end_s=25, max_consecutive_losses=10,
+                     daily_loss_limit_pct=0.20, assumed_spread_pct=0.06,
+                   kelly_fraction=0.25,
+                     min_liquidity=0.0, max_rounds_per_day=200,
                      paper_start_bankroll=100.0),
     # For small accounts, where a percentage cap would fall under the venue's
     # order minimum and the bot would simply never trade. Targets the 0.40-0.75
@@ -353,6 +439,9 @@ PROFILES: dict[str, dict] = {
     "favorite": dict(max_entry_price=0.80, min_entry_price=0.55,
                      min_edge=0.03, min_edge_ratio=0.05,
                      max_stake_pct=0.10, min_stake_usdt=1.0,
+                     daily_loss_limit_pct=0.30, assumed_spread_pct=0.04,
+                   kelly_fraction=0.25,
+                     min_liquidity=0.0, max_rounds_per_day=200,
                      entry_window_start_s=120, entry_window_end_s=20,
                      max_consecutive_losses=10, paper_start_bankroll=25.0),
     # YOUR METHOD, encoded. Wait for a large buffer late in the round, then
@@ -369,14 +458,46 @@ PROFILES: dict[str, dict] = {
     # the REMAINING time away from the strike: roughly 14 bps with a minute
     # left, or 28 bps with four minutes.
     "buffer": dict(max_entry_price=0.97, min_entry_price=0.80,
-                   min_edge=0.015, min_edge_ratio=0.012,
-                   min_buffer_sigmas=2.0,
+                   min_edge=0.012, min_edge_ratio=0.010,
+                   # Lowered from 2.0: fewer sigmas means more trades, and
+                   # more trades is how the edge question gets answered at
+                   # all -- separating a 68% win rate from a 72% one needs
+                   # hundreds of samples. Each trade carries less edge, so
+                   # this is a deliberate trade of quality for sample size.
+                   min_buffer_sigmas=1.5,
                    max_stake_pct=0.10, min_stake_usdt=1.0,
-                   entry_window_start_s=150, entry_window_end_s=15,
+                   # A loss here costs a full 10% of bankroll, so the 20%
+                   # default halted the day after TWO losses -- on 80% of
+                   # days at an 85% win rate. The limit has to match the
+                   # profile's own loss shape or it stops a healthy bot.
+                   daily_loss_limit_pct=0.35,
+                   # Near-certainties late in a round sit in thin books;
+                   # a wide fill destroys an edge measured in single points.
+                   max_price_impact=0.02,
+                   assumed_spread_pct=0.03,
+                   kelly_fraction=0.25,
+                   # Near-certainties late in a round sit in thin books, and
+                   # this is the one profile where an empty book is common.
+                   min_liquidity=1000.0, max_rounds_per_day=250,
+                   scale_in=True, scale_in_initial_pct=0.4,
+                   scale_in_min_topup=1.0,
+                   entry_window_start_s=180, entry_window_end_s=15,
                    max_consecutive_losses=6, paper_start_bankroll=25.0),
     "micro": dict(max_entry_price=0.75, min_entry_price=0.35,
                   min_edge=0.03, min_edge_ratio=0.06,
                   max_stake_pct=0.20, min_stake_usdt=1.0,
+                  # 20% per trade means the 20% default halted after ONE loss.
+                  # Even 45% halts after 2.25. At this stake fraction the
+                  # stake cap and the daily limit are in genuine tension --
+                  # that tension is forced by a 1.00 order minimum on a ~7
+                  # balance, not chosen. Trading a bigger account is the only
+                  # real fix; 55% is the least-bad compromise.
+                  daily_loss_limit_pct=0.55,
+                  assumed_spread_pct=0.05,
+                  # A tiny balance forces a large stake fraction, so cap the
+                  # hard ceiling tightly and let Kelly stay conservative.
+                   kelly_fraction=0.25,
+                  min_liquidity=0.0, max_rounds_per_day=200,
                   entry_window_start_s=200, entry_window_end_s=25,
                   max_consecutive_losses=10, paper_start_bankroll=7.0),
 }
@@ -470,6 +591,17 @@ class Position:
     trade_id: int
     rnd: Round
     signal: Signal
+    committed_usdt: float = 0.0      # total staked on this round so far
+    tranches: int = 1
+
+    def average_price(self, extra_stake: float, extra_price: float) -> float:
+        """Blended fill price after adding another tranche."""
+        total = self.committed_usdt + extra_stake
+        if total <= 0:
+            return extra_price
+        shares = (self.committed_usdt / self.signal.fill_price
+                  + extra_stake / extra_price)
+        return total / shares if shares > 0 else extra_price
 
 
 @dataclass(frozen=True)
@@ -559,6 +691,8 @@ class ApiError(RuntimeError):
 
     @property
     def kind(self) -> ErrorKind:
+        if self.status == 404:
+            return ErrorKind.NOT_FOUND      # wrong path, or unknown resource
         if self.status == 451:
             # Binance refuses restricted locations, which includes the United
             # States. A US-region host will fail every call with this.
@@ -825,7 +959,7 @@ def walk_book(asks: list[tuple[float, float]], stake_usdt: float
         spent += price * size
         shares += size
 
-    if spent < stake_usdt - 1e-9 or shares <= 0:
+    if spent < stake_usdt - EPS or shares <= 0:
         return None
     return stake_usdt / shares
 
@@ -841,9 +975,10 @@ class VolatilityEstimator:
         self._clamped: dict[str, bool] = {}
         self._raw: dict[str, float] = {}
 
-    def sigma_annual(self, symbol: str = "BTCUSDT") -> float:
+    def sigma_annual(self, symbol: Optional[str] = None) -> float:
+        symbol = symbol or self._cfg.symbol
         cached = self._cache.get(symbol)
-        if cached is not None and time.time() - cached[1] < 60:
+        if cached is not None and time.time() - cached[1] < self._cfg.vol_cache_s:
             return cached[0]
 
         r = self._session.get(
@@ -902,17 +1037,17 @@ class VolatilityEstimator:
         return max(self._cfg.tail_df_floor,
                    min(self._cfg.tail_df_ceiling, df))
 
-    def tail_df(self, symbol: str = "BTCUSDT") -> Optional[float]:
+    def tail_df(self, symbol: Optional[str] = None) -> Optional[float]:
         """Tail parameter for `symbol`. Call sigma_annual first."""
-        return self._df_cache.get(symbol)
+        return self._df_cache.get(symbol or self._cfg.symbol)
 
-    def raw_sigma(self, symbol: str = "BTCUSDT") -> Optional[float]:
+    def raw_sigma(self, symbol: Optional[str] = None) -> Optional[float]:
         """Measured sigma before clamping, for diagnostics."""
-        return self._raw.get(symbol)
+        return self._raw.get(symbol or self._cfg.symbol)
 
-    def is_clamped(self, symbol: str = "BTCUSDT") -> bool:
+    def is_clamped(self, symbol: Optional[str] = None) -> bool:
         """True if the last sigma hit a bound and is therefore not a measurement."""
-        return self._clamped.get(symbol, False)
+        return self._clamped.get(symbol or self._cfg.symbol, False)
 
 
 # --------------------------------------------------------------------------
@@ -925,7 +1060,7 @@ class RiskManager:
 
     def __init__(self, cfg: Config, starting_bankroll: float) -> None:
         self._cfg = cfg
-        self._day_start_bankroll = max(starting_bankroll, 1e-9)
+        self._day_start_bankroll = max(starting_bankroll, EPS)
         self._day_key = time.strftime("%Y-%m-%d")
         self.consecutive_losses = 0
         self.rounds_today = 0
@@ -949,7 +1084,7 @@ class RiskManager:
         """
         if self._samples < self._cfg.calibration_min_samples:
             return None
-        if self._variance <= 1e-9:
+        if self._variance <= EPS:
             return None
         return (self._actual_wins - self._expected_wins) / math.sqrt(self._variance)
 
@@ -957,7 +1092,7 @@ class RiskManager:
         today = time.strftime("%Y-%m-%d")
         if today != self._day_key:
             self._day_key = today
-            self._day_start_bankroll = max(bankroll, 1e-9)
+            self._day_start_bankroll = max(bankroll, EPS)
             self.consecutive_losses = 0
             self.rounds_today = 0
             self.halted_reason = None
@@ -1021,6 +1156,8 @@ class PredictionClient:
     round_target_ms: int = DEFAULT_ROUND_SECONDS * 1000
     open_statuses: tuple[str, ...] = ("REGISTERED", "OPEN", "ACTIVE")
     tradable_status: str = "OPEN"
+    duration_tolerance: float = 0.10
+    symbol: str = "BTCUSDT"
 
     def __init__(self, cfg: Config) -> None:
         self._cfg = cfg
@@ -1032,6 +1169,8 @@ class PredictionClient:
         PredictionClient.round_target_ms = cfg.round_seconds * 1000
         PredictionClient.open_statuses = cfg.open_statuses
         PredictionClient.tradable_status = cfg.tradable_status
+        PredictionClient.duration_tolerance = cfg.round_duration_tolerance
+        PredictionClient.symbol = cfg.symbol
 
     @property
     def session(self) -> requests.Session:
@@ -1159,12 +1298,12 @@ class PredictionClient:
         rather than silent.
         """
         if not feed_symbol:
-            return "BTCUSDT"
+            return self._cfg.symbol
         if feed_symbol in self._symbol_cache:
             return self._symbol_cache[feed_symbol]
 
         candidate = re.sub(r"[^A-Z0-9]", "", feed_symbol.upper())
-        resolved = "BTCUSDT"
+        resolved = self._cfg.symbol
         if candidate:
             try:
                 r = self._session.get(BASE + "/api/v3/ticker/price",
@@ -1178,14 +1317,15 @@ class PredictionClient:
 
         if resolved != candidate:
             LOG.warning("Settlement feed %r is not a Binance symbol; modelling "
-                        "on BTCUSDT instead. Basis risk between the two feeds "
-                        "is NOT captured by the model.", feed_symbol)
+                        "on %s instead. Basis risk between the two feeds "
+                        "is NOT captured by the model.", feed_symbol,
+                        self._cfg.symbol)
         self._symbol_cache[feed_symbol] = resolved
         return resolved
 
-    def spot_price(self, symbol: str = "BTCUSDT") -> float:
+    def spot_price(self, symbol: Optional[str] = None) -> float:
         r = self._session.get(BASE + "/api/v3/ticker/price",
-                              params={"symbol": symbol},
+                              params={"symbol": symbol or self._cfg.symbol},
                               timeout=self._cfg.http_timeout_s)
         if r.status_code == 451:
             raise ApiError(
@@ -1233,20 +1373,6 @@ class PredictionClient:
             LOG.warning("Unparseable totalCurrentValue %r", raw)
             return None
         return value if math.isfinite(value) else None
-
-    def transfer_to_prediction(self, amount_usdt: float,
-                               account_type: str, chain_id: str) -> dict:
-        """Move collateral from a CEX account into the prediction wallet."""
-        if account_type not in CEX_ACCOUNT_TYPES:
-            raise ValueError(f"source must be one of {CEX_ACCOUNT_TYPES}")
-        wallet = self.wallet()
-        return self._request("transfer_in", {
-            "walletId": wallet.wallet_id,
-            "walletAddress": wallet.address,
-            "fromTokenAmount": to_wei(amount_usdt),
-            "accountType": account_type,
-            "sourceBiz": "PREDICTION_BUY",
-            "chainId": chain_id})
 
     def payment_options(self) -> list[tuple[str, float, bool]]:
         """
@@ -1312,9 +1438,6 @@ class PredictionClient:
                            f"account; must be one of {CEX_ACCOUNT_TYPES}")
         return account, funding, holder
 
-    def _resolved_account_type(self) -> str:
-        return self.funding_plan()[0]
-
     def resolved_funding_source(self) -> str:
         return self.funding_plan()[1]
 
@@ -1361,10 +1484,11 @@ class PredictionClient:
 
     # -- market data --------------------------------------------------------
 
-    def list_btc_5m_rounds(self) -> list[Round]:
+    def list_rounds(self) -> list[Round]:
         payload = self._request("market_list", {
             "l1Category": "crypto", "l2Category": "up-down",
-            "sortBy": "END_DATE", "orderBy": "ASC", "limit": 50})
+            "sortBy": "END_DATE", "orderBy": "ASC",
+            "limit": self._cfg.market_list_limit})
         out = []
         for topic in payload.get("marketTopics") or []:
             rnd = self._parse_round(topic)
@@ -1431,14 +1555,14 @@ class PredictionClient:
         try:
             if topic.get("chartType") != "CRYPTO_UP_DOWN":
                 return None
-            if topic.get("symbol") != "BTCUSDT":
+            if topic.get("symbol") != PredictionClient.symbol:
                 return None
             if topic.get("status") not in PredictionClient.open_statuses:
                 return None
 
             start_ms, end_ms = int(topic["startDate"]), int(topic["endDate"])
             target = PredictionClient.round_target_ms
-            if abs((end_ms - start_ms) - target) > target * 0.1:
+            if abs((end_ms - start_ms) - target) > target * PredictionClient.duration_tolerance:
                 return None
 
             markets = topic.get("markets") or []
@@ -1637,6 +1761,16 @@ class PredictionClient:
             raise ApiError(f"quote returned {shares} shares for "
                            f"{stake_usdt:.2f} USDT")
 
+        # Cross-check: shares x average price should reconcile with the
+        # amount spent. A mismatch means averagePrice and amountOut describe
+        # different things, and every downstream calculation would be wrong.
+        implied = shares * avg_f
+        tol = self._cfg.quote_consistency_tolerance
+        if implied > 0 and abs(implied - stake_usdt) / stake_usdt > tol:
+            raise ApiError(
+                f"quote is internally inconsistent: {shares:.4f} shares at "
+                f"{avg_f:.4f} implies {implied:.2f} USDT, not {stake_usdt:.2f}")
+
         impact_raw = payload.get("priceImpact")
         fee_raw = payload.get("feeAmount")
         return Quote(
@@ -1776,7 +1910,8 @@ class PredictionClient:
         """
         try:
             payload = self._request("settled_history", {
-                "walletAddress": self.wallet().address, "limit": 50})
+                "walletAddress": self.wallet().address,
+                "limit": self._cfg.settled_history_limit})
         except ApiError as exc:
             # Returning None silently would be indistinguishable from "this
             # round has not settled yet", so a broken lookup would look like
@@ -1894,7 +2029,7 @@ class Journal:
                 strike REAL, spot REAL, sigma REAL, seconds_left REAL,
                 end_ms INTEGER, model_prob REAL, fill_price REAL, edge REAL,
                 stake REAL, bankroll_before REAL, order_id TEXT,
-                profile TEXT, buffer_z REAL,
+                profile TEXT, buffer_z REAL, fee_bps INTEGER,
                 resolved INTEGER DEFAULT 0, won INTEGER, pnl REAL,
                 settle_source TEXT)""")
         # Journals predating the profile column stay readable.
@@ -1904,6 +2039,8 @@ class Journal:
             self._conn.execute("ALTER TABLE trades ADD COLUMN profile TEXT")
         if "buffer_z" not in existing:
             self._conn.execute("ALTER TABLE trades ADD COLUMN buffer_z REAL")
+        if "fee_bps" not in existing:
+            self._conn.execute("ALTER TABLE trades ADD COLUMN fee_bps INTEGER")
         self._conn.commit()
 
     def record(self, mode: str, rnd: Round, sig: Signal, spot: float,
@@ -1912,12 +2049,12 @@ class Journal:
         cur = self._conn.execute(
             "INSERT INTO trades (ts, mode, slug, topic_id, side, strike, spot,"
             " sigma, seconds_left, end_ms, model_prob, fill_price, edge, stake,"
-            " bankroll_before, order_id, profile, buffer_z)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " bankroll_before, order_id, profile, buffer_z, fee_bps)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (int(time.time()), mode, rnd.slug, rnd.topic_id, sig.side.value,
              rnd.strike, spot, sigma, sig.seconds_left, rnd.end_ms,
              sig.model_prob, sig.fill_price, sig.edge, sig.stake_usdt,
-             bankroll, order_id, self._profile, sig.buffer_z))
+             bankroll, order_id, self._profile, sig.buffer_z, rnd.fee_bps))
         self._conn.commit()
         return int(cur.lastrowid)
 
@@ -1927,6 +2064,117 @@ class Journal:
             "UPDATE trades SET resolved=1, won=?, pnl=?, settle_source=?"
             " WHERE id=?", (1 if won else 0, pnl, source, trade_id))
         self._conn.commit()
+
+    def diagnose(self, profile: Optional[str] = None) -> str:
+        """
+        Is the edge real, and if not, what would fix it?
+
+        Answers one question per price bucket: was the realised win rate above
+        the breakeven implied by the price paid? That single comparison
+        decides everything. A losing run at a good win rate and a winning run
+        at a poor one look identical over a few dozen trades, so the shortfall
+        is reported with a standard error rather than as a bare number.
+        """
+        where = "WHERE resolved=1"
+        args: tuple = ()
+        if profile:
+            where += " AND COALESCE(profile, 'unknown') = ?"
+            args = (profile,)
+        rows = self._conn.execute(
+            f"SELECT fill_price, won, pnl, stake, fee_bps FROM trades {where}",
+            args).fetchall()
+        if not rows:
+            return "No resolved trades yet."
+
+        buckets: dict[int, list] = {}
+        for price, won, pnl, stake, fee in rows:
+            buckets.setdefault(int(price * 20), []).append(
+                (price, won, pnl or 0.0, stake or 0.0, fee))
+
+        out = [f"Trades analysed : {len(rows)}", "",
+               "Realised win rate vs the breakeven for the price paid",
+               "(breakeven uses each market's own published fee):",
+               "  price band      n   needed   actual     gap      P&L  verdict"]
+        total_gap_n = 0
+        verdicts: list[tuple[str, float, int]] = []
+
+        for b in sorted(buckets):
+            vals = buckets[b]
+            n = len(vals)
+            avg_price = sum(v[0] for v in vals) / n
+            # Each market publishes its own fee; assuming 2% shifts the exact
+            # bar this whole verdict is measured against. Rows predating the
+            # column fall back to the configured default.
+            fees = [v[4] for v in vals if v[4] is not None]
+            fee = int(sum(fees) / len(fees)) if fees else DEFAULT_FEE_BPS
+            needed = breakeven_probability(avg_price, fee)
+            actual = sum(v[1] for v in vals) / n
+            pnl = sum(v[2] for v in vals)
+            gap = actual - needed
+            se = math.sqrt(max(actual * (1 - actual), EPS) / n)
+
+            if n < 20:
+                verdict = "too few"
+            elif gap > 2 * se:
+                verdict = "EDGE"
+            elif gap < -2 * se:
+                verdict = "NO EDGE"
+            else:
+                verdict = "unclear"
+            verdicts.append((verdict, gap, n))
+            total_gap_n += n
+            out.append(f"  {b/20:.2f}-{b/20+0.05:.2f} {n:>6} {needed:>8.1%} "
+                       f"{actual:>8.1%} {gap:>+7.1%} {pnl:>+8.2f}  {verdict}")
+
+        out += ["", "=" * 66, "WHAT THIS MEANS", "=" * 66]
+        losing = [v for v in verdicts if v[0] == "NO EDGE"]
+        winning = [v for v in verdicts if v[0] == "EDGE"]
+        unclear = [v for v in verdicts if v[0] in ("unclear", "too few")]
+
+        if losing and not winning:
+            out += [
+                "",
+                "Your win rate is significantly BELOW breakeven. Raising the",
+                "stake cannot fix this: stake multiplies expected value, it",
+                "cannot change its sign. A bigger bet on a negative edge just",
+                "loses faster.",
+                "",
+                "The levers that do work, in order of directness:",
+                "  1. Demand a bigger buffer (--min-buffer 2.5 or 3.0). More",
+                "     standard deviations from the strike means a genuinely",
+                "     higher win probability, not just a higher price.",
+                "  2. Enter later (lower entry_window_start_s). The same",
+                "     buffer is worth more with less time left to reverse.",
+                "  3. Pay less (lower max_entry_price). A worse win rate but a",
+                "     better win:loss ratio, and a lower bar to clear.",
+                "  4. Stop. If none of the above lifts the actual column above",
+                "     the needed column, the edge is not there to be found.",
+            ]
+        elif winning and not losing:
+            out += [
+                "",
+                "Your win rate is significantly ABOVE breakeven in the bands",
+                "marked EDGE. Sizing up there is correct, and is what Kelly",
+                "already does automatically -- the bot raises stake as the",
+                "edge grows, without any change from you.",
+                "",
+                "Do NOT raise the stake cap by hand to 'cover' losses. The",
+                "losses are already priced in; the cap is what keeps a run of",
+                "them survivable.",
+            ]
+        else:
+            out += [
+                "",
+                f"Inconclusive: {len(unclear)} band(s) lack the sample to call,"
+                f" {len(winning)} show edge, {len(losing)} show none.",
+                "",
+                "Over a few dozen trades a 68% win rate and a 76% win rate are",
+                "indistinguishable, yet one loses money and the other compounds.",
+                "Keep the settings fixed and let the sample grow. Changing size",
+                "in response to a losing streak is the one move that converts",
+                "an unclear result into a certain loss.",
+            ]
+        return "\n".join(out)
 
     def calibration_report(self, profile: Optional[str] = None) -> str:
         """
@@ -1980,7 +2228,7 @@ class Journal:
             vals = buckets[b]
             pred = sum(p for p, _ in vals) / len(vals)
             act = sum(w for _, w in vals) / len(vals)
-            se = math.sqrt(max(act * (1 - act), 1e-9) / len(vals))
+            se = math.sqrt(max(act * (1 - act), EPS) / len(vals))
             flag = "" if abs(act - pred) <= 2 * se else "  <-- off"
             lines.append(f"  {b*10:>3}-{b*10+9:<3} {len(vals):>6}"
                          f"   {pred:>8.1%} {act:>9.1%} {act-pred:>+8.1%}{flag}")
@@ -2004,7 +2252,7 @@ class Journal:
             vals = pbuckets[b]
             imp = sum(p for p, _ in vals) / len(vals)
             act = sum(w for _, w in vals) / len(vals)
-            se = math.sqrt(max(act * (1 - act), 1e-9) / len(vals))
+            se = math.sqrt(max(act * (1 - act), EPS) / len(vals))
             flag = ""
             if abs(act - imp) > 2 * se:
                 flag = "  <-- underpriced" if act > imp else "  <-- overpriced"
@@ -2118,7 +2366,8 @@ def evaluate(rnd: Round, spot: float, sigma: float, bankroll: float,
                 continue
         levels = (ask_book or {}).get(side)
         entry = (levels[0][0] if levels
-                 else rnd.quote_for(side) + cfg.assumed_spread)
+                 else min(rnd.quote_for(side) * (1.0 + cfg.assumed_spread_pct),
+                          0.999))
 
         if not (cfg.min_entry_price <= entry <= cfg.max_entry_price):
             continue
@@ -2136,6 +2385,11 @@ def evaluate(rnd: Round, spot: float, sigma: float, bankroll: float,
             continue
 
         if not clears_edge(model_prob, avg, cfg, fee_bps):
+            continue
+        # The venue quotes to its own precision, so a fill price carrying
+        # more digits than that is fiction. Snap before pricing the edge.
+        avg = rnd.round_price(avg)
+        if not 0.0 < avg < 1.0:
             continue
         edge = model_prob - breakeven_probability(avg, fee_bps)
 
@@ -2191,6 +2445,7 @@ class Trader:
         # bankroll so an unclaimed win is not misread as a drawdown.
         self._unredeemed: dict[str, tuple[float, list[str], str]] = {}
         self._stopping = False
+        self._settled_count = 0
 
     def _bankroll(self) -> float:
         """
@@ -2246,7 +2501,7 @@ class Trader:
 
     def _prune(self, now_ms: int) -> None:
         for tid in [t for t, end in self._seen.items()
-                    if end < now_ms - 3_600_000]:
+                    if end < now_ms - self._cfg.prune_after_s * 1000]:
             self._seen.pop(tid, None)
             self._hydrated.pop(tid, None)
 
@@ -2296,7 +2551,7 @@ class Trader:
                 if self._stopping:
                     raise Shutdown("stop signal received")
                 try:
-                    if time.time() - last_sync > 300:
+                    if time.time() - last_sync > self._cfg.clock_resync_s:
                         self._client.sync_clock()
                         last_sync = time.time()
 
@@ -2308,6 +2563,8 @@ class Trader:
                     self._risk.check(bankroll)
                     if self._position is None:
                         self._maybe_enter(bankroll, mode)
+                    else:
+                        self._maybe_scale_in(bankroll)
                     self._errors = 0
                 except (TradingHalted, Shutdown):
                     raise
@@ -2319,7 +2576,8 @@ class Trader:
                         raise TradingHalted(
                             "too many consecutive API errors; check "
                             "connectivity and endpoint paths") from exc
-                    time.sleep(min(30.0, 2.0 ** min(self._errors, 5)))
+                    time.sleep(min(self._cfg.error_backoff_max_s,
+                                   2.0 ** min(self._errors, 5)))
 
                 time.sleep(self._cfg.poll_interval_s)
 
@@ -2346,7 +2604,7 @@ class Trader:
         now_ms = self._client.now_ms()
         self._prune(now_ms)
 
-        for raw in self._client.list_btc_5m_rounds():
+        for raw in self._client.list_rounds():
             if raw.topic_id in self._seen:
                 continue
             if not (self._cfg.entry_window_end_s
@@ -2391,6 +2649,13 @@ class Trader:
             if sig is None:
                 continue
 
+            if self._cfg.scale_in:
+                # Open with a fraction of the target so there is room to add
+                # if the round keeps going our way.
+                first = max(sig.stake_usdt * self._cfg.scale_in_initial_pct,
+                            self._cfg.min_stake_usdt)
+                sig = replace(sig, stake_usdt=min(first, sig.stake_usdt))
+
             order_id = None
             if self._cfg.live:
                 quote = self._client.get_quote(rnd, sig.side, sig.stake_usdt)
@@ -2418,9 +2683,13 @@ class Trader:
 
                 order_id = self._client.place_order(rnd, quote,
                                                     sig.stake_usdt)
+                if quote.fee_usdt > 0:
+                    LOG.info("Venue fee %.4f USDT (%.0f bps of stake)",
+                             quote.fee_usdt,
+                             quote.fee_usdt / sig.stake_usdt * 10_000)
                 sig = replace(sig, fill_price=quote.average_price, edge=edge)
-                LOG.info("Order %s filled at %.4f", order_id,
-                         quote.average_price)
+                LOG.info("Order %s filled at %.4f for %.4f shares", order_id,
+                         quote.average_price, quote.amount_out_shares)
 
             mult = kelly_multiple(sig.stake_usdt, bankroll, sig.model_prob,
                                   sig.fill_price, rnd.fee_bps)
@@ -2437,15 +2706,95 @@ class Trader:
             tid = self._journal.record(mode, rnd, sig, spot, sigma, bankroll,
                                        order_id)
             self._seen[rnd.topic_id] = rnd.end_ms
-            self._position = Position(tid, rnd, sig)
+            self._position = Position(tid, rnd, sig, sig.stake_usdt, 1)
             return      # one position at a time
+
+    def _maybe_scale_in(self, bankroll: float) -> None:
+        """
+        Top up an open position as the round moves further into our favour.
+
+        The target is the Kelly stake for the CURRENT probability. If the
+        buffer has grown, the target grows, and we add the difference. If the
+        round has turned against us the target falls and we add nothing --
+        adding there would be chasing a loser, which is the failure this
+        deliberately avoids.
+
+        Because the target is recomputed rather than accumulated, total
+        exposure to one round stays bounded by Kelly no matter how many
+        tranches are added.
+        """
+        pos = self._position
+        if pos is None or not self._cfg.scale_in:
+            return
+        secs = pos.rnd.seconds_remaining(self._client.now_ms())
+        if secs <= self._cfg.entry_window_end_s:
+            return                       # too late to fill
+
+        symbol = self._client.market_symbol(pos.rnd.feed_symbol)
+        spot = self._client.spot_price(symbol)
+        sigma = self._vol.sigma_annual(symbol)
+        if self._cfg.halt_on_clamped_sigma and self._vol.is_clamped(symbol):
+            return
+        tail_df = self._vol.tail_df(symbol)
+
+        if pos.rnd.strike is None:
+            return
+        p_up = digital_up_probability(spot, pos.rnd.strike, sigma, secs, tail_df)
+        prob = p_up if pos.signal.side is Side.UP else 1.0 - p_up
+        if prob <= pos.signal.model_prob:
+            return                       # not more favourable than before
+
+        levels = self._client.asks_for(pos.rnd, pos.signal.side)
+        if not levels:
+            return
+        price = levels[0][0]
+        if not (self._cfg.min_entry_price <= price <= self._cfg.max_entry_price):
+            return
+        if not clears_edge(prob, price, self._cfg, pos.rnd.fee_bps):
+            return
+
+        target = kelly_stake(bankroll + pos.committed_usdt, prob, price,
+                             self._cfg, pos.rnd.fee_bps)
+        topup = target - pos.committed_usdt
+        if topup < max(self._cfg.scale_in_min_topup, self._cfg.min_stake_usdt):
+            return
+        avg = walk_book(levels, topup)
+        if avg is None or not clears_edge(prob, avg, self._cfg, pos.rnd.fee_bps):
+            return
+
+        if self._cfg.live:
+            quote = self._client.get_quote(pos.rnd, pos.signal.side, topup)
+            if quote.average_price > self._cfg.max_entry_price:
+                return
+            if not clears_edge(prob, quote.average_price, self._cfg,
+                               pos.rnd.fee_bps):
+                return
+            if abs(quote.price_impact) > self._cfg.max_price_impact:
+                return
+            self._client.place_order(pos.rnd, quote, topup)
+            if quote.fee_usdt > 0:
+                LOG.debug("Top-up fee %.4f USDT on %.2f staked",
+                          quote.fee_usdt, topup)
+            avg = quote.average_price
+
+        blended = pos.average_price(topup, avg)
+        LOG.info("SCALE-IN %s +%.2f at %.3f (prob %.3f, %.0fs left) -> "
+                 "committed %.2f, avg %.3f", pos.rnd.slug, topup, avg, prob,
+                 secs, pos.committed_usdt + topup, blended)
+
+        self._position = replace(
+            pos,
+            signal=replace(pos.signal, model_prob=prob, fill_price=blended,
+                           stake_usdt=pos.committed_usdt + topup),
+            committed_usdt=pos.committed_usdt + topup,
+            tranches=pos.tranches + 1)
 
     def _settle_open(self) -> None:
         pos = self._position
         if pos is None:
             return
         now_ms = self._client.now_ms()
-        if now_ms < pos.rnd.end_ms + 2_000:
+        if now_ms < pos.rnd.end_ms + self._cfg.settle_grace_s * 1000:
             return
 
         winner: Optional[Side] = None
@@ -2471,7 +2820,7 @@ class Trader:
                 source = "endPrice"
 
         if winner is None:
-            if now_ms > pos.rnd.end_ms + 600_000:
+            if now_ms > pos.rnd.end_ms + self._cfg.settle_timeout_s * 1000:
                 LOG.error("Cannot settle %s; left unresolved in journal",
                           pos.rnd.slug)
                 self._position = None
@@ -2479,8 +2828,8 @@ class Trader:
 
         won = winner is pos.signal.side
         if pnl is None:
-            pnl = settle_pnl(pos.signal.stake_usdt, pos.signal.fill_price,
-                             won, pos.rnd.fee_bps)
+            pnl = settle_pnl(max(pos.committed_usdt, pos.signal.stake_usdt),
+                             pos.signal.fill_price, won, pos.rnd.fee_bps)
         if not self._cfg.live:
             self._paper_bankroll += pnl
 
@@ -2495,14 +2844,22 @@ class Trader:
                  pos.rnd.slug, "WIN" if won else "LOSS", pnl,
                  self._bankroll(), source)
 
-    def _drain(self, timeout_s: float = 600.0) -> None:
-        deadline = time.time() + timeout_s
+        self._settled_count += 1
+        if (self._cfg.report_every
+                and self._settled_count % self._cfg.report_every == 0):
+            for line in self._journal.calibration_report(
+                    self._cfg.profile_name).split("\n"):
+                LOG.info("| %s", line)
+
+    def _drain(self, timeout_s: Optional[float] = None) -> None:
+        deadline = time.time() + (timeout_s if timeout_s is not None
+                                  else self._cfg.drain_timeout_s)
         while self._position is not None and time.time() < deadline:
             try:
                 self._settle_open()
             except (ApiError, requests.RequestException) as exc:
                 LOG.warning("Settle retry: %s", exc)
-            time.sleep(5.0)
+            time.sleep(self._cfg.drain_poll_s)
 
 
 # --------------------------------------------------------------------------
@@ -2524,7 +2881,7 @@ def preflight(cfg: Config) -> int:
             failures += 1
             print(f"  {label:<24} FAIL {type(exc).__name__}: {str(exc)[:105]}")
 
-    check("public spot", lambda: f"BTCUSDT {client.spot_price():,.2f}")
+    check("public spot", lambda: f"{cfg.symbol} {client.spot_price():,.2f}")
     check("clock sync", lambda: f"offset {client.sync_clock()} ms")
     def vol_check() -> str:
         est = VolatilityEstimator(cfg, client.session)
@@ -2558,8 +2915,13 @@ def preflight(cfg: Config) -> int:
         else:
             # Ask the real sizing function, not a percentage rule of thumb:
             # on a small balance the Kelly fraction binds long before the cap.
-            strong = kelly_stake(bal, 0.70, 0.60, cfg, fee_bps=0)
-            weak = kelly_stake(bal, 0.63, 0.60, cfg, fee_bps=0)
+            # Probe at the midpoint of THIS profile's entry band. A fixed
+            # 0.60 lies outside the buffer and convex bands entirely, so the
+            # verdict described a trade those profiles would never make.
+            probe = (cfg.min_entry_price + cfg.max_entry_price) / 2.0
+            be = breakeven_probability(probe, cfg.fee_bps)
+            strong = kelly_stake(bal, min(be + 0.10, 0.999), probe, cfg)
+            weak = kelly_stake(bal, min(be + 0.01, 0.999), probe, cfg)
             if strong <= 0:
                 forced = cfg.min_stake_usdt / bal
                 notes.append(
@@ -2568,7 +2930,8 @@ def preflight(cfg: Config) -> int:
                     f"blocked ({forced:.0%} of bankroll exceeds the "
                     f"{cfg.hard_max_stake_pct:.0%} hard cap or 2x Kelly).")
             else:
-                mult = kelly_multiple(strong, bal, 0.70, 0.60, 0)
+                mult = kelly_multiple(strong, bal, min(be + 0.10, 0.999),
+                                      probe, cfg.fee_bps)
                 tag = f" at {mult:.2f}x full Kelly" if mult else ""
                 notes.append(f"  -> strong edge stakes {strong:.2f}{tag}; "
                              f"marginal edge stakes {weak:.2f}")
@@ -2583,8 +2946,8 @@ def preflight(cfg: Config) -> int:
     rounds: list[Round] = []
 
     def list_rounds():
-        rounds.extend(client.list_btc_5m_rounds())
-        return f"{len(rounds)} live BTC 5m round(s)"
+        rounds.extend(client.list_rounds())
+        return f"{len(rounds)} live {cfg.symbol} round(s)"
 
     check("market list", list_rounds)
 
@@ -2632,11 +2995,91 @@ def preflight(cfg: Config) -> int:
     return 0
 
 
+def whoami(cfg: Config, samples: int = 8) -> int:
+    """
+    Report the outbound IP this process actually uses.
+
+    Render's Connect menu shows shared CIDR *ranges*, while Binance's API-key
+    allowlist accepts individual addresses only. Pasting one address out of a
+    /24 matches only when that address happens to be the one used, which is
+    why the failure looks intermittent. Sampling repeatedly makes the churn
+    visible instead of guessed at.
+    """
+    import collections
+
+    services = ("https://api.ipify.org?format=json",
+                "https://ifconfig.me/all.json",
+                "https://ipinfo.io/json")
+    session = requests.Session()
+    seen: collections.Counter = collections.Counter()
+    errors: list[str] = []
+
+    print(f"\nSampling the outbound IP {samples} times...\n")
+    for i in range(samples):
+        got = None
+        for url in services:
+            try:
+                r = session.get(url, timeout=8)
+                if r.status_code != 200:
+                    continue
+                body = r.json()
+                got = body.get("ip") or body.get("ip_addr")
+                if got:
+                    break
+            except (requests.RequestException, ValueError) as exc:
+                errors.append(f"{url}: {exc}")
+        if got:
+            seen[got] += 1
+            print(f"  sample {i+1}: {got}")
+        else:
+            print(f"  sample {i+1}: could not determine")
+        time.sleep(0.4)
+
+    if not seen:
+        print("\nNo IP could be determined. Outbound HTTP may be blocked.")
+        for e in errors[:3]:
+            print(f"  {e}")
+        return 1
+
+    print(f"\n  distinct addresses observed: {len(seen)}")
+    for ip, count in seen.most_common():
+        print(f"    {ip}  ({count}/{samples})")
+
+    print("\n  What to do with this:")
+    if len(seen) > 1:
+        print("    The address CHANGED between requests. An allowlist keyed to")
+        print("    any single one of these will fail intermittently. You need")
+        print("    dedicated/static egress, or no IP restriction on the key.")
+    else:
+        print("    Stable across this sample -- but a shared range can still")
+        print("    reassign it on the next deploy or restart. Stability over")
+        print("    eight requests is not a guarantee across deploys.")
+    print("    Paste the exact address(es) above into the Binance key's")
+    print("    allowlist -- not the CIDR range from Render's Connect menu,")
+    print("    which Binance cannot parse.")
+
+    # Prove whether Binance itself accepts us, which is the real question.
+    print("\n  Checking whether Binance accepts this source...")
+    client = PredictionClient(cfg)
+    try:
+        client.sync_clock()
+        client.wallet()
+        print("    OK: a signed request succeeded from this IP.")
+        return 0
+    except ApiError as exc:
+        print(f"    FAIL [{exc.kind.value}]: {exc}")
+        if exc.kind is ErrorKind.AUTH:
+            print("    -2015 covers key, IP and permissions together. If the")
+            print("    address above is allowlisted, check the key's Wallet")
+            print("    permission next -- the code does not distinguish them.")
+        return 1
+
+
 def discover_min(cfg: Config) -> int:
     """Measure the venue's real minimum order size instead of assuming it."""
     client = PredictionClient(cfg)
     client.sync_clock()
-    rounds = client.list_btc_5m_rounds()
+    rounds = client.list_rounds()
     if not rounds:
         print("No live rounds to probe.")
         return 1
@@ -2715,16 +3158,29 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     ap.add_argument("--preflight", action="store_true",
                     help="probe endpoints with your keys and exit")
     ap.add_argument("--calibration-report", action="store_true")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="is the edge real? compares realised win rate "
+                         "against the breakeven for the price paid")
+    ap.add_argument("--report-every", type=int, default=0,
+                    help="log the calibration report every N settled trades; "
+                         "useful when hosted, where the journal is hard to read")
     ap.add_argument("--report-profile", default=None,
                     help="restrict the report to one profile; default is "
                          "every profile in the journal, separately")
-    ap.add_argument("--profile", choices=sorted(PROFILES), default="buffer",
+    ap.add_argument("--profile", choices=sorted(PROFILES), default="micro",
                     help="buffer = big buffer late in the round; micro = "
                          "small accounts (default); favorite = favourites; "
                          "balanced = symmetric; convex = longshots")
+    ap.add_argument("--scale-in", action="store_true", default=None,
+                    help="open small, then top up while the round stays "
+                         "favourable (never after a loss)")
+    ap.add_argument("--no-scale-in", dest="scale_in", action="store_false")
     ap.add_argument("--min-buffer", type=float, default=None,
                     help="override the buffer gate, in sigmas of the time "
                          "remaining")
+    ap.add_argument("--whoami", action="store_true",
+                    help="report the outbound IP actually in use and test "
+                         "whether Binance accepts it")
     ap.add_argument("--discover-min", action="store_true",
                     help="probe the venue for its real minimum order size "
                          "(quotes only, places no order) and exit")
@@ -2734,7 +3190,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     ap.add_argument("--min-edge", type=float, default=None)
     ap.add_argument("--no-fat-tails", action="store_true",
                     help="use a Gaussian model (understates cheap contracts)")
-    ap.add_argument("--kelly", type=float, default=0.25)
+    ap.add_argument("--kelly", type=float, default=None,
+                    help="override the profile's Kelly fraction")
     ap.add_argument("--paper-bankroll", type=float, default=None,
                     help="paper starting balance; defaults to the profile's "
                          "own figure so micro does not simulate a 100 USDT "
@@ -2752,6 +3209,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         print(Journal(args.db).calibration_report(args.report_profile))
         return 0
 
+    if args.diagnose:
+        print(Journal(args.db).diagnose(args.report_profile))
+        return 0
+
     key = os.environ.get("BINANCE_API_KEY", "")
     secret = os.environ.get("BINANCE_API_SECRET", "")
     if not key or not secret:
@@ -2762,18 +3223,29 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         settings = dict(PROFILES[args.profile])
         if args.min_edge is not None:
             settings["min_edge"] = args.min_edge
+        if args.kelly is not None:
+            settings["kelly_fraction"] = args.kelly
         if args.fee_bps is not None:
             settings["fee_bps"] = args.fee_bps
         if args.paper_bankroll is not None:
             settings["paper_start_bankroll"] = args.paper_bankroll
         if args.min_buffer is not None:
             settings["min_buffer_sigmas"] = args.min_buffer
-        cfg = Config(api_key=key, api_secret=secret, live=args.live,
-                     kelly_fraction=args.kelly,
-                     use_fat_tails=not args.no_fat_tails,
-                     db_path=args.db,
-                     endpoints=tuple(load_endpoints(args.endpoints).items()),
-                     profile_name=args.profile, **settings)
+        if args.scale_in is not None:
+            settings["scale_in"] = args.scale_in
+        if args.report_every:
+            settings["report_every"] = args.report_every
+        # Everything goes through ONE dict. Passing some keys positionally
+        # and others via **settings meant that adding a field to a profile
+        # collided with the explicit argument -- Config() got two values for
+        # kelly_fraction and the bot crashed on startup. Building a single
+        # mapping makes that collision impossible rather than merely fixed.
+        settings.update(
+            api_key=key, api_secret=secret, live=args.live,
+            use_fat_tails=not args.no_fat_tails, db_path=args.db,
+            endpoints=tuple(load_endpoints(args.endpoints).items()),
+            profile_name=args.profile)
+        cfg = Config(**settings)
         LOG.info("Profile %r: entry %.2f-%.2f, edge >= %.2f abs and "
                  "%.0f%% relative, max stake %.1f%% of bankroll, "
                  "min order %.2f USDT",
@@ -2789,6 +3261,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     commands = {
         "preflight": (args.preflight, preflight),
         "discover-min": (args.discover_min, discover_min),
+        "whoami": (args.whoami, whoami),
     }
     for name, (selected, fn) in commands.items():
         if not selected:
