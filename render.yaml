@@ -34,6 +34,7 @@ services:
       python btc_5m_predictor.py
       --profile ${PROFILE}
       --db /var/data/btc5m_journal.db
+      --live
     autoDeploy: false          # a redeploy mid-round interrupts a position
     disk:
       name: journal

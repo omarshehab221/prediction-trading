@@ -11,4 +11,4 @@ COPY btc_5m_predictor.py .
 ENV PYTHONUNBUFFERED=1
 
 # The journal lives on the mounted disk, not in the image.
-CMD ["python", "btc_5m_predictor.py", "--db", "/var/data/btc5m_journal.db"]
+CMD ["python", "btc_5m_predictor.py", "--db", "/var/data/btc5m_journal.db", "--live"]
