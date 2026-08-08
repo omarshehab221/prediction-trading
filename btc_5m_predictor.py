@@ -1,0 +1,2475 @@
+#!/usr/bin/env python3
+"""
+btc_5m_predictor.py
+===================
+
+Automated trader for Binance Wallet Prediction Markets, restricted to the
+BTC 5-minute Up/Down market.
+
+STRATEGY
+--------
+Price a 5m up/down contract as a digital option off the market's own price
+feed, and buy only when the venue quotes materially less than the model's
+probability. The edge is the gap between price and true probability -- NOT
+the win rate.
+
+WHY NO MARTINGALE
+-----------------
+An outcome share costs p and pays 1, so break-even win rate IS p. Buying at
+0.95 gives a 95% win rate with +5.3% wins and -100% losses; with full-stack
+sizing the 1-in-20 loss arrives on a schedule (expected ruin ~20 rounds).
+Sizing here is fractional Kelly, the correct formalisation of "stay in the
+game."
+
+ENDPOINTS AND SCHEMAS
+---------------------
+Paths and payload shapes below are taken from Binance's own auto-generated
+OpenAPI connector, `@binance/w3w-prediction` (npm). That is the authoritative
+source; several published doc pages 404 after their docs migration.
+
+Notable consequences, each of which silently breaks naive implementations:
+  * All amounts are wei, 18 decimals. 1 USDT == "1000000000000000000".
+  * Trading is two-phase: get-quote returns a quoteId + averagePrice, then
+    place-order-bundle executes that quoteId. MARKET orders are FOK.
+  * The order response returns only orderId. The fill price is the quote's
+    averagePrice.
+  * The strike is variantData.startPrice, and the market resolves on ITS OWN
+    price feed (variantData.priceFeedProvider / priceFeedSymbol), not on
+    Binance spot. Modelling off Binance spot introduces basis risk, so the
+    strike and settlement both come from the venue.
+  * wallet/list returns addresses, not balances. Balances come from
+    balance/payment-options.
+
+Still unverified without a funded account: live behaviour of
+place-order-bundle. Run --preflight first; it probes everything else.
+
+REQUIREMENTS
+------------
+    pip install requests
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import hmac
+import json
+import logging
+import math
+import os
+import sqlite3
+import statistics
+import sys
+import time
+import re
+import urllib.parse
+from dataclasses import dataclass, replace
+from decimal import Decimal, ROUND_DOWN
+from enum import Enum
+from typing import Iterable, Optional
+
+import requests
+
+LOG = logging.getLogger("btc5m")
+
+BASE = "https://api.binance.com"
+# Target round length. A constant here would silently exclude every market if
+# the venue ever lists a different cadence; the tolerance is a fraction of the
+# target rather than a fixed number of seconds.
+DEFAULT_ROUND_SECONDS = 300
+WEI = Decimal(10) ** 18
+
+# Verified against @binance/w3w-prediction. Overridable via endpoints.json.
+# (HTTP method, path). The verb travels WITH the path: keeping them apart is
+# what produced "Request method 'GET' is not supported" on trade/get-quote.
+# Methods verified against @binance/w3w-prediction 2.0.1.
+DEFAULT_ENDPOINTS: dict[str, tuple[str, str]] = {
+    "category_list": ("GET", "/sapi/v1/w3w/wallet/prediction/category/list"),
+    "market_list": ("GET", "/sapi/v1/w3w/wallet/prediction/market/list"),
+    "market_detail": ("GET", "/sapi/v1/w3w/wallet/prediction/market/detail"),
+    "order_book": ("GET", "/sapi/v1/w3w/wallet/prediction/order-book"),
+    "last_trade_price": ("GET", "/sapi/v1/w3w/wallet/prediction/order-book/last-trade-price"),
+    "wallet_list": ("GET", "/sapi/v1/w3w/wallet/prediction/wallet/list"),
+    "balances": ("GET", "/sapi/v1/w3w/wallet/prediction/balance/payment-options"),
+    "quota_status": ("GET", "/sapi/v1/w3w/wallet/prediction/quota/limit/status"),
+    "get_quote": ("POST", "/sapi/v1/w3w/wallet/prediction/trade/get-quote"),
+    "place_order": ("POST", "/sapi/v1/w3w/wallet/prediction/trade/place-order-bundle"),
+    "positions": ("GET", "/sapi/v1/w3w/wallet/prediction/position/list"),
+    "settled_history": ("GET", "/sapi/v1/w3w/wallet/prediction/position/settled-history"),
+    "batch_redeem": ("POST", "/sapi/v1/w3w/wallet/prediction/batch-redeem"),
+    "redeem_status": ("GET", "/sapi/v1/w3w/wallet/prediction/redeem/status"),
+}
+
+
+def load_endpoints(path: str = "endpoints.json") -> dict[str, tuple[str, str]]:
+    """
+    Endpoint table, optionally overridden from JSON.
+
+    An override may be a bare path string (method preserved) or a
+    ["METHOD", "/path"] pair.
+    """
+    eps = dict(DEFAULT_ENDPOINTS)
+    if os.path.exists(path):
+        try:
+            with open(path) as fh:
+                override = json.load(fh)
+            if not isinstance(override, dict):
+                raise ValueError("expected a JSON object")
+            unknown = set(override) - set(eps)
+            if unknown:
+                raise ValueError(f"unknown endpoint keys: {sorted(unknown)}")
+            for k, v in override.items():
+                if isinstance(v, str):
+                    eps[k] = (eps[k][0], v)
+                elif isinstance(v, list) and len(v) == 2:
+                    method = str(v[0]).upper()
+                    if method not in ("GET", "POST", "PUT", "DELETE"):
+                        raise ValueError(f"bad HTTP method for {k}: {v[0]}")
+                    eps[k] = (method, str(v[1]))
+                else:
+                    raise ValueError(f"{k}: expected a path or [method, path]")
+            LOG.info("Loaded %d endpoint override(s) from %s",
+                     len(override), path)
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            raise SystemExit(f"Bad {path}: {exc}")
+    return eps
+
+
+# --------------------------------------------------------------------------
+# Units
+# --------------------------------------------------------------------------
+
+
+def to_wei(amount_usdt: float | Decimal) -> str:
+    """
+    USDT -> wei string, truncated (never rounded up past the balance).
+
+    Decimal throughout: float arithmetic on 18 decimals loses precision and
+    would produce off-by-a-few-wei amounts the venue may reject.
+    """
+    d = Decimal(str(amount_usdt))
+    if d <= 0:
+        raise ValueError("amount must be positive")
+    return str(int((d * WEI).to_integral_value(rounding=ROUND_DOWN)))
+
+
+def from_wei(amount_wei: str | int) -> Decimal:
+    """wei -> USDT as Decimal."""
+    return Decimal(str(amount_wei)) / WEI
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class Config:
+    api_key: str
+    api_secret: str
+    live: bool = False
+
+    # --- Edge --------------------------------------------------------------
+    # Two thresholds, both of which must clear. The absolute floor stops us
+    # trading noise; the ratio keeps the bar consistent across price levels.
+    # An absolute 0.06 edge is a 7% margin at price 0.90 but a 60% margin at
+    # 0.10 -- one number cannot serve both ends of the book.
+    min_edge: float = 0.02
+    min_edge_ratio: float = 0.30      # model_prob >= breakeven * 1.30
+    # FALLBACK only. Each market publishes its own feeRateBps and that value
+    # wins. Assuming 2% when the real rate is near zero silently demands about
+    # a point of extra edge that does not exist, and suppresses valid trades.
+    fee_bps: int = 200
+    max_entry_price: float = 0.35     # convex: buy cheap, lose small
+    min_entry_price: float = 0.05
+    assumed_spread: float = 0.03
+    max_price_impact: float = 0.05      # reject quotes that move the book far
+
+    # --- Timing ------------------------------------------------------------
+    entry_window_start_s: int = 150
+    entry_window_end_s: int = 25
+
+    # --- Risk --------------------------------------------------------------
+    kelly_fraction: float = 0.25
+    max_stake_pct: float = 0.05
+    # Small accounts: allow betting the venue minimum when Kelly sizes below
+    # it, bounded by the 2x-full-Kelly limit inside kelly_stake.
+    round_up_to_minimum: bool = True
+    hard_max_stake_pct: float = 0.25
+    # The connector documents ~1.5 USDT as an APPROXIMATE MARKET-order
+    # minimum that "varies by market depth"; the account minimum is 1.00.
+    # Small MARKET orders may be rejected on a thin book -- that surfaces as a
+    # quote error, not a silent loss.
+    min_stake_usdt: float = 1.0
+    daily_loss_limit_pct: float = 0.20
+    # A low-win-rate strategy produces long losing streaks by design, so a
+    # raw streak counter is the wrong instrument -- at a 25% hit rate, four
+    # losses in a row happens roughly every five trades. The real question is
+    # whether results are significantly worse than the model predicted, which
+    # calibration_z answers. The streak cap remains only as a crude backstop.
+    max_consecutive_losses: int = 30
+    calibration_min_samples: int = 30
+    calibration_z_halt: float = -2.5
+    max_rounds_per_day: int = 200
+    max_consecutive_errors: int = 20
+
+    # --- Venue -------------------------------------------------------------
+    # chainId, collateral, fee and the venue's own slippage all come from the
+    # market payload. Only the values below are genuinely our decisions.
+    round_seconds: int = DEFAULT_ROUND_SECONDS
+    max_slippage_bps: int = 300          # OUR risk cap; venue default is 1200
+    min_liquidity: float = 0.0           # skip markets thinner than this
+    account_type: str = "AUTO"           # AUTO | SPOT | FUNDING
+    funding_source: str = "MPC"          # MPC | CEX
+    open_statuses: tuple[str, ...] = ("REGISTERED", "OPEN", "ACTIVE")
+    tradable_status: str = "OPEN"
+
+    # --- Model -------------------------------------------------------------
+    # Fat tails, estimated from realised kurtosis at runtime. None => Gaussian.
+    use_fat_tails: bool = True
+    tail_df_floor: float = 2.5
+    tail_df_ceiling: float = 30.0
+    # Sigma only needs a short window; kurtosis needs a long one (its standard
+    # error is ~sqrt(24/n), so 60 samples cannot distinguish fat tails from
+    # noise at all). Fetch long, measure sigma on the recent tail of it.
+    vol_lookback_min: int = 500
+    sigma_window_min: int = 60
+    # The floor exists only to avoid degenerate maths, so it must sit well
+    # below any plausible real value. If it ever binds, the model is asserting
+    # a volatility rather than measuring one -- and an overstated sigma
+    # inflates exactly the tail probabilities the convex profile buys, by up
+    # to 3.5x in observed cases. Trading is refused rather than distorted.
+    vol_floor_annual: float = 0.03
+    vol_ceiling_annual: float = 3.00
+    halt_on_clamped_sigma: bool = True
+
+    # --- Plumbing ----------------------------------------------------------
+    db_path: str = "btc5m_journal.db"
+    poll_interval_s: float = 2.0
+    recv_window_ms: int = 5000
+    http_timeout_s: float = 10.0
+    paper_start_bankroll: float = 100.0
+    endpoints: tuple[tuple[str, str], ...] = ()
+
+    def __post_init__(self) -> None:
+        if not self.api_key or not self.api_secret:
+            raise ValueError("API key and secret are required")
+        if not 0 < self.kelly_fraction <= 1:
+            raise ValueError("kelly_fraction must be in (0, 1]")
+        if not 0 < self.max_stake_pct <= 0.25:
+            raise ValueError("max_stake_pct must be in (0, 0.25]")
+        if not 0 < self.hard_max_stake_pct <= 0.35:
+            raise ValueError("hard_max_stake_pct must be in (0, 0.35]")
+        if self.hard_max_stake_pct < self.max_stake_pct:
+            raise ValueError("hard_max_stake_pct must be >= max_stake_pct")
+        if not 0 < self.min_edge < 1:
+            raise ValueError("min_edge must be in (0, 1)")
+        if self.min_edge_ratio < 0:
+            raise ValueError("min_edge_ratio must be non-negative")
+        if self.use_fat_tails and self.tail_df_floor <= 2.0:
+            raise ValueError("tail_df_floor must exceed 2 for finite variance")
+        if self.calibration_z_halt >= 0:
+            raise ValueError("calibration_z_halt must be negative")
+        if self.sigma_window_min > self.vol_lookback_min:
+            raise ValueError("sigma_window_min must not exceed vol_lookback_min")
+        if self.entry_window_end_s >= self.entry_window_start_s:
+            raise ValueError("entry_window_end_s must be < entry_window_start_s")
+        if not 0 < self.min_entry_price < self.max_entry_price < 1:
+            raise ValueError("require 0 < min < max < 1 entry price")
+        if self.vol_floor_annual <= 0:
+            raise ValueError("vol_floor_annual must be positive")
+        if not 0 <= self.fee_bps < 10_000:
+            raise ValueError("fee_bps must be in [0, 10000)")
+        if not 1 <= self.max_slippage_bps <= 10_000:
+            raise ValueError("max_slippage_bps must be in [1, 10000]")
+        if self.round_seconds <= 0:
+            raise ValueError("round_seconds must be positive")
+        if self.min_stake_usdt < 0.5:
+            raise ValueError("min_stake_usdt below 0.50 is not plausible")
+        if self.account_type not in ("AUTO", "SPOT", "FUNDING"):
+            raise ValueError("account_type must be AUTO, SPOT or FUNDING")
+        if self.funding_source not in ("MPC", "CEX"):
+            raise ValueError("funding_source must be MPC or CEX")
+
+    def ep(self, name: str) -> tuple[str, str]:
+        """(method, path) for a named endpoint."""
+        return (dict(self.endpoints) or DEFAULT_ENDPOINTS)[name]
+
+
+PROFILES: dict[str, dict] = {
+    # Big wins, small losses. Buys cheap contracts, so it LOSES MOST ROUNDS by
+    # construction; the winners have to be large enough to pay for them.
+    "convex": dict(max_entry_price=0.35, min_entry_price=0.05,
+                   min_edge=0.02, min_edge_ratio=0.30,
+                   max_stake_pct=0.02, entry_window_start_s=280,
+                   entry_window_end_s=30, max_consecutive_losses=60),
+    # Symmetric: trades anywhere it finds an edge. Higher hit rate, smaller
+    # payoffs, and correspondingly larger individual losses.
+    "balanced": dict(max_entry_price=0.90, min_entry_price=0.10,
+                     min_edge=0.04, min_edge_ratio=0.10,
+                     max_stake_pct=0.05, entry_window_start_s=150,
+                     entry_window_end_s=25, max_consecutive_losses=10),
+    # For small accounts, where a percentage cap would fall under the venue's
+    # order minimum and the bot would simply never trade. Targets the 0.40-0.75
+    # band -- roughly 30-150% return per win. Those are large PERCENTAGE wins
+    # that merely look small in dollars on a small balance.
+    #
+    # 20% of bankroll per round is deliberately aggressive and is the price of
+    # trading a small account at all. It is survivable (a loss is bounded and
+    # 20 consecutive losses still leave ~4% of the balance) but it is NOT the
+    # Kelly-optimal fraction, and scaling stake up after wins compounds both
+    # directions. Move to "balanced" once the balance clears ~30 USDT.
+    # Buy the favourite, late in the round, while the return is still worth
+    # having. Derived from a rule of "return >= 25%", i.e. price <= 0.80.
+    #
+    # This is the OPPOSITE side of the market from "convex". Prediction and
+    # betting markets frequently show a favourite-longshot bias, in which
+    # longshots are overpriced and favourites underpriced -- if that holds
+    # here, this profile is on the right side of it and convex is on the
+    # wrong one. `--calibration-report` measures which, from real fills.
+    #
+    # Entering late is a genuine information edge, not superstition: with
+    # less time left, the same price move is far more decisive, so the
+    # model's probability is sharper. The cost is a thinner book.
+    "favorite": dict(max_entry_price=0.80, min_entry_price=0.55,
+                     min_edge=0.03, min_edge_ratio=0.05,
+                     max_stake_pct=0.10, min_stake_usdt=1.0,
+                     entry_window_start_s=120, entry_window_end_s=20,
+                     max_consecutive_losses=10),
+    "micro": dict(max_entry_price=0.75, min_entry_price=0.35,
+                  min_edge=0.03, min_edge_ratio=0.06,
+                  max_stake_pct=0.20, min_stake_usdt=1.0,
+                  entry_window_start_s=200, entry_window_end_s=25,
+                  max_consecutive_losses=10),
+}
+
+
+# --------------------------------------------------------------------------
+# Domain types
+# --------------------------------------------------------------------------
+
+
+class Side(str, Enum):
+    UP = "UP"
+    DOWN = "DOWN"
+
+
+@dataclass(frozen=True)
+class Round:
+    """A live BTC 5m up/down market. Only ever built by _parse_round."""
+
+    topic_id: int
+    market_id: int
+    vendor: str
+    slug: str
+    start_ms: int
+    end_ms: int
+    up_token_id: str
+    down_token_id: str
+    up_quote: float          # indicative, NOT an executable ask
+    down_quote: float
+    # Everything below is published by the venue per market. None of it is
+    # assumed: an assumed chain id, collateral asset or price precision is a
+    # silent wrong answer, whereas a missing field is a visible one.
+    fee_bps: int
+    chain_id: str
+    collateral: str
+    venue_slippage_bps: int
+    decimal_precision: int
+    # None means the venue did not publish it -- distinct from a real zero.
+    liquidity: Optional[float]
+    strike: Optional[float] = None      # variantData.startPrice
+    feed_symbol: Optional[str] = None   # oracle the venue resolves against
+
+    @property
+    def duration_ms(self) -> int:
+        return self.end_ms - self.start_ms
+
+    def round_price(self, price: float) -> float:
+        """Snap to the market's published precision."""
+        return round(price, self.decimal_precision)
+
+    def seconds_remaining(self, now_ms: int) -> float:
+        return (self.end_ms - now_ms) / 1000.0
+
+    def token_for(self, side: Side) -> str:
+        return self.up_token_id if side is Side.UP else self.down_token_id
+
+    def quote_for(self, side: Side) -> float:
+        return self.up_quote if side is Side.UP else self.down_quote
+
+
+@dataclass(frozen=True)
+class Quote:
+    """An executable quote from the venue."""
+
+    quote_id: str
+    average_price: float
+    amount_out_shares: float
+    price_impact: float
+    fee_usdt: float
+
+
+@dataclass(frozen=True)
+class Signal:
+    side: Side
+    model_prob: float
+    fill_price: float
+    edge: float
+    stake_usdt: float
+    seconds_left: float
+
+
+@dataclass(frozen=True)
+class Position:
+    trade_id: int
+    rnd: Round
+    signal: Signal
+
+
+@dataclass(frozen=True)
+class WalletRef:
+    address: str
+    wallet_id: str
+
+
+class TradingHalted(Exception):
+    """A risk limit tripped. Always fails closed."""
+
+
+class ErrorKind(str, Enum):
+    """
+    What an API failure actually means.
+
+    Classified from the venue's numeric code wherever possible. Matching on
+    message substrings is fragile -- wording changes, locales differ, and a
+    keyword list silently mis-files anything it does not recognise. The code
+    is the structured field; the text is only a last resort.
+    """
+
+    SIZE = "SIZE"                    # order too small / not enough depth
+    INSUFFICIENT_FUNDS = "FUNDS"     # balance cannot cover the order
+    AUTH = "AUTH"                    # key, signature, permissions, IP
+    TIMING = "TIMING"                # clock drift / recvWindow
+    PARAMETER = "PARAMETER"          # malformed or missing parameter
+    NOT_FOUND = "NOT_FOUND"
+    UNKNOWN = "UNKNOWN"
+
+
+# Venue codes observed or documented. Anything absent stays UNKNOWN, which
+# callers must treat as "do not proceed" rather than "probably harmless".
+ERROR_CODES: dict[int, ErrorKind] = {
+    -9000: ErrorKind.INSUFFICIENT_FUNDS,
+    -1022: ErrorKind.AUTH,
+    -2014: ErrorKind.AUTH,
+    -2015: ErrorKind.AUTH,
+    -1002: ErrorKind.AUTH,
+    -1021: ErrorKind.TIMING,
+    -1102: ErrorKind.PARAMETER,
+    -1104: ErrorKind.PARAMETER,
+    -1121: ErrorKind.PARAMETER,
+}
+
+# Fallback only, when no numeric code is supplied.
+_MESSAGE_HINTS: tuple[tuple[tuple[str, ...], ErrorKind], ...] = (
+    (("enough", "insufficient balance", "insufficient funds"),
+     ErrorKind.INSUFFICIENT_FUNDS),
+    (("minimum", "too small", "min amount", "insufficient liquidity",
+      "depth"), ErrorKind.SIZE),
+    (("signature", "api-key", "api key", "permission", "unauthorized"),
+     ErrorKind.AUTH),
+    (("timestamp", "recvwindow"), ErrorKind.TIMING),
+    (("mandatory parameter", "illegal characters", "not supported"),
+     ErrorKind.PARAMETER),
+)
+
+
+class _AboveBalance(Exception):
+    """Internal: a probe size exceeded the wallet balance, not the floor."""
+
+    def __init__(self, amount: float) -> None:
+        super().__init__(f"probe {amount} exceeds balance")
+        self.amount = amount
+
+
+class ApiError(RuntimeError):
+    """
+    Transient or structural API failure, carrying the venue's own code.
+
+    The code travels with the exception so callers can branch on what went
+    wrong instead of re-parsing the message.
+    """
+
+    def __init__(self, message: str, code: Optional[int] = None,
+                 status: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status = status
+
+    @property
+    def kind(self) -> ErrorKind:
+        if self.code is not None and self.code in ERROR_CODES:
+            return ERROR_CODES[self.code]
+        if self.code is not None:
+            return ErrorKind.UNKNOWN     # a code we do not know: do not guess
+        text = str(self).lower()
+        for needles, kind in _MESSAGE_HINTS:
+            if any(n in text for n in needles):
+                return kind
+        return ErrorKind.UNKNOWN
+
+
+# --------------------------------------------------------------------------
+# Pricing
+# --------------------------------------------------------------------------
+
+
+def norm_cdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def _betacf(a: float, b: float, x: float) -> float:
+    """Continued fraction for the incomplete beta function (Lentz's method)."""
+    tiny = 1e-30
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c = 1.0
+    d = 1.0 - qab * x / qap
+    if abs(d) < tiny:
+        d = tiny
+    d = 1.0 / d
+    h = d
+    for mth in range(1, 301):
+        m2 = 2 * mth
+        aa = mth * (b - mth) * x / ((qam + m2) * (a + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        h *= d * c
+        aa = -(a + mth) * (qab + mth) * x / ((a + m2) * (qap + m2))
+        d = 1.0 + aa * d
+        if abs(d) < tiny:
+            d = tiny
+        c = 1.0 + aa / c
+        if abs(c) < tiny:
+            c = tiny
+        d = 1.0 / d
+        delta = d * c
+        h *= delta
+        if abs(delta - 1.0) < 3e-16:
+            break
+    return h
+
+
+def betainc(a: float, b: float, x: float) -> float:
+    """Regularised incomplete beta I_x(a, b). Used for the Student-t CDF."""
+    if not 0.0 <= x <= 1.0:
+        raise ValueError("x must be in [0, 1]")
+    if x in (0.0, 1.0):
+        return x
+    lbeta = (math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
+             + a * math.log(x) + b * math.log(1.0 - x))
+    front = math.exp(lbeta)
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+def student_t_cdf(x: float, df: float) -> float:
+    """
+    CDF of the Student-t distribution with `df` degrees of freedom.
+
+    Implemented in stdlib to keep the runtime dependency to `requests` alone;
+    verified against scipy.stats.t in the test suite.
+    """
+    if df <= 0:
+        raise ValueError("df must be positive")
+    xt = df / (df + x * x)
+    tail = 0.5 * betainc(df / 2.0, 0.5, xt)
+    return 1.0 - tail if x > 0 else tail
+
+
+def standardised_t_cdf(z: float, df: float) -> float:
+    """
+    Student-t CDF rescaled to unit variance, so `z` stays comparable to a
+    Gaussian z-score.
+
+    A raw t has variance df/(df-2); without this rescaling, switching to
+    fat tails would silently change the volatility as well as the shape.
+    """
+    if df <= 2.0:
+        raise ValueError("df must exceed 2 for finite variance")
+    return student_t_cdf(z * math.sqrt(df / (df - 2.0)), df)
+
+
+def digital_up_probability(spot: float, strike: float, sigma_annual: float,
+                           seconds_left: float,
+                           tail_df: Optional[float] = None) -> float:
+    """
+    P(spot finishes above strike), driftless, with optional fat tails.
+
+    Drift is omitted: over <=300s it is dwarfed by diffusion, and estimating it
+    would inject more variance than the term is worth.
+
+    `tail_df` selects a variance-matched Student-t instead of a Gaussian. This
+    matters enormously for cheap out-of-the-money contracts: real BTC returns
+    have heavy tails, so a Gaussian materially understates the probability of
+    the large move a lottery-ticket contract needs. Pricing those with a
+    Gaussian makes them look like bad bets when they are not.
+
+    Preconditions: spot>0, strike>0, sigma_annual>0, tail_df>2 if given.
+    Postcondition: result in [0.0, 1.0].
+    """
+    if spot <= 0 or strike <= 0:
+        raise ValueError("prices must be positive")
+    if sigma_annual <= 0:
+        raise ValueError("volatility must be positive")
+    if seconds_left <= 0:
+        return 1.0 if spot > strike else 0.0
+
+    t_years = seconds_left / (365.0 * 24.0 * 3600.0)
+    denom = sigma_annual * math.sqrt(t_years)
+    if denom <= 1e-12:
+        return 1.0 if spot > strike else 0.0
+
+    z = math.log(spot / strike) / denom
+    return norm_cdf(z) if tail_df is None else standardised_t_cdf(z, tail_df)
+
+
+def breakeven_probability(price: float, fee_bps: int) -> float:
+    """
+    Minimum true probability at which buying at `price` is not -EV.
+
+    Per unit staked: win -> (1-price)/price * (1-fee) profit; lose -> -1.
+    Solving EV=0 gives price / (price + (1-price)(1-fee)). Exact.
+    """
+    if not 0.0 < price < 1.0:
+        raise ValueError("price must be in (0, 1)")
+    f = fee_bps / 10_000.0
+    return price / (price + (1.0 - price) * (1.0 - f))
+
+
+def kelly_stake(bankroll: float, model_prob: float, price: float,
+                cfg: Config, fee_bps: Optional[int] = None) -> float:
+    """
+    Fractional-Kelly stake, with a bounded override for small accounts.
+
+    Never exceeds cfg.max_stake_pct of bankroll -- that cap is what makes ruin
+    impossible rather than merely unlikely.
+
+    THE SMALL-ACCOUNT PROBLEM
+    -------------------------
+    On a small balance the Kelly stake falls below the venue's minimum order
+    size: at 6.64 USDT a quarter-Kelly bet is about 0.40-0.90 USDT against a
+    1.00 minimum. Returning 0 there means the bot never trades at all, silently.
+
+    So when there is genuine positive edge but Kelly sizes below the minimum,
+    the minimum is used instead -- deliberately over-betting relative to Kelly.
+    That is only safe within a hard limit: expected log growth g(f) is zero at
+    f = 0 and again near f = 2*full_kelly, and NEGATIVE beyond it. Past twice
+    full Kelly you lose money in the long run even with a real edge. So the
+    override applies only while the forced fraction stays under 2x full Kelly
+    and under cfg.hard_max_stake_pct; otherwise it declines the trade.
+    """
+    if not 0.0 < price < 1.0:
+        raise ValueError("price must be in (0, 1)")
+    if not 0.0 <= model_prob <= 1.0:
+        raise ValueError("model_prob must be a probability")
+    if bankroll <= 0:
+        return 0.0
+
+    f = (cfg.fee_bps if fee_bps is None else fee_bps) / 10_000.0
+    b = ((1.0 - price) / price) * (1.0 - f)
+    if b <= 0:
+        return 0.0
+
+    full_kelly = (model_prob * b - (1.0 - model_prob)) / b
+    if full_kelly <= 0:
+        return 0.0                      # no edge: never override
+
+    stake = bankroll * min(full_kelly * cfg.kelly_fraction, cfg.max_stake_pct)
+    if stake >= cfg.min_stake_usdt:
+        return stake
+
+    if not cfg.round_up_to_minimum:
+        return 0.0
+
+    forced_fraction = cfg.min_stake_usdt / bankroll
+    if forced_fraction > cfg.hard_max_stake_pct:
+        return 0.0                      # minimum is too big a bite
+    if forced_fraction > 2.0 * full_kelly:
+        return 0.0                      # past 2x Kelly: negative log growth
+    return cfg.min_stake_usdt
+
+
+def kelly_multiple(stake: float, bankroll: float, model_prob: float,
+                   price: float, fee_bps: int) -> Optional[float]:
+    """How many times the full-Kelly fraction a stake represents. None if no edge."""
+    if bankroll <= 0 or not 0.0 < price < 1.0:
+        return None
+    b = ((1.0 - price) / price) * (1.0 - fee_bps / 10_000.0)
+    if b <= 0:
+        return None
+    full_kelly = (model_prob * b - (1.0 - model_prob)) / b
+    if full_kelly <= 0:
+        return None
+    return (stake / bankroll) / full_kelly
+
+
+def walk_book(asks: list[tuple[float, float]], stake_usdt: float
+              ) -> Optional[float]:
+    """
+    Average fill price for spending `stake_usdt` against sorted ask levels.
+
+    Used for pre-quote screening and for paper mode. In live mode the venue's
+    own quote is authoritative. Returns None if depth is insufficient.
+    """
+    if stake_usdt <= 0:
+        raise ValueError("stake must be positive")
+
+    spent = shares = 0.0
+    for price, size in asks:
+        if price <= 0 or size <= 0:
+            continue
+        remaining = stake_usdt - spent
+        if price * size >= remaining:
+            shares += remaining / price
+            spent = stake_usdt
+            break
+        spent += price * size
+        shares += size
+
+    if spent < stake_usdt - 1e-9 or shares <= 0:
+        return None
+    return stake_usdt / shares
+
+
+class VolatilityEstimator:
+    """Annualised sigma AND tail thickness from recent 1m returns."""
+
+    def __init__(self, cfg: Config, session: requests.Session) -> None:
+        self._cfg = cfg
+        self._session = session
+        self._cache: dict[str, tuple[float, float]] = {}
+        self._df_cache: dict[str, Optional[float]] = {}
+        self._clamped: dict[str, bool] = {}
+        self._raw: dict[str, float] = {}
+
+    def sigma_annual(self, symbol: str = "BTCUSDT") -> float:
+        cached = self._cache.get(symbol)
+        if cached is not None and time.time() - cached[1] < 60:
+            return cached[0]
+
+        r = self._session.get(
+            BASE + "/api/v3/klines",
+            params={"symbol": symbol, "interval": "1m",
+                    "limit": self._cfg.vol_lookback_min},
+            timeout=self._cfg.http_timeout_s)
+        r.raise_for_status()
+        closes = [float(k[4]) for k in r.json()]
+        if len(closes) < 10:
+            raise ApiError("insufficient kline history for volatility")
+
+        # Guard BOTH endpoints: a single malformed close (0 or negative) would
+        # otherwise raise a math domain error and take the whole loop down.
+        rets = [math.log(b / a) for a, b in zip(closes, closes[1:])
+                if a > 0 and b > 0]
+        if len(rets) < 10:
+            raise ApiError("insufficient valid returns for volatility")
+        # Recent window for sigma (volatility drifts); full window for tails.
+        recent = rets[-self._cfg.sigma_window_min:]
+        raw = statistics.pstdev(recent) * math.sqrt(365.0 * 24.0 * 60.0)
+        annual = max(self._cfg.vol_floor_annual,
+                     min(self._cfg.vol_ceiling_annual, raw))
+        self._raw[symbol] = raw
+        self._clamped[symbol] = abs(annual - raw) > 1e-12
+        if self._clamped[symbol]:
+            LOG.warning("Volatility %.4f clamped to %.4f for %s -- the model "
+                        "is no longer measuring the market", raw, annual, symbol)
+
+        self._df_cache[symbol] = self._estimate_df(rets, statistics.pstdev(rets))
+        self._cache[symbol] = (annual, time.time())
+        return annual
+
+    def _estimate_df(self, rets: list[float], sd: float) -> Optional[float]:
+        """
+        Degrees of freedom implied by realised excess kurtosis.
+
+        For a Student-t, excess kurtosis = 6 / (df - 4), so df = 4 + 6/k.
+
+        The sample estimator has standard error ~sqrt(24/n), so a fixed small
+        cutoff would flag ordinary sampling noise as fat tails -- a 500-point
+        Gaussian draw routinely shows +0.1 excess kurtosis. Require two
+        standard errors of evidence instead, and refuse to guess at all below
+        200 samples. Returns None when the data does not look convincingly
+        heavy-tailed, in which case pricing stays Gaussian.
+        """
+        n = len(rets)
+        if not self._cfg.use_fat_tails or sd <= 0 or n < 200:
+            return None
+        mu = statistics.fmean(rets)
+        z4 = statistics.fmean([((x - mu) / sd) ** 4 for x in rets])
+        excess = z4 - 3.0
+        if excess <= 2.0 * math.sqrt(24.0 / n):
+            return None
+        df = 4.0 + 6.0 / excess
+        return max(self._cfg.tail_df_floor,
+                   min(self._cfg.tail_df_ceiling, df))
+
+    def tail_df(self, symbol: str = "BTCUSDT") -> Optional[float]:
+        """Tail parameter for `symbol`. Call sigma_annual first."""
+        return self._df_cache.get(symbol)
+
+    def raw_sigma(self, symbol: str = "BTCUSDT") -> Optional[float]:
+        """Measured sigma before clamping, for diagnostics."""
+        return self._raw.get(symbol)
+
+    def is_clamped(self, symbol: str = "BTCUSDT") -> bool:
+        """True if the last sigma hit a bound and is therefore not a measurement."""
+        return self._clamped.get(symbol, False)
+
+
+# --------------------------------------------------------------------------
+# Risk
+# --------------------------------------------------------------------------
+
+
+class RiskManager:
+    """Owns every reason to stop. Fails closed on all of them."""
+
+    def __init__(self, cfg: Config, starting_bankroll: float) -> None:
+        self._cfg = cfg
+        self._day_start_bankroll = max(starting_bankroll, 1e-9)
+        self._day_key = time.strftime("%Y-%m-%d")
+        self.consecutive_losses = 0
+        self.rounds_today = 0
+        self.halted_reason: Optional[str] = None
+        # Poisson-binomial accumulators: each trade contributes its own model
+        # probability, so expectation is well defined even though every trade
+        # has different odds.
+        self._expected_wins = 0.0
+        self._variance = 0.0
+        self._actual_wins = 0
+        self._samples = 0
+
+    def calibration_z(self) -> Optional[float]:
+        """
+        How far observed wins sit below what the model predicted, in sigmas.
+
+        None until there are enough samples. This is the honest health check
+        for a low-win-rate strategy: losing 12 in a row on 10%-probability
+        contracts is expected, whereas losing 12 in a row on 60% contracts
+        means the model is broken. A streak counter cannot tell them apart.
+        """
+        if self._samples < self._cfg.calibration_min_samples:
+            return None
+        if self._variance <= 1e-9:
+            return None
+        return (self._actual_wins - self._expected_wins) / math.sqrt(self._variance)
+
+    def _roll_day(self, bankroll: float) -> None:
+        today = time.strftime("%Y-%m-%d")
+        if today != self._day_key:
+            self._day_key = today
+            self._day_start_bankroll = max(bankroll, 1e-9)
+            self.consecutive_losses = 0
+            self.rounds_today = 0
+            self.halted_reason = None
+            self._expected_wins = self._variance = 0.0
+            self._actual_wins = self._samples = 0
+            LOG.info("New trading day; baseline bankroll %.2f", bankroll)
+
+    def check(self, bankroll: float) -> None:
+        self._roll_day(bankroll)
+        if self.halted_reason:
+            raise TradingHalted(self.halted_reason)
+
+        drawdown = 1.0 - (bankroll / self._day_start_bankroll)
+        if drawdown >= self._cfg.daily_loss_limit_pct:
+            self._halt(f"daily loss limit: {drawdown:.1%} down "
+                       f"(limit {self._cfg.daily_loss_limit_pct:.0%})")
+        z = self.calibration_z()
+        if z is not None:
+            # Enough data for the statistically correct test, so use it and
+            # ignore the streak counter entirely. A convex strategy buying
+            # 12%-probability contracts hits 30-loss streaks several times per
+            # 200 trades; halting on that would shut down a healthy bot.
+            if z <= self._cfg.calibration_z_halt:
+                self._halt(f"results {abs(z):.1f} sigma below model prediction "
+                           f"over {self._samples} trades -- the model is "
+                           f"overconfident, not merely unlucky")
+        elif self.consecutive_losses >= self._cfg.max_consecutive_losses:
+            # Fallback only while the sample is too small to judge properly.
+            self._halt(f"{self.consecutive_losses} consecutive losses before "
+                       f"enough data to assess calibration; manual review")
+        if self.rounds_today >= self._cfg.max_rounds_per_day:
+            self._halt("max rounds per day reached")
+        if bankroll < self._cfg.min_stake_usdt:
+            self._halt("bankroll below minimum stake")
+
+    def _halt(self, reason: str) -> None:
+        self.halted_reason = reason
+        raise TradingHalted(reason)
+
+    def record_result(self, won: bool,
+                      model_prob: Optional[float] = None) -> None:
+        self.rounds_today += 1
+        self.consecutive_losses = 0 if won else self.consecutive_losses + 1
+        if model_prob is not None:
+            self._expected_wins += model_prob
+            self._variance += model_prob * (1.0 - model_prob)
+            self._actual_wins += int(won)
+            self._samples += 1
+
+
+# --------------------------------------------------------------------------
+# API client
+# --------------------------------------------------------------------------
+
+
+class PredictionClient:
+    """All venue I/O. Signs requests; parses payloads exactly once."""
+
+    # Set from Config at construction; _parse_round is a staticmethod and
+    # needs the target duration without a config reference.
+    round_target_ms: int = DEFAULT_ROUND_SECONDS * 1000
+    open_statuses: tuple[str, ...] = ("REGISTERED", "OPEN", "ACTIVE")
+    tradable_status: str = "OPEN"
+
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._session = requests.Session()
+        self._session.headers.update({"X-MBX-APIKEY": cfg.api_key})
+        self._clock_offset_ms = 0
+        self._wallet: Optional[WalletRef] = None
+        self._symbol_cache: dict[str, str] = {}
+        PredictionClient.round_target_ms = cfg.round_seconds * 1000
+        PredictionClient.open_statuses = cfg.open_statuses
+        PredictionClient.tradable_status = cfg.tradable_status
+
+    @property
+    def session(self) -> requests.Session:
+        return self._session
+
+    # -- time ---------------------------------------------------------------
+
+    def sync_clock(self) -> int:
+        r = self._session.get(BASE + "/api/v3/time",
+                              timeout=self._cfg.http_timeout_s)
+        r.raise_for_status()
+        self._clock_offset_ms = (int(r.json()["serverTime"])
+                                 - int(time.time() * 1000))
+        if abs(self._clock_offset_ms) > 1000:
+            LOG.warning("Local clock off by %d ms; compensating",
+                        self._clock_offset_ms)
+        return self._clock_offset_ms
+
+    def now_ms(self) -> int:
+        return int(time.time() * 1000) + self._clock_offset_ms
+
+    # -- transport ----------------------------------------------------------
+
+    def _signed_query(self, params: dict) -> str:
+        """
+        Build the exact query string to send, with its signature appended.
+
+        Binance recomputes the HMAC over the query string it RECEIVES, so the
+        signed bytes and the sent bytes must be byte-identical. Signing a
+        sorted dict and then letting the HTTP client re-serialise it in
+        insertion order produces a different string and a guaranteed -1022
+        signature error. Returning a string rather than a dict makes that
+        class of bug unrepresentable.
+
+        doseq=True is required for repeated parameters such as tokenIds;
+        without it a list serialises as its Python repr.
+        """
+        p = {k: v for k, v in params.items() if v is not None}
+        p["timestamp"] = self.now_ms()
+        p["recvWindow"] = self._cfg.recv_window_ms
+        query = urllib.parse.urlencode(sorted(p.items()), doseq=True)
+        signature = hmac.new(self._cfg.api_secret.encode(),
+                             query.encode(), hashlib.sha256).hexdigest()
+        return f"{query}&signature={signature}"
+
+    # Binance error codes worth explaining rather than echoing verbatim.
+    _ERROR_HINTS = {
+        -1022: "signature mismatch -- the signed and sent query strings differ",
+        -1021: "timestamp outside recvWindow -- clock drift",
+        -1102: "a mandatory parameter was missing or malformed",
+        -2014: "API-key format invalid",
+        -2015: "invalid API key, IP not whitelisted, or missing permissions",
+        -1002: "not authorised for this endpoint",
+        -9000: "the account balance cannot cover this order size",
+    }
+
+    @staticmethod
+    def _json_or_none(response) -> Optional[object]:
+        """Parsed JSON, or None when the body is not JSON at all."""
+        try:
+            return response.json()
+        except ValueError:
+            return None
+
+    def _request(self, name: str, params: Optional[dict] = None) -> dict:
+        """Call a named endpoint. The verb comes from the table, never a caller."""
+        method, path = self._cfg.ep(name)
+        query = self._signed_query(params or {})
+        if LOG.isEnabledFor(logging.DEBUG):
+            # Signature redacted; every other parameter shown verbatim so a
+            # malformed request is visible rather than inferred.
+            LOG.debug("%s %s?%s", method, path,
+                      re.sub(r"signature=[0-9a-f]+", "signature=<redacted>",
+                             query))
+        url = f"{BASE}{path}?{query}"
+        try:
+            r = self._session.request(method, url,
+                                      timeout=self._cfg.http_timeout_s)
+        except requests.RequestException as exc:
+            raise ApiError(f"{method} {path}: {exc}") from exc
+
+        if r.status_code >= 400:
+            # Binance puts the real diagnosis in the body, not the status line.
+            # Discarding it turns every distinct failure into "400 Bad Request".
+            code, body = None, self._json_or_none(r)
+            if isinstance(body, dict) and "msg" in body:
+                code = body.get("code")
+                detail = f"{body['msg']} (code {code})"
+            else:
+                # Not a JSON error envelope; the raw text is the best detail
+                # available and is preserved rather than discarded.
+                detail = r.text[:200] or "<empty response body>"
+            code_int: Optional[int] = None
+            if code is not None:
+                try:
+                    code_int = int(code)
+                except (TypeError, ValueError):
+                    code_int = None
+            hint = self._ERROR_HINTS.get(code_int)
+            raise ApiError(f"{method} {path}: HTTP {r.status_code}: {detail}"
+                           + (f" -- {hint}" if hint else ""),
+                           code=code_int, status=r.status_code)
+
+        try:
+            payload = r.json()
+        except ValueError as exc:
+            raise ApiError(f"{method} {path}: bad JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise ApiError(f"{method} {path}: expected a JSON object")
+        return payload
+
+    # -- public spot (model input only) -------------------------------------
+
+    def market_symbol(self, feed_symbol: Optional[str]) -> str:
+        """
+        Map the venue's oracle symbol to a tradable Binance symbol.
+
+        The market resolves on its own feed (e.g. Pyth "BTC/USD"), which is not
+        a valid Binance ticker. Passing it through unchecked makes every price
+        request fail. Normalise, verify once, and fall back to BTCUSDT with a
+        loud warning -- the fallback carries basis risk, so it must be visible
+        rather than silent.
+        """
+        if not feed_symbol:
+            return "BTCUSDT"
+        if feed_symbol in self._symbol_cache:
+            return self._symbol_cache[feed_symbol]
+
+        candidate = re.sub(r"[^A-Z0-9]", "", feed_symbol.upper())
+        resolved = "BTCUSDT"
+        if candidate:
+            try:
+                r = self._session.get(BASE + "/api/v3/ticker/price",
+                                      params={"symbol": candidate},
+                                      timeout=self._cfg.http_timeout_s)
+                if r.status_code == 200:
+                    resolved = candidate
+            except requests.RequestException as exc:
+                LOG.warning("Could not verify symbol %r (%s); falling back",
+                            candidate, exc)
+
+        if resolved != candidate:
+            LOG.warning("Settlement feed %r is not a Binance symbol; modelling "
+                        "on BTCUSDT instead. Basis risk between the two feeds "
+                        "is NOT captured by the model.", feed_symbol)
+        self._symbol_cache[feed_symbol] = resolved
+        return resolved
+
+    def spot_price(self, symbol: str = "BTCUSDT") -> float:
+        r = self._session.get(BASE + "/api/v3/ticker/price",
+                              params={"symbol": symbol},
+                              timeout=self._cfg.http_timeout_s)
+        r.raise_for_status()
+        return float(r.json()["price"])
+
+    # -- account ------------------------------------------------------------
+
+    def wallet(self) -> WalletRef:
+        """Prediction wallet address + id. Cached; required by most calls."""
+        if self._wallet is not None:
+            return self._wallet
+        payload = self._request("wallet_list")
+        for w in payload.get("wallets") or []:
+            addr, wid = w.get("walletAddress"), w.get("walletId")
+            if addr and wid:
+                self._wallet = WalletRef(str(addr), str(wid))
+                return self._wallet
+        raise ApiError("no prediction wallet found -- create one in the "
+                       "Binance app and complete SAS authorization")
+
+    def payment_options(self) -> list[tuple[str, float, bool]]:
+        """
+        Every funding option as (accountType, balance, enabled).
+
+        Returned whole rather than filtered, because collateral can sit under
+        an account type the caller did not anticipate. Silently filtering to
+        one type reports 0.00 for a funded account -- which looks like an
+        empty wallet rather than a lookup in the wrong place.
+        """
+        payload = self._request("balances")
+        out: list[tuple[str, float, bool]] = []
+        for item in payload.get("items") or []:
+            try:
+                bal = float(item.get("availableBalanceDisplay") or 0.0)
+            except (TypeError, ValueError):
+                bal = 0.0
+            out.append((str(item.get("accountType") or "UNKNOWN").upper(),
+                        bal, bool(item.get("enabled", True))))
+        return out
+
+    def _resolved_account_type(self) -> str:
+        """The account type actually used, resolving AUTO against live balances."""
+        if self._cfg.account_type != "AUTO":
+            return self._cfg.account_type
+        usable = [(t, b) for t, b, en in self.payment_options() if en]
+        if not usable:
+            raise ApiError("no enabled funding option")
+        return max(usable, key=lambda kv: kv[1])[0]
+
+    def balance_usdt(self) -> float:
+        """
+        Available collateral. With account_type AUTO, uses the enabled option
+        holding the most funds; otherwise the named type.
+        """
+        options = self.payment_options()
+        if not options:
+            raise ApiError("no funding options returned")
+
+        usable = [(t, b) for t, b, en in options if en]
+        if self._cfg.account_type != "AUTO":
+            for acct, bal in usable:
+                if acct == self._cfg.account_type:
+                    return bal
+            raise ApiError(
+                f"no enabled {self._cfg.account_type} option; available: "
+                + ", ".join(f"{t}={b:.2f}" for t, b in usable))
+
+        if not usable:
+            raise ApiError("no enabled funding option; all are disabled")
+        acct, bal = max(usable, key=lambda kv: kv[1])
+        LOG.debug("Using %s balance %.2f USDT", acct, bal)
+        return bal
+
+    def remaining_quota_usdt(self) -> Optional[float]:
+        """
+        Venue-imposed daily trading limit, or None if the venue reports none.
+
+        Errors propagate: swallowing them here made preflight print "OK None"
+        for an endpoint that had actually failed, which is worse than no check.
+        """
+        payload = self._request("quota_status")
+        raw = payload.get("remainingDailyLimit")
+        return None if raw is None else float(raw)
+
+    # -- market data --------------------------------------------------------
+
+    def list_btc_5m_rounds(self) -> list[Round]:
+        payload = self._request("market_list", {
+            "l1Category": "crypto", "l2Category": "up-down",
+            "sortBy": "END_DATE", "orderBy": "ASC", "limit": 50})
+        out = []
+        for topic in payload.get("marketTopics") or []:
+            rnd = self._parse_round(topic)
+            if rnd is not None:
+                out.append(rnd)
+        return out
+
+    def market_detail(self, topic_id: int) -> dict:
+        return self._request("market_detail",
+                             {"marketTopicId": topic_id})
+
+    def hydrate(self, rnd: Round) -> Optional[Round]:
+        """
+        Fill in strike and feed symbol from market/detail.
+
+        The strike is variantData.startPrice. Reconstructing it from Binance
+        klines would introduce basis risk, because the market resolves on its
+        own price feed rather than on Binance spot.
+        """
+        if rnd.strike is not None:
+            return rnd
+        try:
+            topic = self.market_detail(rnd.topic_id)
+        except ApiError as exc:
+            LOG.warning("Market detail unavailable for %s: %s", rnd.slug, exc)
+            return None
+        vd = (topic.get("marketTopic") or topic).get("variantData") or {}
+        strike, symbol = self._parse_variant(vd)
+        return None if strike is None else replace(rnd, strike=strike,
+                                                   feed_symbol=symbol)
+
+    @staticmethod
+    def _parse_variant(vd: dict) -> tuple[Optional[float], Optional[str]]:
+        """(startPrice, priceFeedSymbol) from a variantData block."""
+        if not isinstance(vd, dict):
+            return None, None
+        symbol = vd.get("priceFeedSymbol")
+        raw = vd.get("startPrice")
+        if raw is None:
+            return None, symbol         # not published yet: expected early
+        try:
+            price = float(raw)
+        except (TypeError, ValueError):
+            LOG.warning("Unparseable startPrice %r", raw)
+            return None, symbol
+        if price <= 0:
+            LOG.warning("Implausible startPrice %r", raw)
+            return None, symbol
+        return price, symbol
+
+    @staticmethod
+    def _parse_round(topic: dict) -> Optional[Round]:
+        """
+        Validate untrusted payload once, into a precise type.
+
+        Returns None for anything that is not a live BTC 5m up/down market.
+        Downstream code may assume every Round is well-formed. `strike` is left
+        None here: the list response often omits variantData, and requiring it
+        would reject every round and leave the bot silently never trading.
+        """
+        try:
+            if topic.get("chartType") != "CRYPTO_UP_DOWN":
+                return None
+            if topic.get("symbol") != "BTCUSDT":
+                return None
+            if topic.get("status") not in PredictionClient.open_statuses:
+                return None
+
+            start_ms, end_ms = int(topic["startDate"]), int(topic["endDate"])
+            target = PredictionClient.round_target_ms
+            if abs((end_ms - start_ms) - target) > target * 0.1:
+                return None
+
+            markets = topic.get("markets") or []
+            if not markets:
+                return None
+            market = markets[0]
+            if market.get("tradingStatus") != PredictionClient.tradable_status:
+                return None
+
+            outcomes = {str(o.get("name", "")).upper(): o
+                        for o in market.get("outcomes") or []}
+            up = outcomes.get("YES") or outcomes.get("UP")
+            down = outcomes.get("NO") or outcomes.get("DOWN")
+            if not up or not down:
+                return None
+
+            up_q, down_q = float(up["price"]), float(down["price"])
+            if not (0.0 < up_q < 1.0 and 0.0 < down_q < 1.0):
+                return None
+
+            vendor = topic.get("vendor")
+            chain_id = topic.get("chainId")
+            collateral = topic.get("collateral")
+            if not vendor or not chain_id or not collateral:
+                # Required for order routing. Guessing them would send a
+                # correctly-formed order to the wrong place.
+                LOG.warning("Market %s missing vendor/chainId/collateral",
+                            topic.get("slug"))
+                return None
+
+            strike, symbol = PredictionClient._parse_variant(
+                topic.get("variantData") or {})
+
+            fee_raw = topic.get("feeRateBps")
+            if fee_raw is None:
+                LOG.warning("Market %s publishes no feeRateBps", topic.get("slug"))
+                return None
+
+            prec_raw = market.get("decimalPrecision")
+            if prec_raw is None:
+                # Defaulting to 4 would round prices to a precision the venue
+                # does not use, producing orders it may reject.
+                LOG.warning("Market %s publishes no decimalPrecision",
+                            topic.get("slug"))
+                return None
+
+            liq_raw = market.get("liquidity")
+            if liq_raw is None:
+                liq_raw = topic.get("liquidity")
+            try:
+                liquidity = None if liq_raw is None else float(liq_raw)
+            except (TypeError, ValueError):
+                liquidity = None
+
+            return Round(
+                topic_id=int(topic["marketTopicId"]),
+                market_id=int(market["marketId"]),
+                vendor=str(vendor),
+                slug=str(topic.get("slug", "")),
+                start_ms=start_ms, end_ms=end_ms,
+                up_token_id=str(up["tokenId"]),
+                down_token_id=str(down["tokenId"]),
+                up_quote=up_q, down_quote=down_q,
+                fee_bps=int(fee_raw),
+                chain_id=str(chain_id),
+                collateral=str(collateral).upper(),
+                venue_slippage_bps=int(topic.get("slippageBps") or 0),
+                decimal_precision=int(prec_raw),
+                liquidity=liquidity,
+                strike=strike, feed_symbol=symbol)
+        except (KeyError, TypeError, ValueError) as exc:
+            LOG.warning("Skipping malformed market payload: %s", exc)
+            return None
+
+    def asks_for(self, rnd: Round, side: Side
+                 ) -> Optional[list[tuple[float, float]]]:
+        """Ask ladder for one outcome. `vendor` is a required parameter."""
+        try:
+            payload = self._request("order_book", {
+                "vendor": rnd.vendor, "marketId": rnd.market_id,
+                "tokenId": rnd.token_for(side)})
+        except ApiError as exc:
+            LOG.debug("order book unavailable: %s", exc)
+            return None
+        return self._parse_asks(payload)
+
+    @staticmethod
+    def _parse_asks(payload: dict) -> Optional[list[tuple[float, float]]]:
+        """Levels are {price, size} strings per the connector schema."""
+        raw = payload.get("asks")
+        if raw is None:
+            nested = payload.get("orderBook") or payload.get("data") or {}
+            raw = nested.get("asks") if isinstance(nested, dict) else None
+        if not raw:
+            return None
+
+        levels: list[tuple[float, float]] = []
+        skipped = 0
+        for lvl in raw:
+            try:
+                if isinstance(lvl, dict):
+                    price = float(lvl["price"])
+                    size_raw = lvl.get("size")
+                    if size_raw is None:
+                        size_raw = lvl.get("quantity")
+                    if size_raw is None:
+                        size_raw = lvl.get("amount")
+                    size = float(size_raw)
+                else:
+                    price, size = float(lvl[0]), float(lvl[1])
+            except (TypeError, ValueError, KeyError, IndexError):
+                skipped += 1
+                continue
+            if 0.0 < price < 1.0 and size > 0:
+                levels.append((price, size))
+            else:
+                skipped += 1
+        if skipped:
+            # Silently dropping levels would understate depth and make the
+            # book look thinner than it is.
+            LOG.warning("Order book: skipped %d unparseable level(s) of %d",
+                        skipped, len(raw))
+        return sorted(levels) or None
+
+    # -- trading ------------------------------------------------------------
+
+    def effective_slippage_bps(self, rnd: Round) -> int:
+        """
+        The tighter of our risk cap and the venue's published tolerance.
+
+        The venue's value is a maximum it will accept, not a recommendation --
+        the listed default of 1200 bps would let a thin book fill us 12% worse
+        than quoted. Taking the minimum keeps our cap authoritative without
+        inventing a number the venue would reject.
+        """
+        venue = rnd.venue_slippage_bps
+        if venue <= 0:
+            return self._cfg.max_slippage_bps
+        return max(1, min(self._cfg.max_slippage_bps, venue))
+
+    def get_quote(self, rnd: Round, side: Side, stake_usdt: float) -> Quote:
+        """
+        Phase 1 of trading: ask the venue to price the trade.
+
+        Returns the authoritative average fill price, so no local book-walking
+        estimate is needed once we are live.
+        """
+        payload = self._request("get_quote", {
+            "walletAddress": self.wallet().address,
+            "tokenId": rnd.token_for(side),
+            "side": "BUY",
+            "amountIn": to_wei(stake_usdt),
+            "orderType": "MARKET",
+            "slippageBps": self.effective_slippage_bps(rnd),
+            "chainId": rnd.chain_id,
+            "feeRateBps": rnd.fee_bps,
+            "fundingSource": self._cfg.funding_source})
+
+        quote_id = payload.get("quoteId")
+        avg = payload.get("averagePrice")
+        if not quote_id or avg is None:
+            raise ApiError(f"malformed quote response: {payload}")
+
+        avg_f = float(avg)
+        if not 0.0 < avg_f < 1.0:
+            raise ApiError(f"quote returned implausible price {avg_f}")
+
+        shares_raw = payload.get("amountOut")
+        if shares_raw is None:
+            raise ApiError(f"quote omits amountOut: {payload}")
+        shares = float(from_wei(shares_raw))
+        if shares <= 0:
+            raise ApiError(f"quote returned {shares} shares for "
+                           f"{stake_usdt:.2f} USDT")
+
+        impact_raw = payload.get("priceImpact")
+        fee_raw = payload.get("feeAmount")
+        return Quote(
+            quote_id=str(quote_id),
+            average_price=avg_f,
+            amount_out_shares=shares,
+            # A missing impact is unknown, not zero; treat it as the worst
+            # case so the caller's impact guard cannot be bypassed.
+            price_impact=(float("inf") if impact_raw is None
+                          else float(impact_raw)),
+            fee_usdt=0.0 if fee_raw is None else float(from_wei(fee_raw)))
+
+    def discover_min_stake(self, rnd: Round, side: Side,
+                           low: float = 0.25, high: Optional[float] = None,
+                           tolerance: float = 0.05) -> Optional[float]:
+        """
+        Find the venue's actual minimum order size by probing get-quote.
+
+        The connector documents "approximately 1.5 USDT (varies by market
+        depth)" and publishes no field for it, so it cannot be read -- but it
+        can be measured. Quotes are non-binding and place no order.
+
+        `high` defaults to the account's own balance rather than an invented
+        ceiling: probing above what the wallet holds returns "not enough
+        USDT", which says nothing about the minimum and previously crashed
+        the search. Errors are classified by the venue's numeric code, so a
+        funds problem, an auth problem and a genuine size floor are never
+        confused with one another.
+
+        Returns None when no tested size quotes successfully.
+        """
+        if high is None:
+            try:
+                high = max(low * 2.0, self.balance_usdt())
+            except ApiError as exc:
+                LOG.warning("Could not read balance to bound the search: %s",
+                            exc)
+                high = low * 4.0
+        if low <= 0 or high <= low:
+            raise ValueError("require 0 < low < high")
+
+        def quotable(amount: float) -> bool:
+            """
+            True if the venue quotes this size.
+
+            Only a SIZE rejection counts as "too small". A funds error means
+            the probe exceeded the balance and says nothing about the floor,
+            so it bounds the search downward instead. Anything else is
+            re-raised: treating an auth or parameter failure as "amount below
+            minimum" turns a broken request into a confident wrong conclusion.
+            """
+            try:
+                self.get_quote(rnd, side, amount)
+                return True
+            except ApiError as exc:
+                if exc.kind is ErrorKind.SIZE:
+                    LOG.debug("size %.2f rejected as too small: %s", amount, exc)
+                    return False
+                if exc.kind is ErrorKind.INSUFFICIENT_FUNDS:
+                    LOG.debug("size %.2f exceeds the balance, not the floor",
+                              amount)
+                    raise _AboveBalance(amount) from exc
+                raise                       # not a size problem -- surface it
+
+        lo, hi = low, high
+        try:
+            if quotable(low):
+                return low
+            if not quotable(hi):
+                return None
+            while hi - lo > tolerance:
+                mid = (lo + hi) / 2.0
+                if quotable(mid):
+                    hi = mid
+                else:
+                    lo = mid
+            return hi
+        except _AboveBalance as exc:
+            # The probe ran past the wallet balance. Retry below it rather
+            # than discarding everything learned so far.
+            ceiling = exc.amount * 0.9
+            if ceiling <= lo + tolerance:
+                return None
+            LOG.info("Re-bounding the search below the balance (%.2f)",
+                     ceiling)
+            return self.discover_min_stake(rnd, side, low, ceiling, tolerance)
+
+    def place_order(self, rnd: Round, quote: Quote) -> str:
+        """
+        Phase 2: execute a quote. MARKET orders are FOK -- fill-or-kill, so
+        there are no partial fills at prices the model never approved.
+
+        Takes the round so chain and slippage come from the market rather
+        than from a module-level assumption.
+
+        Returns the venue order id. The response carries no fill price; the
+        quote's averagePrice is the executed price.
+        """
+        wallet = self.wallet()
+        payload = self._request("place_order", {
+            "walletAddress": wallet.address,
+            "walletId": wallet.wallet_id,
+            "quoteId": quote.quote_id,
+            "timeInForce": "FOK",
+            "accountType": self._resolved_account_type(),
+            "orderType": "MARKET",
+            "slippageBps": self.effective_slippage_bps(rnd),
+            "fundingSource": self._cfg.funding_source})
+
+        order_id = payload.get("orderId")
+        if not order_id:
+            raise ApiError(f"order not accepted: {payload}")
+        return str(order_id)
+
+    # -- settlement ---------------------------------------------------------
+
+    def settled_outcome(self, rnd: Round
+                        ) -> Optional[tuple[Side, Optional[float]]]:
+        """
+        Authoritative result: (winning side, realised PnL in USDT).
+
+        Read from the venue's settled position history rather than
+        reconstructed locally, because the market resolves on its own oracle.
+        Returns None until the position has actually settled.
+        """
+        try:
+            payload = self._request("settled_history", {
+                "walletAddress": self.wallet().address, "limit": 50})
+        except ApiError as exc:
+            # Returning None silently would be indistinguishable from "this
+            # round has not settled yet", so a broken lookup would look like
+            # an open position rather than a failure.
+            LOG.warning("Settled-history lookup failed for %s: %s",
+                        rnd.slug, exc)
+            return None
+
+        for pos in payload.get("positions") or []:
+            if int(pos.get("marketTopicId") or -1) != rnd.topic_id:
+                continue
+            if pos.get("isWinner") is None:
+                continue
+            name = str(pos.get("outcomeName", "")).upper()
+            held = Side.UP if name in ("YES", "UP") else Side.DOWN
+            winner = held if pos.get("isWinner") else (
+                Side.DOWN if held is Side.UP else Side.UP)
+            pnl_raw = pos.get("realizedPnl")
+            if pnl_raw is None:
+                pnl_raw = pos.get("pnl")
+            if pnl_raw is None:
+                LOG.warning("Settled position for %s reports no realised PnL",
+                            rnd.slug)
+                return winner, None
+            try:
+                return winner, float(pnl_raw)
+            except (TypeError, ValueError):
+                LOG.warning("Unparseable realised PnL %r for %s",
+                            pnl_raw, rnd.slug)
+                return winner, None
+        return None
+
+    def batch_redeem(self, token_ids: list[str], chain_id: str) -> list[str]:
+        """
+        Claim winnings. Returns transaction hashes to poll.
+
+        Winning outcome tokens are NOT credited automatically -- redemption is
+        an explicit on-chain action. Skipping it makes the tradable balance
+        appear to fall after every win.
+        """
+        if not token_ids:
+            raise ValueError("token_ids must not be empty")
+        wallet = self.wallet()
+        payload = self._request("batch_redeem", {
+            "walletAddress": wallet.address,
+            "walletId": wallet.wallet_id,
+            "tokenIds": token_ids,
+            "chainId": chain_id})
+
+        hashes = []
+        for res in payload.get("results") or []:
+            # Only txHash exists in the schema. The `transactionHash` fallback
+            # here was invented -- a field name that appears nowhere in the
+            # connector, so it could never have matched and only served to
+            # make the code look more tolerant than it was.
+            tx = res.get("txHash")
+            if tx:
+                hashes.append(str(tx))
+        if not hashes and payload.get("batchId"):
+            LOG.info("Redemption batch %s accepted, no tx hash yet",
+                     payload["batchId"])
+        return hashes
+
+    def redeem_status(self, tx_hash: str) -> Optional[str]:
+        """Status of a redemption transaction, or None if unknown."""
+        try:
+            payload = self._request("redeem_status", {
+                "walletAddress": self.wallet().address, "txHash": tx_hash})
+        except ApiError as exc:
+            LOG.debug("Redeem-status lookup failed for %s: %s", tx_hash, exc)
+            return None
+        status = payload.get("status")
+        return None if status is None else str(status).upper()
+
+    def final_price(self, rnd: Round) -> Optional[float]:
+        """variantData.endPrice once the round has resolved."""
+        try:
+            topic = self.market_detail(rnd.topic_id)
+        except ApiError as exc:
+            LOG.warning("Final-price lookup failed for %s: %s", rnd.slug, exc)
+            return None
+        vd = (topic.get("marketTopic") or topic).get("variantData") or {}
+        raw = vd.get("endPrice") if isinstance(vd, dict) else None
+        if raw is None:
+            return None                 # genuinely not resolved yet
+        try:
+            price = float(raw)
+        except (TypeError, ValueError):
+            LOG.warning("Unparseable endPrice %r for %s", raw, rnd.slug)
+            return None
+        if price <= 0:
+            LOG.warning("Implausible endPrice %r for %s", raw, rnd.slug)
+            return None
+        return price
+
+
+# --------------------------------------------------------------------------
+# Journal
+# --------------------------------------------------------------------------
+
+
+class Journal:
+    """Append-only record of every decision, for calibration analysis."""
+
+    def __init__(self, path: str) -> None:
+        self._conn = sqlite3.connect(path)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER, mode TEXT, slug TEXT, topic_id INTEGER, side TEXT,
+                strike REAL, spot REAL, sigma REAL, seconds_left REAL,
+                end_ms INTEGER, model_prob REAL, fill_price REAL, edge REAL,
+                stake REAL, bankroll_before REAL, order_id TEXT,
+                resolved INTEGER DEFAULT 0, won INTEGER, pnl REAL,
+                settle_source TEXT)""")
+        self._conn.commit()
+
+    def record(self, mode: str, rnd: Round, sig: Signal, spot: float,
+               sigma: float, bankroll: float,
+               order_id: Optional[str] = None) -> int:
+        cur = self._conn.execute(
+            "INSERT INTO trades (ts, mode, slug, topic_id, side, strike, spot,"
+            " sigma, seconds_left, end_ms, model_prob, fill_price, edge, stake,"
+            " bankroll_before, order_id)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (int(time.time()), mode, rnd.slug, rnd.topic_id, sig.side.value,
+             rnd.strike, spot, sigma, sig.seconds_left, rnd.end_ms,
+             sig.model_prob, sig.fill_price, sig.edge, sig.stake_usdt,
+             bankroll, order_id))
+        self._conn.commit()
+        return int(cur.lastrowid)
+
+    def resolve(self, trade_id: int, won: bool, pnl: float,
+                source: str) -> None:
+        self._conn.execute(
+            "UPDATE trades SET resolved=1, won=?, pnl=?, settle_source=?"
+            " WHERE id=?", (1 if won else 0, pnl, source, trade_id))
+        self._conn.commit()
+
+    def calibration_report(self) -> str:
+        rows = self._conn.execute(
+            "SELECT model_prob, won, pnl, stake FROM trades WHERE resolved=1"
+        ).fetchall()
+        if not rows:
+            return "No resolved trades yet. Let paper mode run first."
+
+        buckets: dict[int, list[tuple[float, int]]] = {}
+        for prob, won, _, _ in rows:
+            buckets.setdefault(min(int(prob * 10), 9), []).append((prob, won))
+
+        n = len(rows)
+        pnl = sum(r[2] or 0.0 for r in rows)
+        staked = sum(r[3] or 0.0 for r in rows)
+        lines = [
+            f"Resolved trades : {n}",
+            f"Total P&L       : {pnl:+.2f} USDT",
+            f"Return on stake : {(pnl / staked if staked else 0):+.2%}",
+            f"Hit rate        : {sum(r[1] for r in rows) / n:.1%}",
+            "",
+            "Calibration (model says X% -> actually won Y%):",
+            "  bucket        n   predicted    actual      gap",
+        ]
+        for b in sorted(buckets):
+            vals = buckets[b]
+            pred = sum(p for p, _ in vals) / len(vals)
+            act = sum(w for _, w in vals) / len(vals)
+            se = math.sqrt(max(act * (1 - act), 1e-9) / len(vals))
+            flag = "" if abs(act - pred) <= 2 * se else "  <-- off"
+            lines.append(f"  {b*10:>3}-{b*10+9:<3} {len(vals):>6}"
+                         f"   {pred:>8.1%} {act:>9.1%} {act-pred:>+8.1%}{flag}")
+        # Market-price buckets: does the venue's own price predict outcomes?
+        price_rows = self._conn.execute(
+            "SELECT fill_price, won FROM trades WHERE resolved=1").fetchall()
+        pbuckets: dict[int, list[tuple[float, int]]] = {}
+        for price, won in price_rows:
+            pbuckets.setdefault(min(int(price * 10), 9), []).append((price, won))
+
+        lines += [
+            "",
+            "Favourite-longshot bias (market price vs realised frequency):",
+            "  price       n   implied     actual      gap",
+        ]
+        for b in sorted(pbuckets):
+            vals = pbuckets[b]
+            imp = sum(p for p, _ in vals) / len(vals)
+            act = sum(w for _, w in vals) / len(vals)
+            se = math.sqrt(max(act * (1 - act), 1e-9) / len(vals))
+            flag = ""
+            if abs(act - imp) > 2 * se:
+                flag = "  <-- underpriced" if act > imp else "  <-- overpriced"
+            lines.append(f"  {b/10:.1f}-{b/10+0.1:.1f} {len(vals):>6}"
+                         f"   {imp:>8.1%} {act:>9.1%} {act-imp:>+8.1%}{flag}")
+        lines += [
+            "",
+            "A positive gap means contracts at that price win MORE often than",
+            "their price implies -- that band is underpriced and worth buying.",
+            "If high prices show positive gaps and low prices negative ones,",
+            "the market has a favourite-longshot bias and buying favourites is",
+            "the right side. The reverse favours the convex profile. This is",
+            "the measurement that decides between them; nothing else does.",
+        ]
+
+        lines += [
+            "",
+            "If 'actual' sits consistently below 'predicted', the model is",
+            "overconfident and every edge estimate is inflated. Do not trade",
+            "real money until the gap column is small and unbiased across",
+            "buckets over several hundred trades. Rows flagged '<-- off' differ",
+            "from prediction by more than two standard errors.",
+        ]
+        return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# Strategy (pure)
+# --------------------------------------------------------------------------
+
+
+def clears_edge(model_prob: float, price: float, cfg: Config,
+                fee_bps: Optional[int] = None) -> bool:
+    """
+    Both thresholds must clear: an absolute floor and a relative margin.
+
+    Absolute alone is inconsistent across the book (0.06 is a 7% margin at
+    price 0.90 and a 60% margin at 0.10). Relative alone would wave through
+    trades at very low prices where a rounding error looks like an edge.
+    """
+    breakeven = breakeven_probability(price, cfg.fee_bps if fee_bps is None
+                                      else fee_bps)
+    if model_prob - breakeven < cfg.min_edge:
+        return False
+    return model_prob >= breakeven * (1.0 + cfg.min_edge_ratio)
+
+
+def evaluate(rnd: Round, spot: float, sigma: float, bankroll: float,
+             now_ms: int, cfg: Config,
+             ask_book: Optional[dict[Side, list[tuple[float, float]]]] = None,
+             tail_df: Optional[float] = None) -> Optional[Signal]:
+    """
+    Decide whether this round is worth a trade. Pure: no I/O, no mutation.
+
+    Two-pass sizing: size off top-of-book, re-price that stake against the real
+    ladder, then re-check the edge at the true average fill. Sizing off a price
+    you will not actually get is how a backtest-positive strategy loses money
+    live. In live mode this is a screen; the venue quote is authoritative.
+
+    Returns None when nothing clears the edge, price and risk filters.
+    """
+    if rnd.strike is None:
+        return None
+
+    secs = rnd.seconds_remaining(now_ms)
+    if not (cfg.entry_window_end_s <= secs <= cfg.entry_window_start_s):
+        return None
+
+    fee_bps = rnd.fee_bps        # the market's published rate, not an assumption
+    p_up = digital_up_probability(spot, rnd.strike, sigma, secs, tail_df)
+
+    best: Optional[Signal] = None
+    for side, model_prob in ((Side.UP, p_up), (Side.DOWN, 1.0 - p_up)):
+        levels = (ask_book or {}).get(side)
+        entry = (levels[0][0] if levels
+                 else rnd.quote_for(side) + cfg.assumed_spread)
+
+        if not (cfg.min_entry_price <= entry <= cfg.max_entry_price):
+            continue
+        if not clears_edge(model_prob, entry, cfg, fee_bps):
+            continue
+
+        stake = kelly_stake(bankroll, model_prob, entry, cfg, fee_bps)
+        if stake <= 0:
+            continue
+
+        avg = walk_book(levels, stake) if levels else entry
+        if avg is None:
+            continue
+        if not (cfg.min_entry_price <= avg <= cfg.max_entry_price):
+            continue
+
+        if not clears_edge(model_prob, avg, cfg, fee_bps):
+            continue
+        edge = model_prob - breakeven_probability(avg, fee_bps)
+
+        stake = kelly_stake(bankroll, model_prob, avg, cfg, fee_bps)
+        if stake <= 0:
+            continue
+
+        cand = Signal(side, model_prob, avg, edge, stake, secs)
+        if best is None or cand.edge > best.edge:
+            best = cand
+
+    return best
+
+
+def settle_pnl(stake: float, fill_price: float, won: bool,
+               fee_bps: int) -> float:
+    """Realised P&L for one resolved contract (paper mode)."""
+    if not 0.0 < fill_price < 1.0:
+        raise ValueError("fill_price must be in (0, 1)")
+    if not won:
+        return -stake
+    return stake * (1.0 - fill_price) / fill_price * (1.0 - fee_bps / 10_000.0)
+
+
+# --------------------------------------------------------------------------
+# Runner
+# --------------------------------------------------------------------------
+
+
+class Trader:
+    def __init__(self, cfg: Config) -> None:
+        self._cfg = cfg
+        self._client = PredictionClient(cfg)
+        self._vol = VolatilityEstimator(cfg, self._client.session)
+        self._journal = Journal(cfg.db_path)
+        self._paper_bankroll = cfg.paper_start_bankroll
+        self._risk: Optional[RiskManager] = None
+        self._seen: dict[int, int] = {}
+        self._position: Optional[Position] = None
+        self._hydrated: dict[int, Round] = {}
+        self._errors = 0
+        # token_id -> (expected payout USDT, tx hashes). Counted toward the
+        # bankroll so an unclaimed win is not misread as a drawdown.
+        self._unredeemed: dict[str, tuple[float, list[str], str]] = {}
+
+    def _bankroll(self) -> float:
+        """
+        Tradable balance, including winnings that are settled but not yet
+        credited on chain. Excluding them would make a winning streak look
+        like a drawdown and falsely trip the daily loss limit.
+        """
+        if not self._cfg.live:
+            return self._paper_bankroll
+        pending = sum(v for v, _, _ in self._unredeemed.values())
+        return self._client.balance_usdt() + pending
+
+    def _poll_redemptions(self) -> None:
+        """Drop entries once the chain confirms the payout has landed."""
+        for token_id, (value, hashes, _chain) in list(self._unredeemed.items()):
+            if not hashes:
+                continue
+            done = [self._client.redeem_status(h) in ("SUCCESS", "CONFIRMED",
+                                                      "COMPLETED")
+                    for h in hashes]
+            if done and all(done):
+                self._unredeemed.pop(token_id, None)
+                LOG.info("Redemption confirmed: %.2f USDT credited", value)
+
+    def _claim(self, pos: Position) -> None:
+        """Redeem a winning position and track it until it is credited."""
+        token_id = pos.rnd.token_for(pos.signal.side)
+        payout = pos.signal.stake_usdt / pos.signal.fill_price
+        try:
+            hashes = self._client.batch_redeem([token_id], pos.rnd.chain_id)
+            self._unredeemed[token_id] = (payout, hashes, pos.rnd.chain_id)
+            LOG.info("Redeeming %.2f USDT (tx %s)", payout,
+                     ", ".join(hashes) or "pending")
+        except (ApiError, requests.RequestException) as exc:
+            # Keep it tracked anyway: the win is real even if the claim failed,
+            # and retry happens on the next sweep.
+            self._unredeemed[token_id] = (payout, [], pos.rnd.chain_id)
+            LOG.warning("Redemption failed for %s (will retry): %s",
+                        token_id, exc)
+
+    def _retry_failed_claims(self) -> None:
+        for token_id, (value, hashes, chain_id) in list(self._unredeemed.items()):
+            if hashes:
+                continue
+            try:
+                new = self._client.batch_redeem([token_id], chain_id)
+                if new:
+                    self._unredeemed[token_id] = (value, new, chain_id)
+                    LOG.info("Redemption retry accepted for %s", token_id)
+            except (ApiError, requests.RequestException) as exc:
+                LOG.debug("Redemption retry for %s still failing: %s",
+                          token_id, exc)
+
+    def _prune(self, now_ms: int) -> None:
+        for tid in [t for t, end in self._seen.items()
+                    if end < now_ms - 3_600_000]:
+            self._seen.pop(tid, None)
+            self._hydrated.pop(tid, None)
+
+    def run(self) -> None:
+        mode = "LIVE" if self._cfg.live else "PAPER"
+        try:
+            self._client.sync_clock()
+            if self._cfg.live:
+                w = self._client.wallet()
+                LOG.info("Prediction wallet %s", w.address)
+                try:
+                    quota = self._client.remaining_quota_usdt()
+                    if quota is not None:
+                        LOG.info("Remaining daily quota: %.2f USDT", quota)
+                except ApiError as exc:
+                    LOG.warning("Could not read daily quota: %s", exc)
+            bankroll = self._bankroll()
+        except (ApiError, requests.RequestException) as exc:
+            LOG.error("Startup failed: %s", exc)
+            LOG.error("Run --preflight to diagnose.")
+            return
+
+        self._risk = RiskManager(self._cfg, bankroll)
+        LOG.info("Starting %s mode. Bankroll %.2f USDT", mode, bankroll)
+        last_sync = time.time()
+
+        try:
+            while True:
+                try:
+                    if time.time() - last_sync > 300:
+                        self._client.sync_clock()
+                        last_sync = time.time()
+
+                    if self._cfg.live and self._unredeemed:
+                        self._poll_redemptions()
+                        self._retry_failed_claims()
+                    self._settle_open()
+                    bankroll = self._bankroll()
+                    self._risk.check(bankroll)
+                    if self._position is None:
+                        self._maybe_enter(bankroll, mode)
+                    self._errors = 0
+                except TradingHalted:
+                    raise
+                except (ApiError, requests.RequestException) as exc:
+                    self._errors += 1
+                    LOG.warning("Recoverable error %d/%d: %s", self._errors,
+                                self._cfg.max_consecutive_errors, exc)
+                    if self._errors >= self._cfg.max_consecutive_errors:
+                        raise TradingHalted(
+                            "too many consecutive API errors; check "
+                            "connectivity and endpoint paths") from exc
+                    time.sleep(min(30.0, 2.0 ** min(self._errors, 5)))
+
+                time.sleep(self._cfg.poll_interval_s)
+
+        except TradingHalted as exc:
+            LOG.error("HALTED: %s", exc)
+            if self._position is not None:
+                LOG.info("Waiting for the open position to resolve...")
+                self._drain()
+            LOG.error("Stopped. Review the journal before restarting.")
+        except KeyboardInterrupt:
+            LOG.info("Interrupted; open position left in the journal.")
+
+    def _maybe_enter(self, bankroll: float, mode: str) -> None:
+        # Enforced here, not only at the call site: silently replacing an open
+        # position would orphan it in the journal and double real exposure.
+        if self._position is not None:
+            return
+
+        now_ms = self._client.now_ms()
+        self._prune(now_ms)
+
+        for raw in self._client.list_btc_5m_rounds():
+            if raw.topic_id in self._seen:
+                continue
+            if not (self._cfg.entry_window_end_s
+                    <= raw.seconds_remaining(now_ms)
+                    <= self._cfg.entry_window_start_s):
+                continue
+
+            rnd = self._hydrated.get(raw.topic_id) or self._client.hydrate(raw)
+            if rnd is None:
+                LOG.debug("No strike yet for %s", raw.slug)
+                continue
+            self._hydrated[raw.topic_id] = rnd
+
+            if self._cfg.min_liquidity > 0:
+                if rnd.liquidity is None:
+                    LOG.debug("Skipping %s: liquidity unknown and a minimum "
+                              "is configured", rnd.slug)
+                    continue
+                if rnd.liquidity < self._cfg.min_liquidity:
+                    LOG.debug("Skipping %s: liquidity %.0f below %.0f",
+                              rnd.slug, rnd.liquidity, self._cfg.min_liquidity)
+                    continue
+
+            # Spot and volatility must come from the same series, or the
+            # model is fed a price and a sigma describing different assets.
+            symbol = self._client.market_symbol(rnd.feed_symbol)
+            spot = self._client.spot_price(symbol)
+            sigma = self._vol.sigma_annual(symbol)
+            if self._cfg.halt_on_clamped_sigma and self._vol.is_clamped(symbol):
+                LOG.warning("Skipping %s: volatility clamped, so every edge "
+                            "estimate would be unreliable", rnd.slug)
+                continue
+            tail_df = self._vol.tail_df(symbol)
+            book = {}
+            for side in Side:
+                levels = self._client.asks_for(rnd, side)
+                if levels:
+                    book[side] = levels
+
+            sig = evaluate(rnd, spot, sigma, bankroll, now_ms, self._cfg,
+                           book or None, tail_df)
+            if sig is None:
+                continue
+
+            order_id = None
+            if self._cfg.live:
+                quote = self._client.get_quote(rnd, sig.side, sig.stake_usdt)
+
+                # The quote is authoritative. Re-apply every price filter to it
+                # and walk away if the venue prices worse than our screen
+                # assumed -- the ceiling must bind on the executed price, not
+                # merely on the order book we looked at a moment earlier.
+                if quote.average_price > self._cfg.max_entry_price:
+                    LOG.info("Quote %.4f above price ceiling %.2f; skipping",
+                             quote.average_price, self._cfg.max_entry_price)
+                    continue
+                if not clears_edge(sig.model_prob, quote.average_price,
+                                   self._cfg, rnd.fee_bps):
+                    LOG.info("Quote worse than screen (%.3f vs %.3f); skipping",
+                             quote.average_price, sig.fill_price)
+                    continue
+                edge = (sig.model_prob
+                        - breakeven_probability(quote.average_price,
+                                                rnd.fee_bps))
+                if abs(quote.price_impact) > self._cfg.max_price_impact:
+                    LOG.info("Price impact %.1f%% too high; skipping",
+                             quote.price_impact * 100)
+                    continue
+
+                order_id = self._client.place_order(rnd, quote)
+                sig = replace(sig, fill_price=quote.average_price, edge=edge)
+                LOG.info("Order %s filled at %.4f", order_id,
+                         quote.average_price)
+
+            mult = kelly_multiple(sig.stake_usdt, bankroll, sig.model_prob,
+                                  sig.fill_price, rnd.fee_bps)
+            mult_s = "" if mult is None else f" [{mult:.2f}x Kelly]"
+            if mult is not None and mult > 1.0:
+                LOG.warning("Staking %.2fx the full-Kelly fraction because the "
+                            "venue minimum exceeds the Kelly size on a %.2f "
+                            "bankroll", mult, bankroll)
+            LOG.info("ENTER %s %s | fill %.3f model %.3f edge %+.3f "
+                     "stake %.2f%s (%.0fs left)", rnd.slug, sig.side.value,
+                     sig.fill_price, sig.model_prob, sig.edge,
+                     sig.stake_usdt, mult_s, sig.seconds_left)
+
+            tid = self._journal.record(mode, rnd, sig, spot, sigma, bankroll,
+                                       order_id)
+            self._seen[rnd.topic_id] = rnd.end_ms
+            self._position = Position(tid, rnd, sig)
+            return      # one position at a time
+
+    def _settle_open(self) -> None:
+        pos = self._position
+        if pos is None:
+            return
+        now_ms = self._client.now_ms()
+        if now_ms < pos.rnd.end_ms + 2_000:
+            return
+
+        winner: Optional[Side] = None
+        pnl: Optional[float] = None
+        source = "venue"
+
+        settled = self._client.settled_outcome(pos.rnd)
+        if settled is not None:
+            winner, venue_pnl = settled
+            if self._cfg.live and venue_pnl is not None:
+                pnl = venue_pnl
+        else:
+            final = self._client.final_price(pos.rnd)
+            if final is not None and pos.rnd.strike is not None:
+                winner = Side.UP if final > pos.rnd.strike else Side.DOWN
+                source = "endPrice"
+
+        if winner is None:
+            if now_ms > pos.rnd.end_ms + 600_000:
+                LOG.error("Cannot settle %s; left unresolved in journal",
+                          pos.rnd.slug)
+                self._position = None
+            return
+
+        won = winner is pos.signal.side
+        if pnl is None:
+            pnl = settle_pnl(pos.signal.stake_usdt, pos.signal.fill_price,
+                             won, pos.rnd.fee_bps)
+        if not self._cfg.live:
+            self._paper_bankroll += pnl
+
+        if won and self._cfg.live:
+            self._claim(pos)
+
+        self._journal.resolve(pos.trade_id, won, pnl, source)
+        if self._risk is not None:
+            self._risk.record_result(won, pos.signal.model_prob)
+        self._position = None
+        LOG.info("SETTLED %s -> %s  P&L %+.2f  bankroll %.2f  [%s]",
+                 pos.rnd.slug, "WIN" if won else "LOSS", pnl,
+                 self._bankroll(), source)
+
+    def _drain(self, timeout_s: float = 600.0) -> None:
+        deadline = time.time() + timeout_s
+        while self._position is not None and time.time() < deadline:
+            try:
+                self._settle_open()
+            except (ApiError, requests.RequestException) as exc:
+                LOG.warning("Settle retry: %s", exc)
+            time.sleep(5.0)
+
+
+# --------------------------------------------------------------------------
+# Preflight
+# --------------------------------------------------------------------------
+
+
+def preflight(cfg: Config) -> int:
+    """Probe every endpoint and report which ones actually work."""
+    client = PredictionClient(cfg)
+    print("\n=== Preflight ===\n")
+    failures = 0
+
+    def check(label, fn):
+        nonlocal failures
+        try:
+            print(f"  {label:<24} OK   {fn()}")
+        except Exception as exc:            # noqa: BLE001 - report everything
+            failures += 1
+            print(f"  {label:<24} FAIL {type(exc).__name__}: {str(exc)[:105]}")
+
+    check("public spot", lambda: f"BTCUSDT {client.spot_price():,.2f}")
+    check("clock sync", lambda: f"offset {client.sync_clock()} ms")
+    def vol_check() -> str:
+        est = VolatilityEstimator(cfg, client.session)
+        sigma = est.sigma_annual()
+        raw = est.raw_sigma()
+        note = ""
+        if est.is_clamped():
+            note = (f"  <-- CLAMPED from a measured {raw:.4f}; trading refused "
+                    f"while this holds")
+        df = est.tail_df()
+        df_s = "gaussian" if df is None else f"{df:.2f}"
+        return (f"sigma {sigma:.4f} (measured {raw:.4f}) "
+                f"tail_df {df_s}{note}")
+
+    check("volatility", vol_check)
+    check("wallet", lambda: client.wallet().address)
+    def balance_check() -> str:
+        options = client.payment_options()
+        breakdown = ", ".join(
+            f"{t}={b:.2f}{'' if en else ' (disabled)'}" for t, b, en in options
+        ) or "none"
+        bal = client.balance_usdt()
+
+        notes = [f"{bal:.2f} USDT  [{breakdown}]"]
+        if bal < cfg.min_stake_usdt:
+            notes.append(f"  <-- below the {cfg.min_stake_usdt:.2f} minimum "
+                         f"order size; no order can be placed")
+        else:
+            # Ask the real sizing function, not a percentage rule of thumb:
+            # on a small balance the Kelly fraction binds long before the cap.
+            strong = kelly_stake(bal, 0.70, 0.60, cfg, fee_bps=0)
+            weak = kelly_stake(bal, 0.63, 0.60, cfg, fee_bps=0)
+            if strong <= 0:
+                forced = cfg.min_stake_usdt / bal
+                notes.append(
+                    f"  <-- UNTRADEABLE: even a strong edge sizes below the "
+                    f"{cfg.min_stake_usdt:.2f} minimum, and the override is "
+                    f"blocked ({forced:.0%} of bankroll exceeds the "
+                    f"{cfg.hard_max_stake_pct:.0%} hard cap or 2x Kelly).")
+            else:
+                mult = kelly_multiple(strong, bal, 0.70, 0.60, 0)
+                tag = f" at {mult:.2f}x full Kelly" if mult else ""
+                notes.append(f"  -> strong edge stakes {strong:.2f}{tag}; "
+                             f"marginal edge stakes {weak:.2f}")
+        return "".join(notes)
+
+    check("balance", balance_check)
+    check("daily quota", lambda: f"{client.remaining_quota_usdt()}")
+
+    rounds: list[Round] = []
+
+    def list_rounds():
+        rounds.extend(client.list_btc_5m_rounds())
+        return f"{len(rounds)} live BTC 5m round(s)"
+
+    check("market list", list_rounds)
+
+    if rounds:
+        rnd = rounds[0]
+        hydrated: list[Round] = []
+
+        def hydrate():
+            h = client.hydrate(rnd)
+            if h is None:
+                raise ApiError("no startPrice in variantData")
+            hydrated.append(h)
+            return f"strike {h.strike:,.2f} feed {h.feed_symbol}"
+
+        check("market detail", hydrate)
+        check("venue parameters", lambda: (
+            f"fee {rnd.fee_bps}bps  chain {rnd.chain_id}  "
+            f"collateral {rnd.collateral}  precision {rnd.decimal_precision}  "
+            f"slippage venue={rnd.venue_slippage_bps} used="
+            f"{client.effective_slippage_bps(rnd)}  "
+            f"liquidity {rnd.liquidity:,.0f}  "
+            f"duration {rnd.duration_ms/1000:.0f}s"))
+        check("order book",
+              lambda: f"{len(client.asks_for(rnd, Side.UP) or [])} ask levels")
+        check("settled history",
+              lambda: f"{client.settled_outcome(rnd)}")
+        check("redeem status",
+              lambda: f"{client.redeem_status('0x0') or 'reachable'}")
+        if hydrated:
+            check("quote (no order)", lambda: (
+                f"avg {client.get_quote(hydrated[0], Side.UP, cfg.min_stake_usdt).average_price:.4f}"))
+    else:
+        print("  (no live rounds -- detail/book/quote checks skipped)")
+
+    print()
+    if failures:
+        print(f"{failures} check(s) failed.\n"
+              "Override paths in endpoints.json, e.g.:\n"
+              '  {"order_book": "/sapi/v1/w3w/wallet/prediction/order-book"}\n'
+              "Valid keys: " + ", ".join(sorted(DEFAULT_ENDPOINTS)))
+        return 1
+    print("All probed endpoints OK. place-order-bundle is NOT probed here --\n"
+          "it would spend money. Confirm it with one minimum-size manual\n"
+          "trade before --live.")
+    return 0
+
+
+def discover_min(cfg: Config) -> int:
+    """Measure the venue's real minimum order size instead of assuming it."""
+    client = PredictionClient(cfg)
+    client.sync_clock()
+    rounds = client.list_btc_5m_rounds()
+    if not rounds:
+        print("No live rounds to probe.")
+        return 1
+
+    rnd = client.hydrate(rounds[0]) or rounds[0]
+    print(f"\nProbing {rnd.slug} (fee {rnd.fee_bps} bps, "
+          f"liquidity {rnd.liquidity:,.0f}, precision {rnd.decimal_precision}, "
+          f"chain {rnd.chain_id}, collateral {rnd.collateral})")
+    print("Quotes are non-binding; no order is placed.\n")
+
+    # Show the raw outcome at each size before drawing any conclusion.
+    print("  probe results:")
+    sizes = [1.0, 1.5, 2.0, 5.0, 10.0, 25.0]
+    verdicts: list[tuple[float, bool, str]] = []
+    for amount in sizes:
+        try:
+            q = client.get_quote(rnd, Side.UP, amount)
+            verdicts.append((amount, True, f"avg {q.average_price:.4f} "
+                                           f"impact {q.price_impact:.4f}"))
+        except ApiError as exc:
+            verdicts.append((amount, False, str(exc)[:130]))
+    for amount, ok, detail in verdicts:
+        print(f"    {amount:>6.2f} USDT  {'OK  ' if ok else 'FAIL'}  {detail}")
+
+    if not any(ok for _, ok, _ in verdicts):
+        print("\n  Every size failed, so this is NOT a minimum-size problem.")
+        print("  The message above is the venue's own; read it literally.")
+        print("  Common causes: the quote request is missing or malformed a")
+        print("  parameter, the wallet is not authorised for trading, or the")
+        print("  token id is not tradable in this round.")
+        print("\n  Re-run with --verbose to see the full signed request.")
+        return 1
+
+    smallest_ok = next((a for a, ok, _ in verdicts if ok), None)
+
+    try:
+        found = client.discover_min_stake(rnd, Side.UP)
+    except ApiError as exc:
+        # Never discard what the probe table already established.
+        print(f"\n  Refinement stopped [{exc.kind.value}]: {exc}")
+        if smallest_ok is not None:
+            print(f"  Probing already showed {smallest_ok:.2f} USDT quotes "
+                  f"successfully, so the minimum is at or below that.")
+            return 0
+        return 1
+
+    if found is None:
+        if smallest_ok is not None:
+            print(f"\n  Search did not converge, but {smallest_ok:.2f} USDT "
+                  f"quoted successfully -- treat that as the practical "
+                  f"minimum.")
+            return 0
+        print("\n  No tested size quoted successfully.")
+        return 1
+
+    print(f"  Smallest quotable amount: ~{found:.2f} USDT")
+    print(f"  Configured min_stake_usdt: {cfg.min_stake_usdt:.2f} USDT")
+    if found > cfg.min_stake_usdt:
+        print("\n  Your configured minimum is BELOW what this market accepts.")
+        print(f"  Orders would be rejected. Consider min_stake_usdt={found:.2f}.")
+    else:
+        print("\n  Configured minimum is acceptable for this market.")
+    print("  Note: this varies by market depth, so it is a snapshot, not a"
+          " constant.")
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Entry point
+# --------------------------------------------------------------------------
+
+
+def main(argv: Optional[Iterable[str]] = None) -> int:
+    ap = argparse.ArgumentParser(description="BTC 5m prediction market trader")
+    ap.add_argument("--live", action="store_true")
+    ap.add_argument("--preflight", action="store_true",
+                    help="probe endpoints with your keys and exit")
+    ap.add_argument("--calibration-report", action="store_true")
+    ap.add_argument("--profile", choices=sorted(PROFILES), default="convex",
+                    help="convex = big wins/small losses (default); "
+                         "balanced = symmetric; micro = small accounts")
+    ap.add_argument("--discover-min", action="store_true",
+                    help="probe the venue for its real minimum order size "
+                         "(quotes only, places no order) and exit")
+    ap.add_argument("--fee-bps", type=int, default=None,
+                    help="override the fallback fee rate; each market's own "
+                         "published rate is preferred when available")
+    ap.add_argument("--min-edge", type=float, default=None)
+    ap.add_argument("--no-fat-tails", action="store_true",
+                    help="use a Gaussian model (understates cheap contracts)")
+    ap.add_argument("--kelly", type=float, default=0.25)
+    ap.add_argument("--paper-bankroll", type=float, default=100.0)
+    ap.add_argument("--db", default="btc5m_journal.db")
+    ap.add_argument("--endpoints", default="endpoints.json")
+    ap.add_argument("--verbose", action="store_true")
+    args = ap.parse_args(list(argv) if argv is not None else None)
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s %(levelname)-7s %(message)s")
+
+    if args.calibration_report:
+        print(Journal(args.db).calibration_report())
+        return 0
+
+    key = os.environ.get("BINANCE_API_KEY", "")
+    secret = os.environ.get("BINANCE_API_SECRET", "")
+    if not key or not secret:
+        print("Set BINANCE_API_KEY and BINANCE_API_SECRET.", file=sys.stderr)
+        return 1
+
+    try:
+        settings = dict(PROFILES[args.profile])
+        if args.min_edge is not None:
+            settings["min_edge"] = args.min_edge
+        if args.fee_bps is not None:
+            settings["fee_bps"] = args.fee_bps
+        cfg = Config(api_key=key, api_secret=secret, live=args.live,
+                     kelly_fraction=args.kelly,
+                     use_fat_tails=not args.no_fat_tails,
+                     paper_start_bankroll=args.paper_bankroll,
+                     db_path=args.db,
+                     endpoints=tuple(load_endpoints(args.endpoints).items()),
+                     **settings)
+        LOG.info("Profile %r: entry %.2f-%.2f, edge >= %.2f abs and "
+                 "%.0f%% relative, max stake %.1f%% of bankroll, "
+                 "min order %.2f USDT",
+                 args.profile, cfg.min_entry_price, cfg.max_entry_price,
+                 cfg.min_edge, cfg.min_edge_ratio * 100,
+                 cfg.max_stake_pct * 100, cfg.min_stake_usdt)
+    except ValueError as exc:
+        print(f"Invalid configuration: {exc}", file=sys.stderr)
+        return 1
+
+    # Every command is wrapped: an uncaught exception reaching the user as a
+    # traceback is a defect in its own right, regardless of the cause.
+    commands = {
+        "preflight": (args.preflight, preflight),
+        "discover-min": (args.discover_min, discover_min),
+    }
+    for name, (selected, fn) in commands.items():
+        if not selected:
+            continue
+        try:
+            return fn(cfg)
+        except ApiError as exc:
+            print(f"\n{name} failed [{exc.kind.value}]: {exc}", file=sys.stderr)
+            if exc.kind is ErrorKind.AUTH:
+                print("  Check the API key's Wallet permissions and IP "
+                      "allowlist.", file=sys.stderr)
+            elif exc.kind is ErrorKind.INSUFFICIENT_FUNDS:
+                print("  The account balance cannot cover the requested size.",
+                      file=sys.stderr)
+            elif exc.kind is ErrorKind.TIMING:
+                print("  System clock drift; re-sync and retry.",
+                      file=sys.stderr)
+            return 1
+        except KeyboardInterrupt:
+            print("\nInterrupted.", file=sys.stderr)
+            return 130
+
+    if args.live:
+        print("\n*** LIVE MODE: this will spend real USDT. ***")
+        print("Confirm you have (1) run --preflight clean, and (2) reviewed")
+        print("--calibration-report over several hundred paper rounds.")
+        if input('Type "I ACCEPT THE RISK" to continue: ') != "I ACCEPT THE RISK":
+            print("Aborted.")
+            return 1
+
+    try:
+        Trader(cfg).run()
+    except ApiError as exc:
+        print(f"\nStopped [{exc.kind.value}]: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
