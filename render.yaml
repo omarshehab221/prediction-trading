@@ -1,0 +1,50 @@
+# Render Blueprint for the BTC 5m prediction-market bot.
+#
+# THREE THINGS THAT WILL BREAK THIS IF IGNORED
+# --------------------------------------------
+# 1. REGION MUST NOT BE IN THE UNITED STATES.
+#    Binance returns HTTP 451 ("Unavailable For Legal Reasons") to restricted
+#    locations, which include the US. Render's oregon / ohio / virginia
+#    regions are all US and every API call will fail. Use frankfurt or
+#    singapore. Singapore is also the lower-latency choice for Binance.
+#
+# 2. THE JOURNAL NEEDS A PERSISTENT DISK.
+#    Render's filesystem is ephemeral: without a disk, the SQLite journal is
+#    wiped on every deploy and restart. That destroys the calibration record,
+#    which is the only thing that can tell you whether the strategy works.
+#
+# 3. BACKGROUND WORKER, NOT WEB SERVICE.
+#    This is a long-running loop with no HTTP port. Free web services also
+#    spin down when idle, which would stop the loop. Workers are paid only.
+#
+# If your Binance API key uses an IP allowlist, you also need Render's
+# Dedicated IPs (a paid workspace add-on giving three static IPv4 addresses
+# per region). Shared outbound ranges rotate and will get you locked out.
+
+services:
+  - type: worker
+    name: btc-5m-predictor
+    runtime: python
+    region: frankfurt          # NEVER a US region -- see note 1
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    # Paper mode by default. Remove --live only after preflight is clean AND
+    # the calibration report over several hundred rounds looks sound.
+    startCommand: >
+      python btc_5m_predictor.py
+      --profile ${PROFILE}
+      --db /var/data/btc5m_journal.db
+    autoDeploy: false          # a redeploy mid-round interrupts a position
+    disk:
+      name: journal
+      mountPath: /var/data     # must match the --db path above
+      sizeGB: 1
+    envVars:
+      - key: BINANCE_API_KEY
+        sync: false            # set in the dashboard, never in git
+      - key: BINANCE_API_SECRET
+        sync: false
+      - key: PROFILE
+        value: buffer
+      - key: PYTHONUNBUFFERED
+        value: "1"             # so logs appear live rather than in bursts
