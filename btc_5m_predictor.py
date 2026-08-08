@@ -3171,7 +3171,7 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     ap.add_argument("--report-profile", default=None,
                     help="restrict the report to one profile; default is "
                          "every profile in the journal, separately")
-    ap.add_argument("--profile", choices=sorted(PROFILES), default="micro",
+    ap.add_argument("--profile", choices=sorted(PROFILES), default="buffer",
                     help="buffer = big buffer late in the round; micro = "
                          "small accounts (default); favorite = favourites; "
                          "balanced = symmetric; convex = longshots")
