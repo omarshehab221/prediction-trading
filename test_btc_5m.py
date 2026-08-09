@@ -535,9 +535,51 @@ class TestRiskManager(unittest.TestCase):
         RiskManager(cfg(), 100.0).check(95.0)
 
     def test_daily_loss_limit(self):
+        """Losses the bot actually booked do trip the limit."""
         r = RiskManager(cfg(), 100.0)
+        r.record_result(False, 0.6, -21.0)
         with self.assertRaises(TradingHalted):
-            r.check(79.0)
+            r.check(79.0, 0.0)
+
+    def test_an_external_withdrawal_is_not_a_loss(self):
+        """
+        The reported bug: a manual order or transfer emptied most of a small
+        balance and the bot halted as though the strategy had lost it.
+        """
+        r = RiskManager(cfg(min_stake_usdt=1.0), 9.40)
+        r.check(4.40, 0.0)                    # a 5.00 order placed by hand
+        self.assertAlmostEqual(r.external_flow, -5.0, places=6)
+        self.assertEqual(r.realised_pnl, 0.0)
+
+    def test_a_deposit_does_not_flatter_the_limit_either(self):
+        """Rebasing has to cut both ways or it is just a different bias."""
+        r = RiskManager(cfg(), 100.0)
+        r.check(200.0, 0.0)                   # a deposit
+        r.record_result(False, 0.6, -45.0)
+        with self.assertRaises(TradingHalted):
+            r.check(155.0, 0.0)               # 45 of 200 is still over 20%
+
+    def test_an_open_stake_is_not_a_loss_until_it_settles(self):
+        """Money staked has left the balance but has not been lost."""
+        r = RiskManager(cfg(), 100.0)
+        r.check(70.0, 30.0)                   # 30 staked, still open
+        self.assertEqual(r.external_flow, 0.0)
+        self.assertEqual(r.realised_pnl, 0.0)
+
+    def test_settling_a_stake_leaves_no_phantom_external_flow(self):
+        r = RiskManager(cfg(), 100.0)
+        r.check(70.0, 30.0)
+        r.record_result(True, 0.6, 12.0)
+        r.check(112.0, 0.0)                   # stake back plus 12 won
+        self.assertAlmostEqual(r.external_flow, 0.0, places=6)
+        self.assertAlmostEqual(r.realised_pnl, 12.0, places=6)
+
+    def test_mixed_external_and_own_losses_are_told_apart(self):
+        r = RiskManager(cfg(daily_loss_limit_pct=0.20), 100.0)
+        r.record_result(False, 0.6, -10.0)
+        r.check(50.0, 0.0)                    # -10 traded, -40 withdrawn
+        self.assertAlmostEqual(r.realised_pnl, -10.0, places=6)
+        self.assertAlmostEqual(r.external_flow, -40.0, places=6)
 
     def test_consecutive_losses(self):
         r = RiskManager(cfg(max_consecutive_losses=3), 100.0)
@@ -563,10 +605,11 @@ class TestRiskManager(unittest.TestCase):
 
     def test_halt_is_sticky(self):
         r = RiskManager(cfg(), 100.0)
+        r.record_result(False, 0.6, -50.0)
         with self.assertRaises(TradingHalted):
-            r.check(50.0)
+            r.check(50.0, 0.0)
         with self.assertRaises(TradingHalted):
-            r.check(100.0)      # still halted even once bankroll recovers
+            r.check(100.0, 0.0)  # still halted even once bankroll recovers
 
     def test_bankroll_floor(self):
         r = RiskManager(cfg(daily_loss_limit_pct=0.99), 100.0)
@@ -5985,6 +6028,14 @@ class TestNewCliSurface(unittest.TestCase):
             self.assertIn(name, doc["defaults"], name)
 
 
+class _FakePosition:
+    """Just enough of a Position for the loop's bookkeeping."""
+
+    committed_usdt = 1.0
+    signal = None
+    rnd = None
+
+
 class TestLoopSurvivesUnexpectedFailures(unittest.TestCase):
     """
     The run loop's error handling, which nothing else in this file exercised.
@@ -6065,14 +6116,14 @@ class TestLoopSurvivesUnexpectedFailures(unittest.TestCase):
 
     def test_a_recoverable_fault_drains_when_it_finally_halts(self):
         t = self._stub_trader(OSError(28, "No space left on device"))
-        t._positions["BTCUSDT"] = object()
+        t._positions["BTCUSDT"] = _FakePosition()
         t.run()
         self.assertTrue(t._drained)
 
     def test_an_unexpected_bug_drains_before_dying(self):
         """The whole point: a crash must not abandon a staked position."""
         t = self._stub_trader(ZeroDivisionError("bug"))
-        t._positions["BTCUSDT"] = object()
+        t._positions["BTCUSDT"] = _FakePosition()
         with self.assertRaises(ZeroDivisionError):
             t.run()
         self.assertTrue(t._drained,

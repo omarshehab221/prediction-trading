@@ -1852,10 +1852,33 @@ class RiskManager:
         self._variance = 0.0
         self._actual_wins = 0
         self._samples = 0
+        # Attribution. The daily loss limit used to be measured as a fall in
+        # the raw venue balance, which silently counted every deposit,
+        # withdrawal, transfer and manually placed order as the bot's own
+        # trading result. On a small account that is not a rounding error: a
+        # 5 USDT manual order against a 9 USDT balance reads as a 55%
+        # drawdown and halts a bot that has not lost anything.
+        #
+        # So the limit is measured against realised PnL the bot can actually
+        # account for, and any balance movement it cannot account for is
+        # recorded as an external flow and rebased away rather than blamed on
+        # the strategy.
+        self._realised_pnl = 0.0
+        self._external_flow = 0.0
 
     @property
     def _cfg(self) -> Config:
         return self._static_cfg if self._store is None else self._store.current
+
+    @property
+    def realised_pnl(self) -> float:
+        """PnL from positions this bot opened and settled today."""
+        return self._realised_pnl
+
+    @property
+    def external_flow(self) -> float:
+        """Balance movement today that this bot did not cause."""
+        return self._external_flow
 
     def calibration_z(self) -> float | None:
         """
@@ -1882,16 +1905,60 @@ class RiskManager:
             self.halted_reason = None
             self._expected_wins = self._variance = 0.0
             self._actual_wins = self._samples = 0
+            self._realised_pnl = 0.0
+            self._external_flow = 0.0
             LOG.info("New trading day; baseline bankroll %.2f", bankroll)
 
-    def check(self, bankroll: float) -> None:
+    def reconcile(self, bankroll: float, committed: float = 0.0) -> float:
+        """
+        Separate what this bot did to the balance from what anything else did.
+
+        Given no interference, the balance is fully predictable: the day's
+        opening figure, plus everything the bot has settled, minus whatever it
+        currently has staked and not yet resolved. Whatever is left over came
+        from somewhere else -- a deposit, a withdrawal, a transfer between
+        wallets, or an order placed by hand -- and is none of the strategy's
+        doing.
+
+        That residue is folded into the day's baseline instead of being
+        counted as a result, and returned so the caller can report it.
+
+        The tolerance exists because settlement and on-chain credit do not
+        land in the same instant. It is derived from the venue minimum rather
+        than being a new tunable: anything smaller than a fraction of the
+        smallest order the venue accepts cannot be a trade.
+        """
+        expected = self._day_start_bankroll + self._realised_pnl - committed
+        drift = bankroll - expected
+        tolerance = max(0.01, self._cfg.min_stake_usdt * 0.10)
+        if abs(drift) <= tolerance:
+            return 0.0
+        self._day_start_bankroll = max(self._day_start_bankroll + drift, EPS)
+        self._external_flow += drift
+        LOG.info("External balance movement %+.2f USDT (deposit, withdrawal "
+                 "or an order this bot did not place); baseline rebased to "
+                 "%.2f. Not counted as a trading result.",
+                 drift, self._day_start_bankroll)
+        return drift
+
+    def check(self, bankroll: float, committed: float = 0.0) -> None:
         self._roll_day(bankroll)
+        self.reconcile(bankroll, committed)
         if self.halted_reason:
             raise TradingHalted(self.halted_reason)
 
-        drawdown = 1.0 - (bankroll / self._day_start_bankroll)
+        # Measured on the bot's OWN realised PnL, not on the balance. The two
+        # differ by every external flow, and only one of them is the
+        # strategy's performance.
+        drawdown = -self.realised_pnl / self._day_start_bankroll
         if drawdown >= self._cfg.daily_loss_limit_pct:
-            self._halt(f"daily loss limit: {drawdown:.1%} down "
+            # Report both figures. "Down 35%" invites the question the old
+            # message could not answer -- down from what, and did the bot do
+            # it? -- and answering it in the halt line is the difference
+            # between a diagnosis and a mystery.
+            self._halt(f"daily loss limit: {drawdown:.1%} down on this bot's "
+                       f"own trades ({self.realised_pnl:+.2f} USDT; external "
+                       f"movements {self.external_flow:+.2f} USDT excluded) "
                        f"(limit {self._cfg.daily_loss_limit_pct:.0%})")
         z = self.calibration_z()
         if z is not None:
@@ -1917,9 +1984,19 @@ class RiskManager:
         raise TradingHalted(reason)
 
     def record_result(self, won: bool,
-                      model_prob: float | None = None) -> None:
+                      model_prob: float | None = None,
+                      pnl: float | None = None) -> None:
+        """
+        Book a result THIS bot produced.
+
+        pnl is what makes the daily limit meaningful: without it the manager
+        knows a trade happened but not what it cost, and has to fall back on
+        reading the balance -- which is exactly the conflation this avoids.
+        """
         self.rounds_today += 1
         self.consecutive_losses = 0 if won else self.consecutive_losses + 1
+        if pnl is not None:
+            self._realised_pnl += pnl
         if model_prob is not None:
             self._expected_wins += model_prob
             self._variance += model_prob * (1.0 - model_prob)
@@ -3830,7 +3907,7 @@ class Trader:
                     bankroll = self._bankroll()
                     # Account-level limits: one balance, one daily loss cap.
                     # Per-market streaks are checked inside _maybe_enter.
-                    self._account_risk.check(bankroll)
+                    self._account_risk.check(bankroll, self._committed())
                     self._apply_pending_mode()
                     self._maybe_scale_in_all(bankroll)
                     self._maybe_enter(bankroll,
@@ -4333,9 +4410,9 @@ class Trader:
             self._claim(pos)
 
         self._journal.resolve(pos.trade_id, won, pnl, source)
-        self._risk_for(symbol).record_result(won, pos.signal.model_prob)
+        self._risk_for(symbol).record_result(won, pos.signal.model_prob, pnl)
         if self._account_risk is not None:
-            self._account_risk.record_result(won, pos.signal.model_prob)
+            self._account_risk.record_result(won, pos.signal.model_prob, pnl)
         self._positions.pop(symbol, None)
         after = self._bankroll()
         LOG.info("SETTLED %s -> %s  P&L %+.2f  bankroll %.2f  [%s]",
@@ -4966,7 +5043,7 @@ def main(argv: Iterable[str] | None = None) -> int:
               f"-{checked.max_entry_price:.2f}")
         print(f"  max stake      {checked.max_stake_pct:.0%} of bankroll")
         print(f"  min buffer     {checked.min_buffer_sigmas} sigma")
-        print(f"  daily loss limit    {checked.daily_loss_limit_pct:.0%}")
+        print(f"  daily limit    {checked.daily_loss_limit_pct:.0%}")
         return 0
 
     if args.calibration_report:
