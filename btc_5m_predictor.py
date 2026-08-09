@@ -322,7 +322,7 @@ class Config:
     market_list_limit: int = 50
     # 50 could silently miss an older settlement and leave a position
     # looking unresolved when the venue had already settled it.
-    settled_history_limit: int = 200
+    settled_history_limit: int = 100
 
     db_path: str = "btc5m_journal.db"
     # Print the calibration report to the log every N settled trades. On a
