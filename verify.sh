@@ -3,9 +3,9 @@
 #
 # WHAT IS AND IS NOT HERE
 # -----------------------
-# Included: byte-compile, the unit suite, coherence, property-based fuzzing,
-# and the pattern harness self-test. Together roughly 10 seconds, which is
-# cheap enough to run on every boot.
+# Included: byte-compile, the unit suite, coherence, and property-based
+# fuzzing. Together roughly 10 seconds, which is cheap enough to run on every
+# boot.
 #
 # Excluded: mutation testing. It takes 20+ minutes and measures test QUALITY,
 # not correctness -- useful in development, actively harmful as a deploy gate
@@ -67,12 +67,6 @@ if [ -f fuzz.py ]; then
   run "fuzz invariants" "$PY" fuzz.py --trials 400
 else
   printf '  %-22s SKIP\n' "fuzz invariants"; skipped=$((skipped + 1))
-fi
-
-if [ -f patterns.py ]; then
-  run "pattern self-test" "$PY" patterns.py --selftest
-else
-  printf '  %-22s SKIP\n' "pattern self-test"; skipped=$((skipped + 1))
 fi
 
 # Conformance needs the Node connector as ground truth. Exit code 2 means

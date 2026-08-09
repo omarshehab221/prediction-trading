@@ -276,8 +276,13 @@ def fuzz_evaluate(rng: random.Random, trials: int) -> None:
     for _ in range(trials):
         c = cfg(**m.PROFILES[rng.choice(list(m.PROFILES))])
         strike = rng.uniform(5e4, 1.5e5)
+        # Exercise more than one market: `symbol` (the venue's market ticker)
+        # and `feed_symbol` (the oracle it settles against) are independent
+        # fields and can diverge, so fuzz them independently rather than
+        # assuming every round is BTCUSDT-on-BTCUSDT.
+        symbol = rng.choice(["BTCUSDT", "ETHUSDT", "SOLUSDT"])
         rnd = m.Round(
-            topic_id=1, market_id=1, vendor="V", slug="s",
+            topic_id=1, market_id=1, vendor="V", slug="s", symbol=symbol,
             start_ms=0, end_ms=c.round_seconds * 1000,
             up_token_id="1", down_token_id="2",
             up_quote=rng.uniform(0.01, 0.99), down_quote=rng.uniform(0.01, 0.99),

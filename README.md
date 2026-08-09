@@ -62,7 +62,6 @@ Two refinements matter:
 | `conformance.py` | 403 | Validates every API call against Binance's own schema |
 | `fuzz.py` | 363 | Property-based testing with hostile inputs |
 | `coherence.py` | 376 | Finds stale artifacts, dead code, config drift |
-| `patterns.py` | 546 | Tests whether kline patterns predict anything |
 | `mutate.py` | 155 | Mutation testing — measures test quality |
 | `verify.sh` | 107 | The gate: runs before the bot is allowed to trade |
 | `checkup.sh` | 139 | Full isolated verification run |
@@ -266,32 +265,7 @@ measures test *quality*, not correctness.
 
 ---
 
-## 10. Does the pattern idea work?
-
-`patterns.py` tests 19 features — candlestick patterns, momentum, order flow —
-against the next 5-minute outcome, with a chronological train/test split,
-Benjamini-Hochberg correction, and a shuffled-label null run printed alongside
-so you can see what chance looks like on your own data.
-
-```bash
-python3 patterns.py --selftest    # verify the harness first
-python3 patterns.py --days 90
-```
-
-It passes its own self-test: finds **nothing** in pure noise, and recovers a
-*planted* order-flow edge. A tool that cannot do both is worse than none.
-
-Building it exposed two bugs in the harness itself. Overlapping forward windows
-made a plain binomial test read a 49.1% hit rate on a **random walk** as
-significant at p=0.023 (corrected: p=0.31). And `reversal_15m` was exactly
-`NOT momentum_15m` — one coin flip counted as two tests.
-
-The likely honest result on real data is that nothing survives. That is the
-standard finding for candlestick patterns on short-horizon crypto.
-
----
-
-## 11. Deployment
+## 10. Deployment
 
 See `DEPLOY.md`. Three things will break it silently:
 
@@ -307,7 +281,7 @@ your edits) → `--check-config` → `--preflight` → `exec` the bot.
 
 ---
 
-## 12. What is verified, and what is not
+## 11. What is verified, and what is not
 
 **Verified by execution:** pricing model (vs scipy to machine precision), Kelly
 sizing, edge math, order-book walking, payload parsing, risk limits, settlement,
@@ -327,7 +301,7 @@ identical over a few dozen trades, and one loses money while the other compounds
 
 ---
 
-## 13. Things that turned out to be wrong
+## 12. Things that turned out to be wrong
 
 Kept because they are the useful part of the history.
 
@@ -362,7 +336,7 @@ in `coherence.py` and `test_btc_5m.py` now enforce against that class directly.
 
 ---
 
-## 14. Honest expectations
+## 13. Honest expectations
 
 - The bot will often sit idle. With a 2% fee, a coin-flip contract loses ~2% per
   round by default, so declining to trade is correct behaviour.

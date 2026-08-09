@@ -7,7 +7,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # The verification suite ships with the bot: it runs at build time (below) and
 # again on every boot, so a broken image never becomes a trading process.
-COPY btc_5m_predictor.py test_btc_5m.py coherence.py fuzz.py patterns.py \
+COPY btc_5m_predictor.py test_btc_5m.py coherence.py fuzz.py \
      conformance.py verify.sh entrypoint.sh ./
 RUN chmod +x verify.sh entrypoint.sh
 

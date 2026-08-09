@@ -1036,12 +1036,10 @@ class ApiError(RuntimeError):
 # --------------------------------------------------------------------------
 
 
-def _as_float(value: object) -> Optional[float]:
+def _as_float_or_none(value: object) -> Optional[float]:
     """Parse a numeric field, or None when it is absent or unusable."""
-    if value is None:
-        return None
     try:
-        parsed = float(value)
+        parsed = float(value)          # float(None) raises TypeError too
     except (TypeError, ValueError):
         return None
     return parsed if math.isfinite(parsed) else None
@@ -2307,9 +2305,9 @@ class PredictionClient:
             order = self.order_fill(order_id)
             if order is not None:
                 last_status = str(order.get("status") or "unknown").upper()
-                filled = _as_float(order.get("filledUsdtAmount"))
+                filled = _as_float_or_none(order.get("filledUsdtAmount"))
                 if filled is None:
-                    filled = _as_float(order.get("filledShareQty"))
+                    filled = _as_float_or_none(order.get("filledShareQty"))
                 if last_status in self.DEAD_ORDER_STATUSES:
                     raise ApiError(
                         f"order {order_id} did not fill: status "

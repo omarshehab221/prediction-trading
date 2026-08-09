@@ -8,7 +8,7 @@ cd "$DIR" || exit 1
 
 cp "$SRC/btc_5m_predictor.py" "$SRC/test_btc_5m.py" \
    "$SRC/conformance.py" "$SRC/fuzz.py" "$SRC/mutate.py" \
-   "$SRC/patterns.py" "$SRC/coherence.py" \
+   "$SRC/coherence.py" \
    "$SRC/entrypoint.sh" "$SRC/render.yaml" "$SRC/Dockerfile" \
    "$SRC/requirements.txt" .
 chmod +x entrypoint.sh 2>/dev/null || true
@@ -53,10 +53,6 @@ python3 coherence.py >/dev/null 2>&1 && echo "  coherence  0 stale artifacts" \
 # 3c. property-based invariants under hostile input
 FZ=$(python3 fuzz.py --trials 1500 --seed "$RUN" 2>/dev/null | tail -1)
 echo "  fuzz       ${FZ}"
-
-# 3d. the pattern harness must still tell signal from noise
-PT=$(python3 patterns.py --selftest 2>/dev/null | grep -c "^  PASS")
-echo "  patterns   ${PT}/2 self-tests pass"
 
 # 4. full suite, shuffled order to expose inter-test dependencies
 python3 - <<'PY'
@@ -132,7 +128,7 @@ PYX
 echo "  warnings   $(sort run_err.txt | uniq -c | awk '{printf "%s:%s ", $1, substr($2,1,18)}')"
 
 # 8. artifacts left behind in the working directory
-STRAY=$(ls -A | grep -vE '^(btc_5m_predictor.py|test_btc_5m.py|conformance.py|fuzz.py|mutate.py|patterns.py|coherence.py|entrypoint.sh|render.yaml|Dockerfile|requirements.txt|cal_convex.db|cal_balanced.db|__pycache__|run_err.txt)$' | tr '\n' ' ')
+STRAY=$(ls -A | grep -vE '^(btc_5m_predictor.py|test_btc_5m.py|conformance.py|fuzz.py|mutate.py|coherence.py|entrypoint.sh|render.yaml|Dockerfile|requirements.txt|cal_convex.db|cal_balanced.db|__pycache__|run_err.txt)$' | tr '\n' ' ')
 echo "  stray      ${STRAY:-none}"
 
 cd / && rm -rf "$DIR"

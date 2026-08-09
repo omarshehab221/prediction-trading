@@ -637,6 +637,11 @@ class FakeClient:
         self.orders.append((quote.quote_id, quote.average_price, stake_usdt))
         return "order-1"
 
+    def confirm_fill(self, order_id, requested_usdt):
+        # Deterministic stand-in: every order fills in full. Tests that need
+        # a partial or dead fill override this per-instance.
+        return requested_usdt
+
     def list_rounds(self):
         return list(self._rounds)
 
