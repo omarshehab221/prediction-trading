@@ -512,7 +512,7 @@ PROFILES: dict[str, dict] = {
     # min_buffer_sigmas=2.0 means spot must sit two standard deviations of
     # the REMAINING time away from the strike: roughly 14 bps with a minute
     # left, or 28 bps with four minutes.
-    "buffer": dict(max_entry_price=0.92, min_entry_price=0.75,
+    "buffer": dict(max_entry_price=0.95, min_entry_price=0.75,
                    min_edge=0.012, min_edge_ratio=0.010,
                    # Lowered from 2.0: fewer sigmas means more trades, and
                    # more trades is how the edge question gets answered at
