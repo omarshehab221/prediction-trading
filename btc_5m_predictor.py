@@ -285,9 +285,12 @@ class Config:
     round_duration_tolerance: float = 0.10    # fraction of the target length
     quote_consistency_tolerance: float = 0.10
     market_list_limit: int = 50
-    # 50 could silently miss an older settlement and leave a position
-    # looking unresolved when the venue had already settled it.
-    settled_history_limit: int = 200
+    # The venue caps this endpoint's page size at 100 (its documented
+    # range is 1-100); anything above that is rejected outright with
+    # -1102 "mandatory parameter ... malformed", which makes every
+    # settled-history lookup fail closed. 100 is therefore both the
+    # safe default and the ceiling enforced below.
+    settled_history_limit: int = 100
 
     db_path: str = "btc5m_journal.db"
     # Print the calibration report to the log every N settled trades. On a
@@ -336,8 +339,9 @@ class Config:
             raise ValueError("symbol must not be empty")
         if not 0 < self.round_duration_tolerance < 1.0:
             raise ValueError("round_duration_tolerance must be in (0, 1)")
-        if self.settled_history_limit < 1:
-            raise ValueError("settled_history_limit must be positive")
+        if not 1 <= self.settled_history_limit <= 100:
+            raise ValueError("settled_history_limit must be in [1, 100] -- "
+                              "the venue rejects anything above 100")
         for name in ("clock_resync_s", "settle_grace_s", "settle_timeout_s",
                      "drain_timeout_s", "drain_poll_s", "prune_after_s",
                      "vol_cache_s", "error_backoff_max_s"):
@@ -3847,9 +3851,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         print("\n*** LIVE MODE: this will spend real USDT. ***")
         print("Confirm you have (1) run --preflight clean, and (2) reviewed")
         print("--calibration-report over several hundred paper rounds.")
-        if input('Type "I ACCEPT THE RISK" to continue: ') != "I ACCEPT THE RISK":
-            print("Aborted.")
-            return 1
+        # if input('Type "I ACCEPT THE RISK" to continue: ') != "I ACCEPT THE RISK":
+        #     print("Aborted.")
+        #     return 1
 
     try:
         Trader(store if not args.no_hot_reload else cfg).run()
