@@ -1520,20 +1520,6 @@ class PredictionClient:
         self._wallet: WalletRef | None = None
         self._symbol_cache: dict[str, str] = {}
         self.apply_config(cfg)
-        
-        # Binance error codes worth explaining rather than echoing verbatim.
-        self._ERROR_HINTS = {
-            -1022: "signature mismatch -- the signed and sent query strings differ",
-            -1021: "timestamp outside recvWindow -- clock drift",
-            -1102: "a mandatory parameter was missing or malformed",
-            -2014: "API-key format invalid",
-            -2015: "invalid API key, IP not whitelisted, or missing permissions",
-            -1002: "not authorised for this endpoint",
-            -9000: "the account balance cannot cover this order size",
-            -3026: ("a parameter combination the venue rejected -- most often "
-                    "fundingSource not matching accountType (SPOT/FUNDING are "
-                    "CEX accounts, not MPC), or a missing fundTransferAmount"),
-        }
     @property
     def _cfg(self) -> Config:
         return self._static_cfg if self._store is None else self._store.current
@@ -1597,6 +1583,20 @@ class PredictionClient:
         signature = hmac.new(self._cfg.api_secret.encode(),
                              query.encode(), hashlib.sha256).hexdigest()
         return f"{query}&signature={signature}"
+    
+    # Binance error codes worth explaining rather than echoing verbatim.
+    _ERROR_HINTS = {  # noqa: RUF012
+        -1022: "signature mismatch -- the signed and sent query strings differ",
+        -1021: "timestamp outside recvWindow -- clock drift",
+        -1102: "a mandatory parameter was missing or malformed",
+        -2014: "API-key format invalid",
+        -2015: "invalid API key, IP not whitelisted, or missing permissions",
+        -1002: "not authorised for this endpoint",
+        -9000: "the account balance cannot cover this order size",
+        -3026: ("a parameter combination the venue rejected -- most often "
+                "fundingSource not matching accountType (SPOT/FUNDING are "
+                "CEX accounts, not MPC), or a missing fundTransferAmount"),
+    }
 
     @staticmethod
     def _json_or_none(response) -> object | None:
