@@ -17,6 +17,7 @@ import tempfile
 import types
 import math
 import sys
+import time
 import unittest
 from dataclasses import replace
 from decimal import Decimal
@@ -29,6 +30,27 @@ from btc_5m_predictor import (
 )
 
 
+def build_client(config=None, **attrs):
+    """
+    Construct a PredictionClient without __init__ (which opens a session).
+
+    `_cfg` is a read-only property that resolves through a ConfigStore, so
+    tests set the backing field rather than the property. Centralised here so
+    a change to how config is held does not have to be applied at 30 sites.
+    """
+    c = PredictionClient.__new__(PredictionClient)
+    c._store = None
+    c._store = None
+
+    c._static_cfg = config if config is not None else cfg()
+    c._clock_offset_ms = 0
+    c._symbol_cache = {}
+    c._wallet = None
+    for key, value in attrs.items():
+        setattr(c, key, value)
+    return c
+
+
 def build_trader(client, config, db_path):
     """
     Construct a Trader without running __init__ (which does network I/O).
@@ -39,7 +61,9 @@ def build_trader(client, config, db_path):
     supplied here is initialised to a matching empty value.
     """
     t = Trader.__new__(Trader)
-    t._cfg = config
+    t._store = None
+
+    t._static_cfg = config
     t._client = client
     t._vol = types.SimpleNamespace(sigma_annual=lambda *a: 0.5,
                                    tail_df=lambda *a: None,
@@ -49,6 +73,10 @@ def build_trader(client, config, db_path):
     t._paper_bankroll = config.paper_start_bankroll
     t._risk = RiskManager(config, config.paper_start_bankroll)
     t._position = None
+    # The mode actually in force. Derived from config, not reflected: the
+    # reflection below cannot evaluate `config.live`, and defaulting it to
+    # None made every live-mode test silently run as paper.
+    t._active_live = config.live
 
     # Fill in everything else __init__ would have set.
     import ast as _ast, inspect as _inspect, textwrap as _tw
@@ -62,8 +90,15 @@ def build_trader(client, config, db_path):
                     and isinstance(tgt.value, _ast.Name)
                     and tgt.value.id == "self"):
                 continue
-            if hasattr(t, tgt.attr):
+            # Never assign through a read-only property, and never let a
+            # failed hasattr abort the loop before later fields are set.
+            if isinstance(getattr(type(t), tgt.attr, None), property):
                 continue
+            try:
+                if hasattr(t, tgt.attr):
+                    continue
+            except AttributeError:
+                pass
             expr = _ast.unparse(node.value) if node.value else "None"
             if expr.startswith("{"):
                 setattr(t, tgt.attr, {})
@@ -898,7 +933,9 @@ class TestSymbolMapping(unittest.TestCase):
 
     def _client(self, valid):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg()
+        c._store = None
+
+        c._static_cfg = cfg()
         c._symbol_cache = {}
         calls = []
 
@@ -1291,7 +1328,9 @@ class TestRequestSigning(unittest.TestCase):
 
     def _client(self):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg()
+        c._store = None
+
+        c._static_cfg = cfg()
         c._clock_offset_ms = 0
         c._symbol_cache = {}
         c._wallet = None
@@ -1341,7 +1380,9 @@ class TestErrorSurfacing(unittest.TestCase):
 
     def _client_returning(self, status, body, text="{}"):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg(); c._clock_offset_ms = 0
+        c._store = None
+
+        c._static_cfg = cfg(); c._clock_offset_ms = 0
         c._symbol_cache = {}; c._wallet = None
 
         class S:
@@ -1403,30 +1444,27 @@ class TestEndpointMethods(unittest.TestCase):
             self.assertIn(verb, ("GET", "POST"), name)
             self.assertTrue(path.startswith("/sapi/"), name)
 
+    def _built(self, endpoints):
+        doc = m.default_config_document()
+        doc["endpoints"].update(endpoints)
+        return m.build_config(doc, api_key="k", api_secret="s", live=False,
+                              db_path="d")
+
     def test_override_accepts_bare_path_and_keeps_method(self):
-        import json, tempfile, os as _os
-        fd, fp = tempfile.mkstemp(suffix=".json"); _os.close(fd)
-        with open(fp, "w") as fh:
-            json.dump({"get_quote": "/new/path"}, fh)
-        eps = m.load_endpoints(fp); _os.unlink(fp)
-        self.assertEqual(eps["get_quote"], ("POST", "/new/path"))
+        self.assertEqual(self._built({"get_quote": "/new/path"}).ep("get_quote"),
+                         ("POST", "/new/path"))
 
     def test_override_accepts_method_path_pair(self):
-        import json, tempfile, os as _os
-        fd, fp = tempfile.mkstemp(suffix=".json"); _os.close(fd)
-        with open(fp, "w") as fh:
-            json.dump({"order_book": ["POST", "/x"]}, fh)
-        eps = m.load_endpoints(fp); _os.unlink(fp)
-        self.assertEqual(eps["order_book"], ("POST", "/x"))
+        self.assertEqual(self._built({"order_book": ["POST", "/x"]})
+                         .ep("order_book"), ("POST", "/x"))
 
     def test_override_rejects_bad_method(self):
-        import json, tempfile, os as _os
-        fd, fp = tempfile.mkstemp(suffix=".json"); _os.close(fd)
-        with open(fp, "w") as fh:
-            json.dump({"order_book": ["FETCH", "/x"]}, fh)
-        with self.assertRaises(SystemExit):
-            m.load_endpoints(fp)
-        _os.unlink(fp)
+        with self.assertRaises(ValueError):
+            self._built({"order_book": ["FETCH", "/x"]})
+
+    def test_override_rejects_unknown_endpoint(self):
+        with self.assertRaises(ValueError):
+            self._built({"not_an_endpoint": "/x"})
 
 
 class TestClampedSigmaGuard(unittest.TestCase):
@@ -1492,7 +1530,9 @@ class TestBalanceLookup(unittest.TestCase):
 
     def _client(self, items, account_type="AUTO"):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg(account_type=account_type)
+        c._store = None
+
+        c._static_cfg = cfg(account_type=account_type)
         c._clock_offset_ms = 0; c._symbol_cache = {}; c._wallet = None
 
         class S:
@@ -1714,7 +1754,9 @@ class TestVenueDerivedParameters(unittest.TestCase):
 
     def test_slippage_takes_the_tighter_of_ours_and_the_venue(self):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg(max_slippage_bps=300)
+        c._store = None
+
+        c._static_cfg = cfg(max_slippage_bps=300)
         self.assertEqual(c.effective_slippage_bps(make_round(venue_slippage_bps=1200)), 300)
         self.assertEqual(c.effective_slippage_bps(make_round(venue_slippage_bps=100)), 100)
         self.assertEqual(c.effective_slippage_bps(make_round(venue_slippage_bps=0)), 300)
@@ -1740,7 +1782,9 @@ class TestMinimumDiscovery(unittest.TestCase):
 
     def _client(self, true_min, balance=50.0):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg()
+        c._store = None
+
+        c._static_cfg = cfg()
         c.calls = []
         c.balance_usdt = lambda: balance
 
@@ -1896,7 +1940,9 @@ class TestQuoteErrorClassification(unittest.TestCase):
 
     def _client(self, raiser, balance=50.0):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg()
+        c._store = None
+
+        c._static_cfg = cfg()
         c.get_quote = raiser
         c.balance_usdt = lambda: balance
         return c
@@ -2141,7 +2187,9 @@ class TestQuoteValidation(unittest.TestCase):
 
     def _client(self, payload):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg(); c._clock_offset_ms = 0
+        c._store = None
+
+        c._static_cfg = cfg(); c._clock_offset_ms = 0
         c._symbol_cache = {}; c._wallet = m.WalletRef("0xabc", "w1")
         c._request = lambda name, params=None: payload
         c.resolved_funding_source = lambda: "MPC"
@@ -2225,7 +2273,9 @@ class TestErrorClassification(unittest.TestCase):
 
     def test_request_attaches_the_code(self):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg(); c._clock_offset_ms = 0
+        c._store = None
+
+        c._static_cfg = cfg(); c._clock_offset_ms = 0
         c._symbol_cache = {}; c._wallet = None
 
         class S:
@@ -2258,9 +2308,9 @@ class TestNoRawTracebacks(unittest.TestCase):
         main_fn = next(n for n in ast.walk(tree)
                        if isinstance(n, ast.FunctionDef) and n.name == "main")
         src = ast.unparse(main_fn)
-        idx = src.find("Trader(cfg).run()")
-        self.assertGreater(idx, 0)
-        self.assertIn("except ApiError", src[idx - 200:idx + 300])
+        idx = src.find(").run()")
+        self.assertGreater(idx, 0, "no Trader run call found in main()")
+        self.assertIn("except ApiError", src[max(0, idx - 300):idx + 400])
 
 
 class TestSchemaConformance(unittest.TestCase):
@@ -2379,7 +2429,9 @@ class TestOrderResponseHandling(unittest.TestCase):
 
     def _client(self, payload):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg(); c._clock_offset_ms = 0
+        c._store = None
+
+        c._static_cfg = cfg(); c._clock_offset_ms = 0
         c._symbol_cache = {}; c._wallet = m.WalletRef("0xabc", "w1")
         c._request = lambda name, params=None: payload
         c._resolved_account_type = lambda: "SPOT"
@@ -2524,7 +2576,9 @@ class TestFundingSourceDerivation(unittest.TestCase):
 
     def _client(self, options, cfg_funding="AUTO", cfg_account="AUTO"):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg(funding_source=cfg_funding, account_type=cfg_account)
+        c._store = None
+
+        c._static_cfg = cfg(funding_source=cfg_funding, account_type=cfg_account)
         c.payment_options = lambda: options
         return c
 
@@ -2579,7 +2633,9 @@ class TestFundingSourceDerivation(unittest.TestCase):
     def _order_client(self, options):
         sent = {}
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg(); c._wallet = m.WalletRef("0xa", "w1")
+        c._store = None
+
+        c._static_cfg = cfg(); c._wallet = m.WalletRef("0xa", "w1")
         c.payment_options = lambda: options
         c._request = lambda name, params=None: (sent.update(params or {}),
                                                 {"orderId": "1"})[1]
@@ -2614,11 +2670,33 @@ class TestFundingSourceDerivation(unittest.TestCase):
 
 class TestProfileDefaults(unittest.TestCase):
 
-    def test_micro_is_the_cli_default(self):
+    def test_profile_flag_has_no_default(self):
+        """
+        An argparse default would always beat the config file's
+        active_profile, making that setting dead -- the same way --kelly's
+        0.25 default silently overrode every profile's kelly_fraction.
+        """
         import inspect, re as _re
         src = inspect.getsource(m.main)
-        hit = _re.search(r'"--profile".*?default="(\w+)"', src, _re.S)
-        self.assertEqual(hit.group(1), "micro")
+        hit = _re.search(r'"--profile".*?default=(\w+)', src, _re.S)
+        self.assertEqual(hit.group(1), "None")
+
+    def test_generated_config_uses_the_declared_default(self):
+        self.assertEqual(m.default_config_document()["active_profile"],
+                         m.DEFAULT_PROFILE)
+
+    def test_default_profile_is_buffer(self):
+        self.assertEqual(m.DEFAULT_PROFILE, "buffer")
+
+    def test_default_profile_exists(self):
+        self.assertIn(m.DEFAULT_PROFILE, m.PROFILES)
+
+    def test_build_config_falls_back_to_the_declared_default(self):
+        doc = m.default_config_document()
+        doc.pop("active_profile")
+        c = m.build_config(doc, api_key="k", api_secret="s", live=False,
+                           db_path="d")
+        self.assertEqual(c.profile_name, m.DEFAULT_PROFILE)
 
     def test_micro_simulates_a_small_account(self):
         c = Config(api_key="k", api_secret="s", **m.PROFILES["micro"])
@@ -2715,7 +2793,9 @@ class TestPredictionWalletBalance(unittest.TestCase):
 
     def _client(self, options, wallet_value):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg(account_type="AUTO")
+        c._store = None
+
+        c._static_cfg = cfg(account_type="AUTO")
         c.payment_options = lambda: options
         c.prediction_wallet_value = lambda: wallet_value
         return c
@@ -2743,19 +2823,25 @@ class TestPredictionWalletBalance(unittest.TestCase):
 
     def test_portfolio_parses_total_current_value(self):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg(); c._wallet = m.WalletRef("0xa", "w1")
+        c._store = None
+
+        c._static_cfg = cfg(); c._wallet = m.WalletRef("0xa", "w1")
         c._request = lambda name, params=None: {"totalCurrentValue": "6.64"}
         self.assertAlmostEqual(c.prediction_wallet_value(), 6.64)
 
     def test_portfolio_rejects_non_finite_value(self):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg(); c._wallet = m.WalletRef("0xa", "w1")
+        c._store = None
+
+        c._static_cfg = cfg(); c._wallet = m.WalletRef("0xa", "w1")
         c._request = lambda name, params=None: {"totalCurrentValue": "1e999"}
         self.assertIsNone(c.prediction_wallet_value())
 
     def test_portfolio_missing_field_is_none(self):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg(); c._wallet = m.WalletRef("0xa", "w1")
+        c._store = None
+
+        c._static_cfg = cfg(); c._wallet = m.WalletRef("0xa", "w1")
         c._request = lambda name, params=None: {"walletAddress": "0xa"}
         self.assertIsNone(c.prediction_wallet_value())
 
@@ -2867,7 +2953,9 @@ class TestHostingReadiness(unittest.TestCase):
         import signal as _sig
         c = cfg()
         t = Trader.__new__(Trader)
-        t._cfg = c; t._stopping = False
+        t._store = None
+
+        t._static_cfg = c; t._stopping = False
         previous = _sig.getsignal(_sig.SIGTERM)
         try:
             t._install_signal_handlers()
@@ -2878,7 +2966,9 @@ class TestHostingReadiness(unittest.TestCase):
     def test_sigterm_sets_stopping_rather_than_dying(self):
         import signal as _sig
         t = Trader.__new__(Trader)
-        t._cfg = cfg(); t._stopping = False
+        t._store = None
+
+        t._static_cfg = cfg(); t._stopping = False
         previous = _sig.getsignal(_sig.SIGTERM)
         try:
             t._install_signal_handlers()
@@ -2890,7 +2980,9 @@ class TestHostingReadiness(unittest.TestCase):
     def test_second_sigterm_exits_immediately(self):
         import signal as _sig
         t = Trader.__new__(Trader)
-        t._cfg = cfg(); t._stopping = True
+        t._store = None
+
+        t._static_cfg = cfg(); t._stopping = True
         previous = _sig.getsignal(_sig.SIGTERM)
         try:
             t._install_signal_handlers()
@@ -2909,7 +3001,9 @@ class TestHostingReadiness(unittest.TestCase):
 
     def test_public_endpoint_reports_geo_block(self):
         c = PredictionClient.__new__(PredictionClient)
-        c._cfg = cfg()
+        c._store = None
+
+        c._static_cfg = cfg()
 
         class S:
             def get(self, url, params=None, timeout=None):
@@ -3403,6 +3497,935 @@ class TestMainEntryPoint(unittest.TestCase):
             self.assertFalse(explicit and starred,
                              "Config() mixes explicit kwargs with **settings; "
                              "a profile field can collide with one of them")
+
+
+class TestConfigFile(unittest.TestCase):
+    """Every setting lives in the file, and the file round-trips."""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".json"); os.close(fd)
+        os.unlink(self.path)
+
+    def tearDown(self):
+        if os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def _write(self, doc=None):
+        import json as _j
+        _j.dump(doc or m.default_config_document(),
+                open(self.path, "w"), indent=2)
+
+    def test_document_covers_every_mutable_config_field(self):
+        import dataclasses as _dc
+        doc = m.default_config_document()
+        covered = set(doc["defaults"])
+        for prof in doc["profiles"].values():
+            covered |= set(prof)
+        for f in _dc.fields(Config):
+            if f.name in m.IMMUTABLE_FIELDS:
+                continue
+            self.assertIn(f.name, covered,
+                          f"{f.name} is not represented in the config file")
+
+    def test_no_immutable_field_is_emitted(self):
+        doc = m.default_config_document()
+        self.assertEqual(set(doc["defaults"]) & m.IMMUTABLE_FIELDS, set())
+
+    def test_document_round_trips_to_the_same_config(self):
+        for name in m.PROFILES:
+            built = m.build_config(m.default_config_document(), api_key="k",
+                                   api_secret="s", live=False, db_path="d",
+                                   profile=name)
+            direct = Config(api_key="k", api_secret="s", db_path="d",
+                            profile_name=name, **m.PROFILES[name])
+            for fld in ("max_stake_pct", "min_entry_price", "max_entry_price",
+                        "min_edge", "kelly_fraction", "daily_loss_limit_pct",
+                        "min_buffer_sigmas", "scale_in"):
+                self.assertEqual(getattr(built, fld), getattr(direct, fld),
+                                 f"{name}.{fld}")
+
+    def test_document_is_json_serialisable(self):
+        import json as _j
+        _j.loads(_j.dumps(m.default_config_document()))
+
+    def test_unknown_setting_is_rejected_by_name(self):
+        doc = m.default_config_document()
+        doc["overrides"]["not_a_setting"] = 1
+        with self.assertRaises(ValueError) as ctx:
+            m.build_config(doc, api_key="k", api_secret="s", live=False,
+                           db_path="d")
+        self.assertIn("not_a_setting", str(ctx.exception))
+
+    def test_unknown_profile_is_rejected(self):
+        with self.assertRaises(ValueError):
+            m.build_config(m.default_config_document(), api_key="k",
+                           api_secret="s", live=False, db_path="d",
+                           profile="nope")
+
+    def test_layering_order_overrides_wins(self):
+        doc = m.default_config_document()
+        doc["profiles"]["micro"]["max_stake_pct"] = 0.11
+        doc["overrides"]["max_stake_pct"] = 0.12
+        c = m.build_config(doc, api_key="k", api_secret="s", live=False,
+                           db_path="d", profile="micro",
+                           overrides={"max_stake_pct": 0.13})
+        self.assertEqual(c.max_stake_pct, 0.13)   # CLI beats file overrides
+
+    def test_tuple_fields_survive_json(self):
+        doc = m.default_config_document()
+        doc["defaults"]["open_statuses"] = ["OPEN", "ACTIVE"]
+        c = m.build_config(doc, api_key="k", api_secret="s", live=False,
+                           db_path="d")
+        self.assertEqual(c.open_statuses, ("OPEN", "ACTIVE"))
+
+    def test_int_field_rejects_a_fractional_value(self):
+        doc = m.default_config_document()
+        doc["defaults"]["market_list_limit"] = 12.5
+        with self.assertRaises(ValueError):
+            m.build_config(doc, api_key="k", api_secret="s", live=False,
+                           db_path="d")
+
+    def test_endpoint_overrides_apply(self):
+        doc = m.default_config_document()
+        doc["endpoints"]["order_book"] = ["POST", "/custom"]
+        c = m.build_config(doc, api_key="k", api_secret="s", live=False,
+                           db_path="d")
+        self.assertEqual(c.ep("order_book"), ("POST", "/custom"))
+
+
+class TestHotReload(unittest.TestCase):
+    """A bad edit must never take down a running bot."""
+
+    def setUp(self):
+        fd, self.path = tempfile.mkstemp(suffix=".json"); os.close(fd)
+        self._save(m.default_config_document())
+        self.store = m.ConfigStore(self.path, api_key="k", api_secret="s",
+                                   live=False, db_path="/tmp/j.db",
+                                   profile="buffer")
+
+    def tearDown(self):
+        os.unlink(self.path)
+
+    def _save(self, doc):
+        import json as _j
+        _j.dump(doc, open(self.path, "w"), indent=2)
+        future = time.time() + 5
+        os.utime(self.path, (future, future))
+
+    def _edit(self, fn):
+        import json as _j
+        doc = _j.load(open(self.path))
+        fn(doc)
+        self._save(doc)
+
+    def test_valid_edit_is_applied(self):
+        self._edit(lambda d: d["profiles"]["buffer"].update(
+            min_buffer_sigmas=3.0))
+        self.assertTrue(self.store.maybe_reload())
+        self.assertEqual(self.store.current.min_buffer_sigmas, 3.0)
+
+    def test_no_change_means_no_reload(self):
+        self.assertFalse(self.store.maybe_reload())
+
+    def test_invalid_value_keeps_the_previous_config(self):
+        before = self.store.current.kelly_fraction
+        self._edit(lambda d: d["profiles"]["buffer"].update(kelly_fraction=99))
+        self.assertFalse(self.store.maybe_reload())
+        self.assertEqual(self.store.current.kelly_fraction, before)
+
+    def test_malformed_json_keeps_the_previous_config(self):
+        before = self.store.current.min_buffer_sigmas
+        with open(self.path, "a") as fh:
+            fh.write("}}}not json")
+        future = time.time() + 9
+        os.utime(self.path, (future, future))
+        self.assertFalse(self.store.maybe_reload())
+        self.assertEqual(self.store.current.min_buffer_sigmas, before)
+
+    def test_deleted_file_keeps_the_previous_config(self):
+        before = self.store.current.min_buffer_sigmas
+        os.unlink(self.path)
+        self.assertFalse(self.store.maybe_reload())
+        self.assertEqual(self.store.current.min_buffer_sigmas, before)
+        self._save(m.default_config_document())      # restore for tearDown
+
+    def test_immutable_field_is_ignored_not_applied(self):
+        self._edit(lambda d: d["overrides"].update(db_path="/tmp/elsewhere.db"))
+        self.store.maybe_reload()
+        self.assertEqual(self.store.current.db_path, "/tmp/j.db")
+
+    def test_reload_count_only_counts_successes(self):
+        self._edit(lambda d: d["profiles"]["buffer"].update(kelly_fraction=99))
+        self.store.maybe_reload()
+        self.assertEqual(self.store.reload_count, 0)
+        self._edit(lambda d: d["profiles"]["buffer"].update(kelly_fraction=0.3))
+        self.store.maybe_reload()
+        self.assertEqual(self.store.reload_count, 1)
+
+    def test_parsing_attributes_follow_a_reload(self):
+        """_parse_round reads class attributes, which must track the config."""
+        self._edit(lambda d: d["defaults"].update(symbol="ETHUSDT"))
+        self.assertTrue(self.store.maybe_reload())
+        PredictionClient.apply_config(self.store.current)
+        try:
+            self.assertIsNone(PredictionClient._parse_round(
+                TestParseRound.topic(symbol="BTCUSDT")))
+            self.assertIsNotNone(PredictionClient._parse_round(
+                TestParseRound.topic(symbol="ETHUSDT")))
+        finally:
+            PredictionClient(cfg())
+
+    def test_client_sees_the_new_config_without_rebuilding(self):
+        client = PredictionClient(self.store)
+        self.assertEqual(client._cfg.min_buffer_sigmas, 1.5)
+        self._edit(lambda d: d["profiles"]["buffer"].update(
+            min_buffer_sigmas=2.75))
+        self.store.maybe_reload()
+        self.assertEqual(client._cfg.min_buffer_sigmas, 2.75)
+
+    def test_a_plain_config_still_works_without_a_store(self):
+        client = PredictionClient(cfg())
+        self.assertIsInstance(client._cfg, Config)
+
+
+class TestDeploymentEntrypoint(unittest.TestCase):
+    """
+    The deploy path, tested as a unit.
+
+    These are the behaviours that cannot be checked by reading the file: a
+    regenerated config would silently discard the user's edits on every
+    deploy, and a missing `exec` would stop SIGTERM ever reaching Python.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os as _os
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        cls.script = _os.path.join(here, "entrypoint.sh")
+        cls.bot = _os.path.join(here, "btc_5m_predictor.py")
+        cls.text = (open(cls.script).read()
+                    if _os.path.exists(cls.script) else "")
+
+    def setUp(self):
+        if not self.text:
+            self.skipTest("entrypoint.sh not present")
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _run(self, config_path, profile=None):
+        import subprocess, shutil as _sh, os as _os
+        _sh.copy(self.bot, self.tmp)
+        _sh.copy(self.script, self.tmp)
+        _os.chmod(_os.path.join(self.tmp, "entrypoint.sh"), 0o755)
+        # These exercise config seeding, not the venue: preflight would try
+        # to reach Binance with placeholder keys and fail for reasons that
+        # have nothing to do with what is being tested.
+        env = dict(_os.environ,
+                   BINANCE_API_KEY="k", BINANCE_API_SECRET="s",
+                   CONFIG_PATH=config_path,
+                   PROFILE=profile or m.DEFAULT_PROFILE,
+                   SKIP_PREFLIGHT="1", VERIFY_NESTED="1",
+                   DB_PATH=_os.path.join(self.tmp, "j.db"))
+        return subprocess.run(["./entrypoint.sh", "--check-config"],
+                              cwd=self.tmp, env=env, capture_output=True,
+                              text=True, timeout=120)
+
+    def test_uses_exec_so_sigterm_reaches_python(self):
+        """Without exec the shell keeps PID 1 and Python never shuts down."""
+        self.assertRegex(self.text, r"\nexec python")
+
+    def test_first_boot_creates_the_config(self):
+        import os as _os
+        path = _os.path.join(self.tmp, "data", "config.json")
+        r = self._run(path)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertTrue(_os.path.exists(path))
+
+    def test_written_config_uses_the_requested_profile(self):
+        import os as _os, json as _j
+        path = _os.path.join(self.tmp, "data", "config.json")
+        self._run(path, profile="convex")
+        self.assertEqual(_j.load(open(path))["active_profile"], "convex")
+
+    def test_redeploy_preserves_user_edits(self):
+        """The reason the script must never regenerate an existing file."""
+        import os as _os, json as _j
+        path = _os.path.join(self.tmp, "data", "config.json")
+        self._run(path)
+        doc = _j.load(open(path))
+        doc["profiles"][m.DEFAULT_PROFILE]["min_buffer_sigmas"] = 2.75
+        doc["overrides"]["max_rounds_per_day"] = 42
+        _j.dump(doc, open(path, "w"), indent=2)
+
+        r = self._run(path)                      # simulate a redeploy
+        self.assertEqual(r.returncode, 0, r.stderr)
+        after = _j.load(open(path))
+        self.assertEqual(
+            after["profiles"][m.DEFAULT_PROFILE]["min_buffer_sigmas"], 2.75)
+        self.assertEqual(after["overrides"]["max_rounds_per_day"], 42)
+
+    def test_invalid_config_fails_before_starting(self):
+        import os as _os, json as _j
+        path = _os.path.join(self.tmp, "data", "config.json")
+        self._run(path)
+        doc = _j.load(open(path))
+        doc["profiles"][m.DEFAULT_PROFILE]["max_stake_pct"] = 9
+        _j.dump(doc, open(path, "w"))
+        r = self._run(path)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("invalid", r.stderr.lower())
+
+    def test_unwritable_config_dir_fails_with_a_clear_message(self):
+        r = self._run("/proc/nope/config.json")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("mounted disk", r.stderr)
+
+    def test_config_and_journal_default_to_the_same_disk(self):
+        self.assertIn("/var/data/config.json", self.text)
+        self.assertIn("/var/data", self.text)
+
+
+class TestDefaultProfileCoherence(unittest.TestCase):
+    """
+    One default, four files.
+
+    The manifests cannot import the module, so each carries a literal. Because
+    the config is written only once, a manifest disagreeing with the module
+    seeds the wrong strategy for the life of the disk.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os as _os
+        cls.here = _os.path.dirname(_os.path.abspath(__file__))
+
+    def _read(self, name):
+        import os as _os
+        path = _os.path.join(self.here, name)
+        if not _os.path.exists(path):
+            self.skipTest(f"{name} not present")
+        return open(path).read()
+
+    def test_dockerfile_agrees_with_the_module(self):
+        import re as _re
+        hit = _re.search(r"ENV\s+PROFILE=(\w+)", self._read("Dockerfile"))
+        self.assertEqual(hit.group(1), m.DEFAULT_PROFILE)
+
+    def test_render_agrees_with_the_module(self):
+        import re as _re
+        hit = _re.search(r"key:\s*PROFILE\s*\n\s*value:\s*(\w+)",
+                         self._read("render.yaml"))
+        self.assertEqual(hit.group(1), m.DEFAULT_PROFILE)
+
+    def test_entrypoint_derives_rather_than_hardcodes(self):
+        text = self._read("entrypoint.sh")
+        self.assertIn("--print-default-profile", text)
+
+    def test_print_default_profile_matches_the_constant(self):
+        import subprocess, os as _os
+        env = dict(_os.environ, BINANCE_API_KEY="k", BINANCE_API_SECRET="s")
+        r = subprocess.run(
+            [sys.executable, _os.path.join(self.here, "btc_5m_predictor.py"),
+             "--print-default-profile"], capture_output=True, text=True,
+            env=env, timeout=60)
+        self.assertEqual(r.stdout.strip(), m.DEFAULT_PROFILE)
+
+
+class TestVerificationGate(unittest.TestCase):
+    """
+    Broken code must not become a trading process.
+
+    verify.sh runs at build time (failing the build) and again at boot
+    (failing the start). These check the gate actually gates.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os as _os
+        cls.here = _os.path.dirname(_os.path.abspath(__file__))
+        cls.script = _os.path.join(cls.here, "verify.sh")
+
+    def setUp(self):
+        import os as _os
+        if not _os.path.exists(self.script):
+            self.skipTest("verify.sh not present")
+        if _os.environ.get("VERIFY_NESTED") == "1":
+            # verify.sh runs this suite, and this suite runs verify.sh.
+            # Without a depth guard that recurses forever, so the inner run
+            # skips these particular tests. The outer run still exercises them.
+            self.skipTest("nested inside verify.sh")
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _stage(self, mutate=None):
+        import shutil as _sh, os as _os, glob
+        for path in glob.glob(_os.path.join(self.here, "*.py")):
+            _sh.copy(path, self.tmp)
+        _sh.copy(self.script, self.tmp)
+        if mutate:
+            target = _os.path.join(self.tmp, "btc_5m_predictor.py")
+            text = open(target).read()
+            open(target, "w").write(mutate(text))
+
+    def _run(self, env_extra=None):
+        import subprocess, os as _os
+        env = dict(_os.environ, BINANCE_API_KEY="k", BINANCE_API_SECRET="s",
+                   VERIFY_NESTED="1")
+        env.update(env_extra or {})
+        return subprocess.run(["bash", "verify.sh"], cwd=self.tmp, env=env,
+                              capture_output=True, text=True, timeout=600)
+
+    def test_healthy_code_passes(self):
+        self._stage()
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stdout[-1500:])
+
+    def test_syntax_error_is_caught(self):
+        self._stage(lambda t: t + "\ndef broken(:\n")
+        r = self._run()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("byte-compile", r.stdout)
+
+    def test_broken_logic_is_caught(self):
+        """A function that returns a plausible constant still fails."""
+        self._stage(lambda t: t.replace(
+            "def breakeven_probability(price: float, fee_bps: int) -> float:",
+            "def breakeven_probability(price: float, fee_bps: int) -> float:\n"
+            "    return 0.5"))
+        r = self._run()
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("FAILED", r.stdout)
+
+    def test_refusal_message_is_explicit(self):
+        self._stage(lambda t: t + "\ndef broken(:\n")
+        r = self._run()
+        self.assertIn("must not trade", r.stdout)
+
+    def test_skip_verify_bypasses_everything(self):
+        self._stage(lambda t: t + "\ndef broken(:\n")
+        r = self._run({"SKIP_VERIFY": "1"})
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("NOT been checked", r.stdout)
+
+    def test_missing_connector_skips_rather_than_fails(self):
+        """The runtime image has no Node connector; that is not a violation."""
+        import os as _os
+        self._stage()
+        text = open(_os.path.join(self.tmp, "verify.sh")).read()
+        text = text.replace('"$PY" conformance.py 2>&1',
+                            '"$PY" conformance.py --connector /nonexistent 2>&1')
+        open(_os.path.join(self.tmp, "verify.sh"), "w").write(text)
+        r = self._run()
+        self.assertEqual(r.returncode, 0, r.stdout[-1000:])
+        self.assertIn("SKIP", r.stdout)
+
+    def test_mutation_testing_is_not_a_deploy_gate(self):
+        """20+ minutes of test-quality measurement must not block a restart."""
+        self.assertNotIn("mutate.py", open(self.script).read())
+
+    def test_boot_verification_skips_only_the_self_referential_tests(self):
+        """Boot must stay fast; the gate's own tests belong at build time."""
+        import os as _os
+        path = _os.path.join(self.here, "entrypoint.sh")
+        if not _os.path.exists(path):
+            self.skipTest("entrypoint.sh not present")
+        self.assertIn("VERIFY_NESTED=1 bash ./verify.sh", open(path).read())
+
+    def test_build_verification_is_the_full_run(self):
+        import os as _os
+        path = _os.path.join(self.here, "Dockerfile")
+        if not _os.path.exists(path):
+            self.skipTest("Dockerfile not present")
+        text = open(path).read()
+        build_line = [ln for ln in text.split("\n")
+                      if ln.startswith("RUN BINANCE_API_KEY=build")][0]
+        self.assertNotIn("VERIFY_NESTED", build_line)
+
+    def test_entrypoint_runs_verification_before_exec(self):
+        import os as _os
+        path = _os.path.join(self.here, "entrypoint.sh")
+        if not _os.path.exists(path):
+            self.skipTest("entrypoint.sh not present")
+        text = open(path).read()
+        self.assertLess(text.index("verify.sh"), text.index("exec python"))
+
+    def test_dockerfile_verifies_at_build_time(self):
+        import os as _os
+        path = _os.path.join(self.here, "Dockerfile")
+        if not _os.path.exists(path):
+            self.skipTest("Dockerfile not present")
+        text = open(path).read()
+        self.assertIn("RUN BINANCE_API_KEY=build", text)
+        self.assertLess(text.index("verify.sh"), text.index("ENTRYPOINT"))
+
+    def test_render_verifies_at_build_time(self):
+        import os as _os
+        path = _os.path.join(self.here, "render.yaml")
+        if not _os.path.exists(path):
+            self.skipTest("render.yaml not present")
+        text = open(path).read()
+        build = text[text.index("buildCommand"):text.index("startCommand")]
+        self.assertIn("verify.sh", build)
+
+
+class TestModeSwitching(unittest.TestCase):
+    """
+    paper <-> live, hot-reloadable but deferred.
+
+    A mid-round switch is incoherent in both directions: a paper position has
+    no real order behind it, and a real position flipped to paper stops being
+    tracked while its settlement is simulated. So the switch waits until flat.
+    """
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        fd, self.path = tempfile.mkstemp(suffix=".json"); os.close(fd)
+        self._save(m.default_config_document())
+
+    def tearDown(self):
+        for p in (self.db, self.path):
+            if os.path.exists(p):
+                os.unlink(p)
+
+    def _save(self, doc):
+        import json as _j
+        _j.dump(doc, open(self.path, "w"), indent=2)
+        future = time.time() + 5
+        os.utime(self.path, (future, future))
+
+    def _store(self, live=None):
+        return m.ConfigStore(self.path, api_key="k", api_secret="s",
+                             live=live, db_path=self.db,
+                             profile=m.DEFAULT_PROFILE)
+
+    def _set_live(self, value):
+        import json as _j
+        doc = _j.load(open(self.path))
+        doc["defaults"]["live"] = value
+        self._save(doc)
+
+    def _trader(self, store):
+        client = FakeClient([], [(0, 65_000.0)], {}, {})
+        t = build_trader(client, store.current, self.db)
+        t._store = store
+        t._static_cfg = None
+        t._active_live = store.current.live
+        return t
+
+    def test_file_governs_when_unpinned(self):
+        store = self._store(live=None)
+        self.assertFalse(store.current.live)
+        self._set_live(True)
+        self.assertTrue(store.maybe_reload())
+        self.assertTrue(store.current.live)
+
+    def test_flag_pins_and_file_cannot_override(self):
+        store = self._store(live=False)
+        self._set_live(True)
+        store.maybe_reload()
+        self.assertFalse(store.current.live)
+
+    def test_pinned_edit_is_reported_not_silent(self):
+        store = self._store(live=True)
+        self._set_live(False)
+        self.assertIn("live", " ".join(store._ignored_edits(
+            {"defaults": {"live": False}})))
+
+    def test_switch_applies_when_flat(self):
+        store = self._store(live=None)
+        t = self._trader(store)
+        self.assertFalse(t._live)
+        self._set_live(True)
+        store.maybe_reload()
+        t._apply_pending_mode()
+        self.assertTrue(t._live)
+
+    def test_switch_is_deferred_while_a_position_is_open(self):
+        store = self._store(live=None)
+        t = self._trader(store)
+        t._position = Position(1, make_round(),
+                               Signal(Side.UP, 0.9, 0.6, 0.05, 1.0, 60.0, 2.0),
+                               1.0, 1)
+        self._set_live(True)
+        store.maybe_reload()
+        t._apply_pending_mode()
+        self.assertFalse(t._live, "mode changed mid-round")
+
+    def test_switch_is_deferred_while_winnings_are_unclaimed(self):
+        store = self._store(live=None)
+        t = self._trader(store)
+        t._unredeemed = {"tok": (5.0, ["0xabc"], "56")}
+        self._set_live(True)
+        store.maybe_reload()
+        t._apply_pending_mode()
+        self.assertFalse(t._live)
+
+    def test_deferred_switch_applies_once_flat(self):
+        store = self._store(live=None)
+        t = self._trader(store)
+        t._position = Position(1, make_round(),
+                               Signal(Side.UP, 0.9, 0.6, 0.05, 1.0, 60.0, 2.0),
+                               1.0, 1)
+        self._set_live(True)
+        store.maybe_reload()
+        t._apply_pending_mode()
+        self.assertFalse(t._live)
+        t._position = None
+        t._apply_pending_mode()
+        self.assertTrue(t._live)
+
+    def test_switch_resets_the_risk_baseline(self):
+        store = self._store(live=None)
+        t = self._trader(store)
+        before = t._risk
+        t._risk.record_result(False, 0.6)
+        self._set_live(True)
+        store.maybe_reload()
+        t._apply_pending_mode()
+        self.assertIsNot(t._risk, before)
+        self.assertEqual(t._risk.consecutive_losses, 0)
+
+    def test_no_change_is_a_no_op(self):
+        store = self._store(live=None)
+        t = self._trader(store)
+        risk = t._risk
+        t._apply_pending_mode()
+        self.assertIs(t._risk, risk)
+
+    def test_live_is_not_immutable_but_is_deferred(self):
+        self.assertNotIn("live", m.IMMUTABLE_FIELDS)
+        self.assertIn("live", m.DEFERRED_FIELDS)
+
+
+class TestTradingModeEnv(unittest.TestCase):
+    """TRADING_MODE is the environment equivalent of --live/--paper."""
+
+    def setUp(self):
+        self._env = dict(os.environ)
+        os.environ["BINANCE_API_KEY"] = "k"
+        os.environ["BINANCE_API_SECRET"] = "s"
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+
+    def tearDown(self):
+        os.environ.clear(); os.environ.update(self._env)
+        os.unlink(self.db)
+
+    def _run(self, *argv):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            code = m.main([*argv, "--db", self.db])
+        return code, buf.getvalue()
+
+    def test_invalid_mode_is_rejected(self):
+        os.environ["TRADING_MODE"] = "yolo"
+        code, out = self._run("--calibration-report")
+        self.assertEqual(code, 1)
+        self.assertIn("TRADING_MODE", out)
+
+    def test_paper_and_live_are_accepted(self):
+        for value in ("paper", "live", "PAPER", "Live"):
+            os.environ["TRADING_MODE"] = value
+            code, out = self._run("--calibration-report")
+            self.assertEqual(code, 0, f"{value}: {out}")
+
+    def test_flags_are_mutually_expressive(self):
+        import inspect
+        src = inspect.getsource(m.main)
+        self.assertIn('"--paper"', src)
+        self.assertIn('"--live"', src)
+
+    def test_flag_default_is_none_so_the_file_can_govern(self):
+        import inspect, re as _re
+        src = inspect.getsource(m.main)
+        hit = _re.search(r'"--live".*?default=(\w+)', src, _re.S)
+        self.assertEqual(hit.group(1), "None")
+
+
+class TestPreflightGate(unittest.TestCase):
+    """Preflight runs at boot, where real credentials and a region exist."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os as _os
+        cls.here = _os.path.dirname(_os.path.abspath(__file__))
+
+    def _entry(self):
+        import os as _os
+        path = _os.path.join(self.here, "entrypoint.sh")
+        if not _os.path.exists(path):
+            self.skipTest("entrypoint.sh not present")
+        return open(path).read()
+
+    def test_preflight_runs_before_exec(self):
+        text = self._entry()
+        self.assertLess(text.index("--preflight"), text.index("exec python"))
+
+    def test_preflight_blocks_by_default(self):
+        self.assertIn("PREFLIGHT_REQUIRED:-1", self._entry())
+
+    def test_preflight_can_be_downgraded_to_a_warning(self):
+        self.assertIn("PREFLIGHT_REQUIRED", self._entry())
+
+    def test_preflight_can_be_skipped(self):
+        self.assertIn("SKIP_PREFLIGHT", self._entry())
+
+    def test_preflight_is_not_a_build_step(self):
+        """Build has no real credentials and may sit in a blocked region."""
+        import os as _os
+        path = _os.path.join(self.here, "Dockerfile")
+        if not _os.path.exists(path):
+            self.skipTest("Dockerfile not present")
+        self.assertNotIn("--preflight", open(path).read())
+
+
+class TestBlendedPriceCeiling(unittest.TestCase):
+    """
+    Top-ups happen at a HIGHER price, so each one drags the blend up and the
+    payout down. The ceiling is what stops "scale in more" from quietly
+    turning a 6-wins-per-loss position into a 15-wins-per-loss one.
+    """
+
+    def test_wins_per_loss_is_set_by_price_alone(self):
+        self.assertAlmostEqual(m.wins_per_loss(0.50), 1.0)
+        self.assertAlmostEqual(m.wins_per_loss(0.90), 9.0)
+        self.assertAlmostEqual(m.wins_per_loss(0.95), 19.0)
+
+    def test_wins_per_loss_rejects_impossible_prices(self):
+        for bad in (0.0, 1.0, -0.1, 1.5):
+            with self.assertRaises(ValueError):
+                m.wins_per_loss(bad)
+
+    def test_topup_below_the_cap_is_unbounded(self):
+        self.assertEqual(
+            m.max_topup_within_blend(1.0, 0.80, 0.88, 0.90), math.inf)
+
+    def test_topup_above_the_cap_is_bounded(self):
+        allowed = m.max_topup_within_blend(1.28, 0.86, 0.95, 0.90)
+        self.assertLess(allowed, math.inf)
+        self.assertGreater(allowed, 0.0)
+
+    def test_the_bound_lands_exactly_on_the_cap(self):
+        for price in (0.92, 0.95, 0.97, 0.99):
+            allowed = m.max_topup_within_blend(1.28, 0.86, price, 0.90)
+            shares = 1.28 / 0.86 + allowed / price
+            blended = (1.28 + allowed) / shares
+            self.assertAlmostEqual(blended, 0.90, places=6, msg=str(price))
+
+    def test_a_position_already_over_the_cap_cannot_top_up(self):
+        self.assertEqual(
+            m.max_topup_within_blend(1.0, 0.95, 0.96, 0.90), 0.0)
+
+    def test_higher_topup_price_permits_less(self):
+        prev = math.inf
+        for price in (0.91, 0.93, 0.95, 0.98):
+            allowed = m.max_topup_within_blend(1.28, 0.86, price, 0.90)
+            self.assertLess(allowed, prev)
+            prev = allowed
+
+    def test_rejects_invalid_inputs(self):
+        with self.assertRaises(ValueError):
+            m.max_topup_within_blend(0.0, 0.86, 0.95, 0.90)
+        with self.assertRaises(ValueError):
+            m.max_topup_within_blend(1.0, 0.0, 0.95, 0.90)
+        with self.assertRaises(ValueError):
+            m.max_topup_within_blend(1.0, 0.86, 1.0, 0.90)
+
+    def test_buffer_profile_declares_a_ceiling(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        self.assertLessEqual(c.max_blended_price, 0.95)
+        self.assertGreater(c.max_blended_price, c.min_entry_price)
+
+    def test_invalid_ceiling_is_rejected(self):
+        for bad in (0.0, 1.0, 1.5):
+            with self.assertRaises(ValueError):
+                cfg(max_blended_price=bad)
+
+
+class TestBlendCapIsPerProfile(unittest.TestCase):
+    """
+    The blend cap is only meaningful against a profile's own band.
+
+    0.90 suits buffer (0.80-0.97) and is meaningless for convex (0.05-0.35),
+    where no fill could approach it. Leaving it as a shared default would
+    repeat the pattern of one strategy's number quietly governing all of them.
+    """
+
+    def test_every_profile_declares_its_own_cap(self):
+        for name, prof in m.PROFILES.items():
+            self.assertIn("max_blended_price", prof, name)
+
+    def test_each_cap_sits_inside_its_own_band(self):
+        for name, prof in m.PROFILES.items():
+            c = Config(api_key="k", api_secret="s", **prof)
+            self.assertGreaterEqual(c.max_blended_price, c.min_entry_price, name)
+            self.assertLessEqual(c.max_blended_price, c.max_entry_price, name)
+
+    def test_cap_above_the_band_is_rejected(self):
+        """It could never bind, so it would silently do nothing."""
+        with self.assertRaises(ValueError):
+            cfg(min_entry_price=0.05, max_entry_price=0.35,
+                max_blended_price=0.90)
+
+    def test_cap_below_the_band_is_rejected(self):
+        """No position could satisfy it, so top-ups would never happen."""
+        with self.assertRaises(ValueError):
+            cfg(min_entry_price=0.80, max_entry_price=0.97,
+                max_blended_price=0.50)
+
+    def test_caps_differ_across_profiles(self):
+        caps = {Config(api_key="k", api_secret="s", **p).max_blended_price
+                for p in m.PROFILES.values()}
+        self.assertGreater(len(caps), 1, "all profiles share one cap")
+
+
+class TestOnlyBufferScalesIn(unittest.TestCase):
+    """The sizing change was requested for buffer; it must not leak."""
+
+    def test_scale_in_is_enabled_only_for_buffer(self):
+        for name, prof in m.PROFILES.items():
+            c = Config(api_key="k", api_secret="s", **prof)
+            self.assertEqual(c.scale_in, name == "buffer", name)
+
+    def test_only_buffer_opens_below_full_kelly(self):
+        for name, prof in m.PROFILES.items():
+            c = Config(api_key="k", api_secret="s", **prof)
+            mid = (c.min_entry_price + c.max_entry_price) / 2
+            full = m.kelly_stake(100.0, min(mid * 1.5, 0.99), mid, c, 200)
+            if name == "buffer":
+                self.assertLess(c.scale_in_initial_pct, 1.0)
+            else:
+                opener = full
+                self.assertAlmostEqual(opener, full, places=9, msg=name)
+
+    def test_other_profiles_keep_the_standard_opener_fraction(self):
+        for name, prof in m.PROFILES.items():
+            if name == "buffer":
+                continue
+            c = Config(api_key="k", api_secret="s", **prof)
+            self.assertAlmostEqual(c.scale_in_initial_pct, 0.4, msg=name)
+
+    def test_buffer_opens_smaller_than_the_others(self):
+        buf = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        other = Config(api_key="k", api_secret="s", **m.PROFILES["micro"])
+        self.assertLess(buf.scale_in_initial_pct, other.scale_in_initial_pct)
+
+
+class TestScaleInSizing(unittest.TestCase):
+    """The top-up should be the larger bet -- bounded, not unbounded."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _setup(self, spot_now, **over):
+        settings = dict(m.PROFILES["buffer"]); settings.update(over)
+        c = cfg(db_path=self.db, **settings)
+        start = 1_700_000_000_000
+        rnd = make_round(strike=65_000.0, start_ms=start, fee_bps=0,
+                         end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
+        path = [(start, 65_000.0), (start + 120_000, spot_now),
+                (start + m.DEFAULT_ROUND_SECONDS * 1000 + 3_000, spot_now)]
+        book = {(1, Side.UP): [(0.88, 1e6)], (1, Side.DOWN): [(0.90, 1e6)]}
+        client = FakeClient([rnd], path, book, {})
+        t = build_trader(client, c, self.db)
+        sig = Signal(Side.UP, 0.88, 0.86, 0.02, 1.0, 120.0, 1.6)
+        tid = t._journal.record("PAPER", rnd, sig, 65_000, 0.5, 100.0)
+        t._position = Position(tid, rnd, sig, 1.0, 1)
+        client.t = 1
+        return t
+
+    def test_topup_is_larger_than_the_opener(self):
+        t = self._setup(65_260.0)
+        opener = t._position.committed_usdt
+        t._maybe_scale_in(100.0)
+        added = t._position.committed_usdt - opener
+        self.assertGreater(added, opener)
+
+    def test_smaller_opener_leaves_more_room(self):
+        c_small = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        self.assertLessEqual(c_small.scale_in_initial_pct, 0.4)
+
+    def test_blend_never_exceeds_the_ceiling(self):
+        t = self._setup(65_400.0)
+        for _ in range(6):
+            t._maybe_scale_in(100.0)
+        self.assertLessEqual(t._position.signal.fill_price,
+                             t._cfg.max_blended_price + 1e-6)
+
+    def test_total_exposure_still_bounded_by_kelly(self):
+        t = self._setup(65_400.0)
+        for _ in range(6):
+            t._maybe_scale_in(100.0)
+        c = t._cfg
+        total = t._position.committed_usdt
+        self.assertLessEqual(total, (100.0 + total) * c.hard_max_stake_pct + 1e-6)
+
+    def test_no_topup_when_the_blend_would_breach(self):
+        """Opener already at the ceiling: nothing may be added above it."""
+        t = self._setup(65_400.0)
+        t._position = replace(
+            t._position,
+            signal=replace(t._position.signal, fill_price=0.90))
+        before = t._position.committed_usdt
+        t._maybe_scale_in(100.0)
+        self.assertLessEqual(t._position.signal.fill_price,
+                             t._cfg.max_blended_price + 1e-6)
+        self.assertGreaterEqual(t._position.committed_usdt, before)
+
+
+class TestDeploymentManifests(unittest.TestCase):
+    """render.yaml and the Dockerfile must agree with the entrypoint."""
+
+    @classmethod
+    def setUpClass(cls):
+        import os as _os
+        cls.here = _os.path.dirname(_os.path.abspath(__file__))
+
+    def _read(self, name):
+        import os as _os
+        path = _os.path.join(self.here, name)
+        if not _os.path.exists(path):
+            self.skipTest(f"{name} not present")
+        return open(path).read()
+
+    def test_render_region_is_not_in_the_us(self):
+        import re as _re
+        text = self._read("render.yaml")
+        region = _re.search(r"region:\s*(\w+)", text).group(1)
+        self.assertNotIn(region, ("oregon", "ohio", "virginia"))
+
+    def test_render_paths_sit_on_the_mounted_disk(self):
+        import re as _re
+        text = self._read("render.yaml")
+        mount = _re.search(r"mountPath:\s*(\S+)", text).group(1)
+        for key in ("CONFIG_PATH", "DB_PATH"):
+            value = _re.search(rf"{key}\n\s*value:\s*(\S+)", text).group(1)
+            self.assertTrue(value.startswith(mount), f"{key}={value}")
+
+    def test_render_uses_the_entrypoint(self):
+        self.assertIn("entrypoint.sh", self._read("render.yaml"))
+
+    def test_render_disables_autodeploy(self):
+        self.assertIn("autoDeploy: false", self._read("render.yaml"))
+
+    def test_dockerfile_uses_entrypoint_not_cmd_python(self):
+        text = self._read("Dockerfile")
+        self.assertIn("ENTRYPOINT", text)
+        self.assertIn("entrypoint.sh", text)
+
+    def test_dockerfile_paths_are_on_the_disk_not_the_image(self):
+        text = self._read("Dockerfile")
+        self.assertIn("CONFIG_PATH=/var/data/", text)
+        self.assertIn("DB_PATH=/var/data/", text)
 
 
 class TestJournal(unittest.TestCase):

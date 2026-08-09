@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import os
 import re
 from dataclasses import dataclass, field
 
@@ -292,6 +293,48 @@ def check_magic_numbers(src: str, tree: ast.Module, f: Findings) -> None:
                    f"(lines {lines[:6]}...) -- consider one named constant")
 
 
+def check_default_profile(src: str, tree: ast.Module, f: Findings) -> None:
+    """
+    The default profile is declared in Python; every manifest must agree.
+
+    Deployment files cannot import the module, so each carries a literal.
+    Without this check, changing DEFAULT_PROFILE leaves the Dockerfile and
+    render.yaml quietly seeding a different strategy on first boot -- and
+    since the config is written only once, that wrong default persists for
+    the life of the disk.
+    """
+    hit = re.search(r'^DEFAULT_PROFILE\s*=\s*"(\w+)"', src, re.M)
+    if not hit:
+        f.error("DEFAULT_PROFILE is not declared in the module")
+        return
+    expected = hit.group(1)
+
+    here = os.path.dirname(os.path.abspath(SOURCE_PATH)) or "."
+    manifests = {
+        "Dockerfile": r"ENV\s+PROFILE=(\w+)",
+        "render.yaml": r"key:\s*PROFILE\s*\n\s*value:\s*(\w+)",
+    }
+    for name, pattern in manifests.items():
+        path = os.path.join(here, name)
+        if not os.path.exists(path):
+            f.warn(f"{name} not found; cannot verify its default profile")
+            continue
+        found = re.search(pattern, open(path, encoding="utf-8").read())
+        if not found:
+            f.warn(f"{name} declares no PROFILE")
+        elif found.group(1) != expected:
+            f.error(f"{name} seeds profile {found.group(1)!r} but "
+                    f"DEFAULT_PROFILE is {expected!r}")
+
+    entry = os.path.join(here, "entrypoint.sh")
+    if os.path.exists(entry):
+        text = open(entry, encoding="utf-8").read()
+        literal = re.search(r'PROFILE="\$\{PROFILE:-(\w+)\}"', text)
+        if literal and literal.group(1) != expected:
+            f.error(f"entrypoint.sh hardcodes profile {literal.group(1)!r} "
+                    f"but DEFAULT_PROFILE is {expected!r}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--source", default="btc_5m_predictor.py")
@@ -304,7 +347,8 @@ def main() -> int:
     src, tree = load(args.source)
     f = Findings()
     for check in (check_config, check_dead_functions, check_attributes,
-                  check_cli, check_stale_prose, check_magic_numbers):
+                  check_cli, check_stale_prose, check_magic_numbers,
+                  check_default_profile):
         check(src, tree, f)
 
     print(f"=== COHERENCE: {args.source} ===\n")

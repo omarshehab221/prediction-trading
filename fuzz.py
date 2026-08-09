@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+fuzz.py -- property-based testing with hostile inputs.
+
+Unit tests check cases I thought of. This asserts INVARIANTS over randomly
+generated inputs, including adversarial ones (NaN, infinity, zero, negatives,
+enormous and denormal magnitudes, malformed API payloads). It finds cases I
+would not have thought to write.
+
+    python3 fuzz.py [--trials 20000] [--seed N]
+
+Exit code 0 only when every invariant holds on every trial.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+import random
+import sys
+from decimal import Decimal
+
+import btc_5m_predictor as m
+
+HOSTILE_FLOATS = [
+    0.0, -0.0, 1.0, -1.0, 1e-300, 1e300, -1e300,
+    float("inf"), float("-inf"), float("nan"),
+    sys.float_info.min, sys.float_info.max, sys.float_info.epsilon,
+]
+
+failures: list[str] = []
+
+
+def check(name: str, condition: bool, detail: str = "") -> None:
+    if not condition:
+        failures.append(f"{name}: {detail}")
+
+
+def cfg(**kw) -> m.Config:
+    base = dict(api_key="k", api_secret="s")
+    base.update(kw)
+    return m.Config(**base)
+
+
+# --------------------------------------------------------------------------
+# Pure numeric invariants
+# --------------------------------------------------------------------------
+
+
+def fuzz_digital(rng: random.Random, trials: int) -> None:
+    for _ in range(trials):
+        spot = rng.choice([rng.uniform(1e-6, 1e9), rng.uniform(5e4, 1.5e5)])
+        strike = rng.choice([rng.uniform(1e-6, 1e9), spot * rng.uniform(.9, 1.1)])
+        sigma = rng.uniform(1e-6, 50.0)
+        secs = rng.choice([0.0, rng.uniform(0, 1e6), 1e-9])
+        df = rng.choice([None, 2.0001, 2.5, 4.0, 30.0, 1e6])
+        try:
+            p = m.digital_up_probability(spot, strike, sigma, secs, df)
+        except ValueError:
+            continue                       # documented rejection
+        check("digital range", 0.0 <= p <= 1.0, f"{p} spot={spot} k={strike}")
+        check("digital finite", math.isfinite(p), str(p))
+
+    # Monotonicity: higher spot can never lower P(UP).
+    for _ in range(trials // 4):
+        strike, sigma = 100_000.0, rng.uniform(0.05, 3.0)
+        secs = rng.uniform(1, 300)
+        df = rng.choice([None, 3.0, 6.0])
+        a, b = sorted(rng.uniform(9e4, 1.1e5) for _ in range(2))
+        pa = m.digital_up_probability(a, strike, sigma, secs, df)
+        pb = m.digital_up_probability(b, strike, sigma, secs, df)
+        check("digital monotonic in spot", pb >= pa - 1e-12,
+              f"{a}->{pa}  {b}->{pb}")
+
+    # Symmetry: P(UP | S,K) + P(UP | K,S) == 1.
+    for _ in range(trials // 4):
+        s_, k_ = rng.uniform(9e4, 1.1e5), rng.uniform(9e4, 1.1e5)
+        sigma, secs = rng.uniform(0.1, 2.0), rng.uniform(1, 300)
+        df = rng.choice([None, 4.0])
+        total = (m.digital_up_probability(s_, k_, sigma, secs, df)
+                 + m.digital_up_probability(k_, s_, sigma, secs, df))
+        check("digital symmetry", abs(total - 1.0) < 1e-9, str(total))
+
+
+def fuzz_breakeven(rng: random.Random, trials: int) -> None:
+    for _ in range(trials):
+        price = rng.uniform(1e-9, 1 - 1e-9)
+        fee = rng.randint(0, 9999)
+        q = m.breakeven_probability(price, fee)
+        check("breakeven range", 0.0 < q < 1.0, f"{q} price={price} fee={fee}")
+        check("breakeven >= price", q >= price - 1e-12, f"{q} vs {price}")
+        # By construction, expected value at q must be exactly zero.
+        ev = q * (1 - price) / price * (1 - fee / 10_000) - (1 - q)
+        check("breakeven zero EV", abs(ev) < 1e-9, f"ev={ev}")
+
+
+def fuzz_kelly(rng: random.Random, trials: int) -> None:
+    for _ in range(trials):
+        c = cfg(kelly_fraction=rng.uniform(0.01, 1.0),
+                max_stake_pct=rng.uniform(0.01, 0.25),
+                min_stake_usdt=rng.choice([0.5, 1.0, 1.5]))
+        bankroll = rng.choice([0.0, -5.0, rng.uniform(0.1, 1e6)])
+        price = rng.uniform(1e-6, 1 - 1e-6)
+        q = rng.uniform(0.0, 1.0)
+        fee = rng.randint(0, 9999)
+        try:
+            stake = m.kelly_stake(bankroll, q, price, c, fee)
+        except ValueError:
+            continue
+        check("kelly non-negative", stake >= 0.0, str(stake))
+        check("kelly finite", math.isfinite(stake), str(stake))
+        if bankroll > 0:
+            check("kelly under hard cap",
+                  stake <= bankroll * c.hard_max_stake_pct + 1e-9,
+                  f"stake={stake} bankroll={bankroll}")
+        if stake > 0:
+            check("kelly meets minimum", stake >= c.min_stake_usdt - 1e-9,
+                  str(stake))
+            # Never past 2x full Kelly: beyond that, log growth is negative.
+            b = ((1 - price) / price) * (1 - fee / 10_000)
+            if b > 0:
+                full = (q * b - (1 - q)) / b
+                if full > 0:
+                    check("kelly under 2x full",
+                          (stake / bankroll) <= 2 * full + 1e-9,
+                          f"{stake/bankroll} vs {2*full}")
+        # No edge must never produce a stake.
+        if q <= m.breakeven_probability(price, fee):
+            check("no edge -> no stake", stake == 0.0,
+                  f"q={q} be={m.breakeven_probability(price, fee)} stake={stake}")
+
+
+def fuzz_walk_book(rng: random.Random, trials: int) -> None:
+    for _ in range(trials):
+        n = rng.randint(1, 8)
+        levels = sorted((rng.uniform(0.01, 0.99), rng.uniform(0.1, 1e4))
+                        for _ in range(n))
+        stake = rng.uniform(0.01, 5e4)
+        avg = m.walk_book(levels, stake)
+        if avg is None:
+            continue
+        check("avg within book", levels[0][0] - 1e-9 <= avg <= levels[-1][0] + 1e-9,
+              f"avg={avg} book={levels[0][0]}..{levels[-1][0]}")
+        check("avg is a valid price", 0.0 < avg < 1.0, str(avg))
+        shares = stake / avg
+        check("shares positive", shares > 0, str(shares))
+
+    # Hostile levels must never raise.
+    for _ in range(trials // 4):
+        levels = [(rng.choice(HOSTILE_FLOATS), rng.choice(HOSTILE_FLOATS))
+                  for _ in range(rng.randint(1, 5))]
+        try:
+            m.walk_book(levels, rng.uniform(0.1, 100))
+        except ValueError:
+            pass
+        except Exception as exc:           # noqa: BLE001 - that is the point
+            check("walk_book hostile input", False,
+                  f"{type(exc).__name__}: {exc} on {levels}")
+
+
+def fuzz_settle(rng: random.Random, trials: int) -> None:
+    for _ in range(trials):
+        stake = rng.uniform(0.01, 1e5)
+        price = rng.uniform(1e-6, 1 - 1e-6)
+        fee = rng.randint(0, 9999)
+        loss = m.settle_pnl(stake, price, False, fee)
+        win = m.settle_pnl(stake, price, True, fee)
+        check("loss is the stake", abs(loss + stake) < 1e-9, str(loss))
+        check("win positive", win > 0, f"{win} price={price} fee={fee}")
+        check("win finite", math.isfinite(win), str(win))
+        # A cheaper contract must never pay less than a dearer one.
+        cheaper = m.settle_pnl(stake, price / 2, True, fee)
+        check("cheaper pays more", cheaper >= win - 1e-9,
+              f"{cheaper} vs {win}")
+
+
+def fuzz_wei(rng: random.Random, trials: int) -> None:
+    for _ in range(trials):
+        amount = rng.choice([
+            Decimal(str(round(rng.uniform(1e-9, 1e6), 9))),
+            Decimal("1"), Decimal("0.000000000000000001"),
+        ])
+        wei = m.to_wei(amount)
+        check("wei is an integer string", wei.isdigit(), wei)
+        back = m.from_wei(wei)
+        check("wei round trip", abs(back - amount) <= Decimal("1e-18"),
+              f"{amount} -> {wei} -> {back}")
+        check("wei never rounds up", back <= amount, f"{back} > {amount}")
+
+
+# --------------------------------------------------------------------------
+# Payload robustness
+# --------------------------------------------------------------------------
+
+
+def random_json(rng: random.Random, depth: int = 0):
+    """An arbitrary JSON-ish value, including hostile scalars."""
+    if depth > 3:
+        return rng.choice([None, 0, "", [], {}])
+    kind = rng.randint(0, 7)
+    if kind == 0:
+        return None
+    if kind == 1:
+        return rng.choice(HOSTILE_FLOATS)
+    if kind == 2:
+        return rng.choice(["", "0", "abc", "-1", "1e999", "NaN", "null",
+                           "0x00", " ", "\x00"])
+    if kind == 3:
+        return rng.randint(-10**18, 10**18)
+    if kind == 4:
+        return rng.choice([True, False])
+    if kind == 5:
+        return [random_json(rng, depth + 1) for _ in range(rng.randint(0, 3))]
+    if kind == 6:
+        return {rng.choice(["price", "size", "tokenId", "name", "marketId",
+                            "status", "feeRateBps", "startPrice", "asks"]):
+                random_json(rng, depth + 1) for _ in range(rng.randint(0, 4))}
+    return rng.choice(["YES", "NO", "UP", "DOWN", "OPEN", "REGISTERED"])
+
+
+def fuzz_parsers(rng: random.Random, trials: int) -> None:
+    """Every parser must return a value or None -- never raise."""
+    for _ in range(trials):
+        payload = random_json(rng)
+        for fn, label in (
+            (m.PredictionClient._parse_round, "_parse_round"),
+            (m.PredictionClient._parse_asks, "_parse_asks"),
+            (m.PredictionClient._parse_variant, "_parse_variant"),
+        ):
+            if not isinstance(payload, dict):
+                continue
+            try:
+                fn(payload)
+            except Exception as exc:       # noqa: BLE001 - that is the point
+                check(f"{label} hostile payload", False,
+                      f"{type(exc).__name__}: {exc} on {str(payload)[:120]}")
+
+    # Well-shaped but hostile-valued market topics.
+    for _ in range(trials // 2):
+        topic = {
+            "marketTopicId": random_json(rng), "chartType": "CRYPTO_UP_DOWN",
+            "symbol": "BTCUSDT", "status": "REGISTERED",
+            "startDate": rng.choice([0, 1748131200000, random_json(rng)]),
+            "endDate": rng.choice([300000, 1748131500000, random_json(rng)]),
+            "vendor": "V", "chainId": "56", "collateral": "USDT",
+            "feeRateBps": random_json(rng), "slippageBps": random_json(rng),
+            "liquidity": random_json(rng),
+            "variantData": random_json(rng),
+            "markets": [{"marketId": random_json(rng), "tradingStatus": "OPEN",
+                         "decimalPrecision": random_json(rng),
+                         "liquidity": random_json(rng),
+                         "outcomes": [
+                             {"name": "YES", "price": random_json(rng),
+                              "tokenId": "1"},
+                             {"name": "NO", "price": random_json(rng),
+                              "tokenId": "2"}]}],
+        }
+        try:
+            rnd = m.PredictionClient._parse_round(topic)
+        except Exception as exc:           # noqa: BLE001
+            check("_parse_round hostile topic", False,
+                  f"{type(exc).__name__}: {exc}")
+            continue
+        if rnd is not None:
+            check("parsed fee in range", 0 <= rnd.fee_bps < 10_000,
+                  str(rnd.fee_bps))
+            check("parsed prices valid",
+                  0 < rnd.up_quote < 1 and 0 < rnd.down_quote < 1,
+                  f"{rnd.up_quote}/{rnd.down_quote}")
+            check("parsed precision sane", rnd.decimal_precision >= 0,
+                  str(rnd.decimal_precision))
+
+
+def fuzz_evaluate(rng: random.Random, trials: int) -> None:
+    """Any Signal returned must satisfy every configured constraint."""
+    for _ in range(trials):
+        c = cfg(**m.PROFILES[rng.choice(list(m.PROFILES))])
+        strike = rng.uniform(5e4, 1.5e5)
+        rnd = m.Round(
+            topic_id=1, market_id=1, vendor="V", slug="s",
+            start_ms=0, end_ms=c.round_seconds * 1000,
+            up_token_id="1", down_token_id="2",
+            up_quote=rng.uniform(0.01, 0.99), down_quote=rng.uniform(0.01, 0.99),
+            fee_bps=rng.randint(0, 900), chain_id="56", collateral="USDT",
+            venue_slippage_bps=1200, decimal_precision=2,
+            liquidity=rng.uniform(0, 1e6), strike=strike, feed_symbol="BTCUSDT")
+        now = rnd.end_ms - int(rng.uniform(0, 320) * 1000)
+        book = None
+        if rng.random() < 0.7:
+            book = {}
+            for side in m.Side:
+                base = rng.uniform(0.02, 0.97)
+                book[side] = sorted(
+                    (min(base + i * rng.uniform(0, .05), 0.99),
+                     rng.uniform(1, 1e5)) for i in range(rng.randint(1, 4)))
+        try:
+            sig = m.evaluate(rnd, strike * rng.uniform(0.97, 1.03),
+                             rng.uniform(0.05, 3.0), rng.uniform(1, 1e5),
+                             now, c, book, rng.choice([None, 3.0, 6.0]))
+        except Exception as exc:           # noqa: BLE001
+            check("evaluate hostile input", False,
+                  f"{type(exc).__name__}: {exc}")
+            continue
+        if sig is None:
+            continue
+        check("signal price band",
+              c.min_entry_price <= sig.fill_price <= c.max_entry_price,
+              f"{sig.fill_price} not in [{c.min_entry_price},{c.max_entry_price}]")
+        check("signal edge clears floor", sig.edge >= c.min_edge - 1e-12,
+              f"{sig.edge} < {c.min_edge}")
+        check("signal stake positive", sig.stake_usdt > 0, str(sig.stake_usdt))
+        check("signal within entry window",
+              c.entry_window_end_s <= sig.seconds_left <= c.entry_window_start_s,
+              str(sig.seconds_left))
+        check("signal prob valid", 0.0 <= sig.model_prob <= 1.0,
+              str(sig.model_prob))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--trials", type=int, default=8000)
+    ap.add_argument("--seed", type=int, default=1)
+    args = ap.parse_args()
+
+    rng = random.Random(args.seed)
+    suites = [
+        ("digital pricing", fuzz_digital),
+        ("breakeven", fuzz_breakeven),
+        ("kelly sizing", fuzz_kelly),
+        ("order book walking", fuzz_walk_book),
+        ("settlement P&L", fuzz_settle),
+        ("wei conversion", fuzz_wei),
+        ("payload parsers", fuzz_parsers),
+        ("evaluate", fuzz_evaluate),
+    ]
+    for name, fn in suites:
+        before = len(failures)
+        fn(rng, args.trials)
+        found = len(failures) - before
+        print(f"  {name:<22} {'FAIL ' + str(found) if found else 'ok'}")
+
+    print()
+    if failures:
+        print(f"{len(failures)} invariant violation(s); first 15:\n")
+        seen = set()
+        shown = 0
+        for f in failures:
+            key = f.split(":")[0]
+            if key in seen:
+                continue
+            seen.add(key)
+            print(f"  - {f[:180]}")
+            shown += 1
+            if shown >= 15:
+                break
+        return 1
+    print("All invariants held.")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

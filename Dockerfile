@@ -1,14 +1,36 @@
-# Optional: use this instead of the native Python runtime to pin the version.
 FROM python:3.12-slim
 
 WORKDIR /app
+
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY btc_5m_predictor.py .
+# The verification suite ships with the bot: it runs at build time (below) and
+# again on every boot, so a broken image never becomes a trading process.
+COPY btc_5m_predictor.py test_btc_5m.py coherence.py fuzz.py patterns.py \
+     conformance.py verify.sh entrypoint.sh ./
+RUN chmod +x verify.sh entrypoint.sh
 
-# Logs stream immediately rather than buffering, so Render's log view is live.
+# Fail the BUILD on broken code, so a bad image is never produced rather than
+# produced and then refusing to start. This is the FULL run, including the
+# tests that exercise verify.sh itself; the boot-time run skips those, since
+# they check the gate rather than the bot and would triple every restart.
+#
+# Schema conformance skips automatically here: it needs the Node connector as
+# ground truth, which is not in this image. Run it in CI, where npm exists.
+RUN BINANCE_API_KEY=build BINANCE_API_SECRET=build ./verify.sh
+
 ENV PYTHONUNBUFFERED=1
 
-# The journal lives on the mounted disk, not in the image.
-CMD ["python", "btc_5m_predictor.py", "--db", "/var/data/btc5m_journal.db", "--live"]
+# Both live on the mounted disk, never in the image: anything written into the
+# image resets on every deploy, wiping the config and splitting the journal.
+ENV CONFIG_PATH=/var/data/config.json
+ENV DB_PATH=/var/data/btc5m_journal.db
+# Only used when the config is first created; the file governs after that.
+# Must match DEFAULT_PROFILE in btc_5m_predictor.py -- coherence.py asserts it.
+ENV PROFILE=buffer
+# paper | live. Pins the mode; unset it to let config.json govern, which makes
+# the mode hot-reloadable.
+ENV TRADING_MODE=paper
+
+ENTRYPOINT ["./entrypoint.sh"]

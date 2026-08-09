@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import dataclasses
 import json
 import logging
 import math
@@ -87,7 +88,8 @@ EPS = 1e-9
 # Fallback only, for journal rows written before the fee column existed.
 DEFAULT_FEE_BPS = 200
 
-# Verified against @binance/w3w-prediction. Overridable via endpoints.json.
+# Verified against @binance/w3w-prediction. Overridable in the config
+# file under "endpoints"; run --write-config to generate one.
 # (HTTP method, path). The verb travels WITH the path: keeping them apart is
 # what produced "Request method 'GET' is not supported" on trade/get-quote.
 # Methods verified against @binance/w3w-prediction 2.0.1.
@@ -110,40 +112,6 @@ DEFAULT_ENDPOINTS: dict[str, tuple[str, str]] = {
     # Transfers are handled inline by place-order's fundTransferAmount, so
     # the standalone transfer endpoints are deliberately not wired up.
 }
-
-
-def load_endpoints(path: str = "endpoints.json") -> dict[str, tuple[str, str]]:
-    """
-    Endpoint table, optionally overridden from JSON.
-
-    An override may be a bare path string (method preserved) or a
-    ["METHOD", "/path"] pair.
-    """
-    eps = dict(DEFAULT_ENDPOINTS)
-    if os.path.exists(path):
-        try:
-            with open(path) as fh:
-                override = json.load(fh)
-            if not isinstance(override, dict):
-                raise ValueError("expected a JSON object")
-            unknown = set(override) - set(eps)
-            if unknown:
-                raise ValueError(f"unknown endpoint keys: {sorted(unknown)}")
-            for k, v in override.items():
-                if isinstance(v, str):
-                    eps[k] = (eps[k][0], v)
-                elif isinstance(v, list) and len(v) == 2:
-                    method = str(v[0]).upper()
-                    if method not in ("GET", "POST", "PUT", "DELETE"):
-                        raise ValueError(f"bad HTTP method for {k}: {v[0]}")
-                    eps[k] = (method, str(v[1]))
-                else:
-                    raise ValueError(f"{k}: expected a path or [method, path]")
-            LOG.info("Loaded %d endpoint override(s) from %s",
-                     len(override), path)
-        except (OSError, json.JSONDecodeError, ValueError) as exc:
-            raise SystemExit(f"Bad {path}: {exc}")
-    return eps
 
 
 # --------------------------------------------------------------------------
@@ -232,6 +200,22 @@ class Config:
     scale_in: bool = False
     scale_in_initial_pct: float = 0.4     # first tranche, as a share of target
     scale_in_min_topup: float = 1.0       # skip top-ups below the order min
+    # Ceiling on the BLENDED fill price across all tranches of one round.
+    #
+    # This is the knob that controls "how many wins does it take to cover a
+    # loss", because that number is 1/((1-p)/p) at the blended price p and
+    # nothing else. Top-ups happen when the round has moved our way, which
+    # means the price has RISEN -- so every top-up drags the blended price up
+    # and the payout down. Left unbounded, a large top-up at 0.95 can turn a
+    # 6-wins-per-loss position into a 15-wins-per-loss one.
+    #
+    # A top-up is trimmed to whatever keeps the blend under this cap, and
+    # skipped if that leaves less than the minimum order.
+    #
+    # Meaningful only relative to a profile's own band, so every profile sets
+    # it: 0.90 suits buffer (0.80-0.97) and is inert for convex (0.05-0.35),
+    # where no fill could ever approach it. Validated against the band below.
+    max_blended_price: float = 0.90
     # The connector documents ~1.5 USDT as an APPROXIMATE MARKET-order
     # minimum that "varies by market depth"; the account minimum is 1.00.
     # Small MARKET orders may be rejected on a thin book -- that surfaces as a
@@ -301,12 +285,9 @@ class Config:
     round_duration_tolerance: float = 0.10    # fraction of the target length
     quote_consistency_tolerance: float = 0.10
     market_list_limit: int = 50
-    # The venue caps this endpoint's page size at 100 (its documented
-    # range is 1-100); anything above that is rejected outright with
-    # -1102 "mandatory parameter ... malformed", which makes every
-    # settled-history lookup fail closed. 100 is therefore both the
-    # safe default and the ceiling enforced below.
-    settled_history_limit: int = 100
+    # 50 could silently miss an older settlement and leave a position
+    # looking unresolved when the venue had already settled it.
+    settled_history_limit: int = 200
 
     db_path: str = "btc5m_journal.db"
     # Print the calibration report to the log every N settled trades. On a
@@ -339,15 +320,24 @@ class Config:
             raise ValueError("min_buffer_sigmas must be non-negative")
         if not 0 < self.scale_in_initial_pct <= 1.0:
             raise ValueError("scale_in_initial_pct must be in (0, 1]")
+        if not 0 < self.max_blended_price < 1.0:
+            raise ValueError("max_blended_price must be in (0, 1)")
+        if not (self.min_entry_price <= self.max_blended_price
+                <= self.max_entry_price):
+            # Above the band it can never bind; below it, no position could
+            # ever satisfy it and top-ups would never happen. Either way the
+            # setting silently does nothing, which is worse than an error.
+            raise ValueError(
+                f"max_blended_price {self.max_blended_price} must lie within "
+                f"the entry band {self.min_entry_price}-{self.max_entry_price}")
         if not 0 < self.assumed_spread_pct < 1.0:
             raise ValueError("assumed_spread_pct must be in (0, 1)")
         if not self.symbol:
             raise ValueError("symbol must not be empty")
         if not 0 < self.round_duration_tolerance < 1.0:
             raise ValueError("round_duration_tolerance must be in (0, 1)")
-        if not 1 <= self.settled_history_limit <= 100:
-            raise ValueError("settled_history_limit must be in [1, 100] -- "
-                              "the venue rejects anything above 100")
+        if self.settled_history_limit < 1:
+            raise ValueError("settled_history_limit must be positive")
         for name in ("clock_resync_s", "settle_grace_s", "settle_timeout_s",
                      "drain_timeout_s", "drain_poll_s", "prune_after_s",
                      "vol_cache_s", "error_backoff_max_s"):
@@ -407,7 +397,10 @@ PROFILES: dict[str, dict] = {
                    # cautiously than a mid-price strategy would.
                    kelly_fraction=0.20,
                    min_liquidity=0.0, max_rounds_per_day=200,
-                   paper_start_bankroll=100.0),
+                   paper_start_bankroll=100.0,
+                   # Inert here unless scale_in is enabled; sized to this
+                   # profile's own band (0.05-0.35), not buffer's.
+                   max_blended_price=0.3),
     # Symmetric: trades anywhere it finds an edge. Higher hit rate, smaller
     # payoffs, and correspondingly larger individual losses.
     "balanced": dict(max_entry_price=0.90, min_entry_price=0.10,
@@ -417,7 +410,10 @@ PROFILES: dict[str, dict] = {
                      daily_loss_limit_pct=0.20, assumed_spread_pct=0.06,
                    kelly_fraction=0.25,
                      min_liquidity=0.0, max_rounds_per_day=200,
-                     paper_start_bankroll=100.0),
+                     paper_start_bankroll=100.0,
+                     # Inert here unless scale_in is enabled; sized to this
+                     # profile's own band (0.10-0.90), not buffer's.
+                     max_blended_price=0.8),
     # For small accounts, where a percentage cap would fall under the venue's
     # order minimum and the bot would simply never trade. Targets the 0.40-0.75
     # band -- roughly 30-150% return per win. Those are large PERCENTAGE wins
@@ -447,7 +443,10 @@ PROFILES: dict[str, dict] = {
                    kelly_fraction=0.25,
                      min_liquidity=0.0, max_rounds_per_day=200,
                      entry_window_start_s=120, entry_window_end_s=20,
-                     max_consecutive_losses=10, paper_start_bankroll=25.0),
+                     max_consecutive_losses=10, paper_start_bankroll=25.0,
+                     # Inert here unless scale_in is enabled; sized to this
+                     # profile's own band (0.55-0.80), not buffer's.
+                     max_blended_price=0.72),
     # YOUR METHOD, encoded. Wait for a large buffer late in the round, then
     # size up. Trades the 0.80-0.97 band, which every other profile refuses.
     #
@@ -483,8 +482,17 @@ PROFILES: dict[str, dict] = {
                    # Near-certainties late in a round sit in thin books, and
                    # this is the one profile where an empty book is common.
                    min_liquidity=1000.0, max_rounds_per_day=250,
-                   scale_in=True, scale_in_initial_pct=0.4,
+                   # A smaller first tranche leaves more room to add once the
+                   # round has proven itself, so the top-up genuinely is the
+                   # larger bet -- roughly 4x the opener rather than 1.5x.
+                   # Total exposure is still bounded by Kelly, and by the
+                   # blended-price cap below.
+                   scale_in=True, scale_in_initial_pct=0.25,
                    scale_in_min_topup=1.0,
+                   # Never let the blend past 0.90: about nine wins per loss.
+                   # Raise it for a higher hit rate and smaller wins; lower it
+                   # for bigger wins and fewer of them.
+                   max_blended_price=0.90,
                    entry_window_start_s=180, entry_window_end_s=15,
                    max_consecutive_losses=6, paper_start_bankroll=25.0),
     "micro": dict(max_entry_price=0.75, min_entry_price=0.35,
@@ -503,8 +511,266 @@ PROFILES: dict[str, dict] = {
                    kelly_fraction=0.25,
                   min_liquidity=0.0, max_rounds_per_day=200,
                   entry_window_start_s=200, entry_window_end_s=25,
-                  max_consecutive_losses=10, paper_start_bankroll=7.0),
+                  max_consecutive_losses=10, paper_start_bankroll=7.0,
+                  # Inert here unless scale_in is enabled; sized to this
+                  # profile's own band (0.35-0.75), not buffer's.
+                  max_blended_price=0.65),
 }
+
+
+# --------------------------------------------------------------------------
+# Configuration file and hot reload
+# --------------------------------------------------------------------------
+
+# The default strategy, declared once. Previously six literals across four
+# files each carried their own copy of this, which is precisely how a default
+# drifts: change five and the sixth silently disagrees.
+DEFAULT_PROFILE = "buffer"
+
+# Fields that cannot change while the bot is running. Swapping any of these
+# mid-flight would leave the process in a state that does not match what it
+# already did: a different journal would split one session's record across two
+# files, a different key would sign with credentials the open position was not
+# opened under. They are read once at startup and ignored on reload.
+IMMUTABLE_FIELDS = frozenset({
+    "api_key", "api_secret", "db_path", "endpoints", "profile_name",
+})
+
+# `live` is reloadable but NOT applied instantly. Switching mode while a
+# position is open is incoherent in both directions: a paper position has no
+# real order behind it, so live settlement would look for a venue position
+# that never existed; and a real position flipped to paper stops being
+# tracked while its settlement is simulated. The Trader therefore defers a
+# mode change until it is flat, and resets the bankroll baseline on the swap.
+DEFERRED_FIELDS = frozenset({"live"})
+
+CONFIG_SCHEMA_NOTE = (
+    "Every setting lives here. 'profiles' holds the named strategies, "
+    "'active_profile' selects one, and 'overrides' is applied on top of it. "
+    "The file is re-read whenever it changes on disk -- no restart needed. "
+    "Fields listed in immutable_fields are fixed at startup."
+)
+
+
+def default_config_document(active_profile: str = DEFAULT_PROFILE) -> dict:
+    """The full configuration as a plain document, ready to serialise."""
+    base = {f.name: f.default for f in dataclasses.fields(Config)
+            if f.default is not dataclasses.MISSING}
+    # Every immutable field is excluded, not just the secrets. Emitting them
+    # would make the file warn "these were ignored" on every single reload,
+    # training the reader to ignore a warning that matters when it is real.
+    for name in IMMUTABLE_FIELDS:
+        base.pop(name, None)
+    base = {k: (list(v) if isinstance(v, tuple) else v)
+            for k, v in base.items()}
+    return {
+        "_note": CONFIG_SCHEMA_NOTE,
+        "_immutable_fields": sorted(IMMUTABLE_FIELDS),
+        "active_profile": active_profile,
+        "defaults": base,
+        "profiles": {name: dict(values) for name, values in PROFILES.items()},
+        "overrides": {},
+        "endpoints": {k: list(v) for k, v in DEFAULT_ENDPOINTS.items()},
+    }
+
+
+def _coerce(name: str, value: object) -> object:
+    """Match a JSON value to the dataclass field's declared type."""
+    hints = {f.name: f.type for f in dataclasses.fields(Config)}
+    declared = str(hints.get(name, ""))
+    if "tuple" in declared and isinstance(value, list):
+        return tuple(tuple(x) if isinstance(x, list) else x for x in value)
+    if "int" in declared and "float" not in declared and isinstance(value, float):
+        if value != int(value):
+            raise ValueError(f"{name} must be a whole number, got {value}")
+        return int(value)
+    return value
+
+
+def build_config(document: dict, *, api_key: str, api_secret: str,
+                 live: Optional[bool], db_path: str,
+                 profile: Optional[str] = None,
+                 overrides: Optional[dict] = None) -> Config:
+    """
+    Assemble a Config from a configuration document.
+
+    Layering is explicit and one-directional: defaults, then the selected
+    profile, then the document's overrides, then any command-line overrides.
+    Everything passes through a single mapping so a key can never be supplied
+    twice.
+    """
+    if not isinstance(document, dict):
+        raise ValueError("configuration must be a JSON object")
+
+    profiles = document.get("profiles") or {}
+    name = profile or document.get("active_profile") or DEFAULT_PROFILE
+    if name not in profiles:
+        raise ValueError(
+            f"unknown profile {name!r}; available: {sorted(profiles) or 'none'}")
+
+    settings: dict = {}
+    for layer in (document.get("defaults") or {}, profiles[name],
+                  document.get("overrides") or {}, overrides or {}):
+        for key, value in layer.items():
+            if key.startswith("_"):
+                continue
+            settings[key] = value
+
+    known = {f.name for f in dataclasses.fields(Config)}
+    unknown = set(settings) - known
+    if unknown:
+        raise ValueError(f"unknown setting(s): {sorted(unknown)}")
+
+    # A pinned value (CLI flag or environment) wins over the file and is not
+    # hot-reloadable; without a pin the file governs and can be changed live.
+    pinned_live = live is not None
+    settings = {k: _coerce(k, v) for k, v in settings.items()
+                if k not in IMMUTABLE_FIELDS}
+    if pinned_live:
+        settings["live"] = live
+    elif "live" not in settings:
+        settings["live"] = False
+
+    endpoints = dict(DEFAULT_ENDPOINTS)
+    for key, value in (document.get("endpoints") or {}).items():
+        if key not in endpoints:
+            raise ValueError(f"unknown endpoint {key!r}")
+        if isinstance(value, str):
+            endpoints[key] = (endpoints[key][0], value)
+        elif isinstance(value, (list, tuple)) and len(value) == 2:
+            method = str(value[0]).upper()
+            if method not in ("GET", "POST", "PUT", "DELETE"):
+                raise ValueError(f"bad HTTP method for {key}: {value[0]}")
+            endpoints[key] = (method, str(value[1]))
+        else:
+            raise ValueError(f"{key}: expected a path or [method, path]")
+
+    settings.update(api_key=api_key, api_secret=api_secret,
+                    db_path=db_path, profile_name=name,
+                    endpoints=tuple(endpoints.items()))
+    return Config(**settings)
+
+
+class ConfigStore:
+    """
+    Holds the live configuration and reloads it when the file changes.
+
+    Reload is atomic and fail-safe: the new document is parsed and a Config is
+    fully constructed before anything is swapped, so a malformed or invalid
+    file leaves the running bot on its last good configuration rather than
+    crashing it mid-position. Immutable fields are ignored on reload and
+    reported, so an edit that appears to take effect but cannot is visible
+    rather than silent.
+    """
+
+    def __init__(self, path: Optional[str], *, api_key: str, api_secret: str,
+                 live: Optional[bool], db_path: str,
+                 profile: Optional[str] = None,
+                 overrides: Optional[dict] = None) -> None:
+        self._path = path
+        self._identity = dict(api_key=api_key, api_secret=api_secret,
+                              live=live, db_path=db_path, profile=profile,
+                              overrides=overrides or {})
+        self._mtime: Optional[float] = None
+        self._document = self._read()
+        self._current = build_config(self._document, **self._as_kwargs())
+        self.reload_count = 0
+
+    def _as_kwargs(self) -> dict:
+        d = dict(self._identity)
+        return dict(api_key=d["api_key"], api_secret=d["api_secret"],
+                    live=d["live"], db_path=d["db_path"],
+                    profile=d["profile"], overrides=d["overrides"])
+
+    def _read(self) -> dict:
+        if not self._path:
+            return default_config_document()
+        with open(self._path, encoding="utf-8") as fh:
+            document = json.load(fh)
+        self._mtime = os.path.getmtime(self._path)
+        return document
+
+    @property
+    def current(self) -> Config:
+        return self._current
+
+    @property
+    def path(self) -> Optional[str]:
+        return self._path
+
+    def changed_on_disk(self) -> bool:
+        if not self._path:
+            return False
+        try:
+            return os.path.getmtime(self._path) != self._mtime
+        except OSError as exc:
+            # Expected transiently: many editors replace a file rather than
+            # writing in place, so it can vanish for an instant. Logged so a
+            # permanently missing file is visible rather than looking like
+            # "nothing changed" forever.
+            LOG.debug("Config file not readable right now: %s", exc)
+            return False
+
+    def maybe_reload(self) -> bool:
+        """
+        Re-read the file if it changed. Returns True when the config swapped.
+
+        Never raises: a bad edit is reported and the previous configuration
+        stays in force.
+        """
+        if not self.changed_on_disk():
+            return False
+        try:
+            document = self._read()
+            candidate = build_config(document, **self._as_kwargs())
+        except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
+            LOG.error("Config reload REJECTED, keeping the previous one: %s",
+                      exc)
+            return False
+
+        ignored = self._ignored_edits(document)
+        if ignored:
+            LOG.warning("These settings cannot change while running and were "
+                        "ignored: %s. Restart to apply them.",
+                        ", ".join(sorted(ignored)))
+
+        changes = self._diff(self._current, candidate)
+        self._document, self._current = document, candidate
+        self.reload_count += 1
+        if changes:
+            LOG.info("Config reload #%d (%d change(s)): %s",
+                     self.reload_count, len(changes),
+                     "; ".join(changes[:8]))
+        else:
+            LOG.info("Config file changed but no effective setting differed")
+        return True
+
+    @property
+    def live_is_pinned(self) -> bool:
+        """True when a CLI flag or environment variable fixed the mode."""
+        return self._identity["live"] is not None
+
+    def _ignored_edits(self, document: dict) -> set[str]:
+        present: set[str] = set()
+        for layer in (document.get("defaults") or {},
+                      document.get("overrides") or {}):
+            present |= set(layer)
+        ignored = present & IMMUTABLE_FIELDS
+        if "live" in present and self.live_is_pinned:
+            ignored = ignored | {"live (pinned by --live/--paper or "
+                                 "TRADING_MODE)"}
+        return ignored
+
+    @staticmethod
+    def _diff(old: Config, new: Config) -> list[str]:
+        out = []
+        for f in dataclasses.fields(Config):
+            if f.name in ("api_key", "api_secret", "endpoints"):
+                continue
+            a, b = getattr(old, f.name), getattr(new, f.name)
+            if a != b:
+                out.append(f"{f.name}: {a} -> {b}")
+        return out
 
 
 # --------------------------------------------------------------------------
@@ -971,13 +1237,19 @@ def walk_book(asks: list[tuple[float, float]], stake_usdt: float
 class VolatilityEstimator:
     """Annualised sigma AND tail thickness from recent 1m returns."""
 
-    def __init__(self, cfg: Config, session: requests.Session) -> None:
-        self._cfg = cfg
+    def __init__(self, cfg: Config | "ConfigStore",
+                 session: requests.Session) -> None:
+        self._store = None if isinstance(cfg, Config) else cfg
+        self._static_cfg = cfg if isinstance(cfg, Config) else None
         self._session = session
         self._cache: dict[str, tuple[float, float]] = {}
         self._df_cache: dict[str, Optional[float]] = {}
         self._clamped: dict[str, bool] = {}
         self._raw: dict[str, float] = {}
+
+    @property
+    def _cfg(self) -> Config:
+        return self._static_cfg if self._store is None else self._store.current
 
     def sigma_annual(self, symbol: Optional[str] = None) -> float:
         symbol = symbol or self._cfg.symbol
@@ -1062,8 +1334,10 @@ class VolatilityEstimator:
 class RiskManager:
     """Owns every reason to stop. Fails closed on all of them."""
 
-    def __init__(self, cfg: Config, starting_bankroll: float) -> None:
-        self._cfg = cfg
+    def __init__(self, cfg: Config | "ConfigStore",
+                 starting_bankroll: float) -> None:
+        self._store = None if isinstance(cfg, Config) else cfg
+        self._static_cfg = cfg if isinstance(cfg, Config) else None
         self._day_start_bankroll = max(starting_bankroll, EPS)
         self._day_key = time.strftime("%Y-%m-%d")
         self.consecutive_losses = 0
@@ -1076,6 +1350,10 @@ class RiskManager:
         self._variance = 0.0
         self._actual_wins = 0
         self._samples = 0
+
+    @property
+    def _cfg(self) -> Config:
+        return self._static_cfg if self._store is None else self._store.current
 
     def calibration_z(self) -> Optional[float]:
         """
@@ -1163,13 +1441,37 @@ class PredictionClient:
     duration_tolerance: float = 0.10
     symbol: str = "BTCUSDT"
 
-    def __init__(self, cfg: Config) -> None:
-        self._cfg = cfg
+    def __init__(self, cfg: Config | "ConfigStore") -> None:
+        # Accepts either a Config or a ConfigStore. With a store, `_cfg`
+        # resolves to the current configuration on every access, so a hot
+        # reload takes effect without rebuilding the client or its session.
+        self._store: Optional["ConfigStore"] = None
+        self._static_cfg: Optional[Config] = None
+        if isinstance(cfg, Config):
+            self._static_cfg = cfg
+        else:
+            self._store = cfg
+        cfg = self._cfg
         self._session = requests.Session()
         self._session.headers.update({"X-MBX-APIKEY": cfg.api_key})
         self._clock_offset_ms = 0
         self._wallet: Optional[WalletRef] = None
         self._symbol_cache: dict[str, str] = {}
+        self.apply_config(cfg)
+    @property
+    def _cfg(self) -> Config:
+        return self._static_cfg if self._store is None else self._store.current
+
+    @staticmethod
+    def apply_config(cfg: Config) -> None:
+        """
+        Push settings that _parse_round reads as class attributes.
+
+        _parse_round is a staticmethod (it validates untrusted payloads with
+        no instance to hand), so these must be refreshed whenever the config
+        changes -- otherwise a hot reload would update everything except
+        parsing, and the two would silently disagree.
+        """
         PredictionClient.round_target_ms = cfg.round_seconds * 1000
         PredictionClient.open_statuses = cfg.open_statuses
         PredictionClient.tradable_status = cfg.tradable_status
@@ -2408,6 +2710,45 @@ def evaluate(rnd: Round, spot: float, sigma: float, bankroll: float,
     return best
 
 
+def max_topup_within_blend(committed: float, avg_price: float,
+                           topup_price: float, cap: float) -> float:
+    """
+    Largest top-up that keeps the blended fill price at or under `cap`.
+
+    Solving (S+t)/(S/p0 + t/p1) <= cap for t gives
+        t <= S * (cap/p0 - 1) / (1 - cap/p1)
+
+    When the top-up price is already at or below the cap the denominator is
+    non-positive, meaning no amount of buying can push the blend over it, so
+    the size is unbounded here and only Kelly limits it. Returns 0.0 when the
+    position is already at or above the cap.
+    """
+    if not 0.0 < avg_price < 1.0 or not 0.0 < topup_price < 1.0:
+        raise ValueError("prices must be in (0, 1)")
+    if committed <= 0:
+        raise ValueError("committed must be positive")
+    if avg_price > cap:
+        return 0.0                      # already past the ceiling
+    if topup_price <= cap:
+        return math.inf                 # cannot breach it by buying here
+
+    # Here avg_price <= cap < topup_price, so both terms are positive and
+    # the bound is real. (An earlier version guarded on denominator >= 0 and
+    # returned "unbounded" for exactly the case that needs bounding.)
+    numerator = committed * (cap / avg_price - 1.0)
+    denominator = 1.0 - cap / topup_price
+    if denominator <= 0:
+        return math.inf
+    return max(numerator / denominator, 0.0)
+
+
+def wins_per_loss(price: float) -> float:
+    """How many wins at this price it takes to cover one full-stake loss."""
+    if not 0.0 < price < 1.0:
+        raise ValueError("price must be in (0, 1)")
+    return price / (1.0 - price)
+
+
 def settle_pnl(stake: float, fill_price: float, won: bool,
                fee_bps: int) -> float:
     """Realised P&L for one resolved contract (paper mode)."""
@@ -2434,12 +2775,21 @@ class Trader:
     silently corrupts the calibration record on every redeploy.
     """
 
-    def __init__(self, cfg: Config) -> None:
-        self._cfg = cfg
+    def __init__(self, cfg: Config | "ConfigStore") -> None:
+        self._store: Optional["ConfigStore"] = None
+        self._static_cfg: Optional[Config] = None
+        if isinstance(cfg, Config):
+            self._static_cfg = cfg
+        else:
+            self._store = cfg
+        # Resolve once for construction. A ConfigStore has no config fields of
+        # its own, so reading cfg.db_path off the argument would fail; every
+        # later read goes through the _cfg property and sees reloads.
+        config = self._resolve(cfg)
         self._client = PredictionClient(cfg)
         self._vol = VolatilityEstimator(cfg, self._client.session)
-        self._journal = Journal(cfg.db_path, cfg.profile_name)
-        self._paper_bankroll = cfg.paper_start_bankroll
+        self._journal = Journal(config.db_path, config.profile_name)
+        self._paper_bankroll = config.paper_start_bankroll
         self._risk: Optional[RiskManager] = None
         self._seen: dict[int, int] = {}
         self._position: Optional[Position] = None
@@ -2450,6 +2800,53 @@ class Trader:
         self._unredeemed: dict[str, tuple[float, list[str], str]] = {}
         self._stopping = False
         self._settled_count = 0
+        # The mode actually in force. Diverges from the config only while a
+        # position is open and a switch is pending.
+        self._active_live = config.live
+
+    @staticmethod
+    def _resolve(cfg: Config | "ConfigStore") -> Config:
+        return cfg if isinstance(cfg, Config) else cfg.current
+
+    @property
+    def _cfg(self) -> Config:
+        return self._static_cfg if self._store is None else self._store.current
+
+    @property
+    def _live(self) -> bool:
+        """
+        The mode in force right now.
+
+        Reads the ACTIVE mode rather than the configured one, so a pending
+        switch cannot take effect halfway through a round. Every decision that
+        turns on paper-vs-live goes through here.
+        """
+        return self._active_live
+
+    def _apply_pending_mode(self) -> None:
+        """Adopt a configured mode change, but only while flat."""
+        wanted = self._cfg.live
+        if wanted == self._active_live:
+            return
+        if self._position is not None or self._unredeemed:
+            LOG.info("Mode change to %s is pending: waiting until flat "
+                     "(open position or unclaimed winnings)",
+                     "LIVE" if wanted else "PAPER")
+            return
+
+        self._active_live = wanted
+        # The bankroll means something different in each mode, so the risk
+        # baseline and streak counters would otherwise carry across a switch
+        # and misreport the first day in the new mode.
+        try:
+            bankroll = self._bankroll()
+        except (ApiError, requests.RequestException) as exc:
+            LOG.error("Switched to %s but could not read the balance: %s",
+                      "LIVE" if wanted else "PAPER", exc)
+            return
+        self._risk = RiskManager(self._store or self._cfg, bankroll)
+        LOG.warning("MODE NOW %s -- bankroll %.2f, risk counters reset",
+                    "LIVE" if wanted else "PAPER", bankroll)
 
     def _bankroll(self) -> float:
         """
@@ -2457,7 +2854,7 @@ class Trader:
         credited on chain. Excluding them would make a winning streak look
         like a drawdown and falsely trip the daily loss limit.
         """
-        if not self._cfg.live:
+        if not self._live:
             return self._paper_bankroll
         pending = sum(v for v, _, _ in self._unredeemed.values())
         return self._client.balance_usdt() + pending
@@ -2527,11 +2924,10 @@ class Trader:
                 LOG.debug("Could not install a handler for %s", sig)
 
     def run(self) -> None:
-        mode = "LIVE" if self._cfg.live else "PAPER"
         self._install_signal_handlers()
         try:
             self._client.sync_clock()
-            if self._cfg.live:
+            if self._live:
                 w = self._client.wallet()
                 LOG.info("Prediction wallet %s", w.address)
                 try:
@@ -2547,7 +2943,8 @@ class Trader:
             return
 
         self._risk = RiskManager(self._cfg, bankroll)
-        LOG.info("Starting %s mode. Bankroll %.2f USDT", mode, bankroll)
+        LOG.info("Starting %s mode. Bankroll %.2f USDT",
+                 "LIVE" if self._live else "PAPER", bankroll)
         last_sync = time.time()
 
         try:
@@ -2555,18 +2952,24 @@ class Trader:
                 if self._stopping:
                     raise Shutdown("stop signal received")
                 try:
+                    if self._store is not None and self._store.maybe_reload():
+                        # Parsing reads class attributes, so refresh them
+                        # whenever the configuration swaps.
+                        PredictionClient.apply_config(self._cfg)
                     if time.time() - last_sync > self._cfg.clock_resync_s:
                         self._client.sync_clock()
                         last_sync = time.time()
 
-                    if self._cfg.live and self._unredeemed:
+                    if self._live and self._unredeemed:
                         self._poll_redemptions()
                         self._retry_failed_claims()
                     self._settle_open()
                     bankroll = self._bankroll()
                     self._risk.check(bankroll)
+                    self._apply_pending_mode()
                     if self._position is None:
-                        self._maybe_enter(bankroll, mode)
+                        self._maybe_enter(bankroll,
+                                          "LIVE" if self._live else "PAPER")
                     else:
                         self._maybe_scale_in(bankroll)
                     self._errors = 0
@@ -2661,7 +3064,23 @@ class Trader:
                 sig = replace(sig, stake_usdt=min(first, sig.stake_usdt))
 
             order_id = None
-            if self._cfg.live:
+            if self._live:
+                # Re-read the balance immediately before committing. The
+                # figure from the top of the loop is seconds old and may
+                # predate a settlement, a redemption landing, or a manual
+                # withdrawal -- sizing from it can request more than the
+                # account holds, which the venue rejects with -9000.
+                fresh = self._live_bankroll("entry")
+                if fresh is None:
+                    continue
+                if fresh < bankroll:
+                    sig = self._resize(sig, rnd, fresh)
+                    if sig is None:
+                        continue
+                if sig.stake_usdt > fresh:
+                    LOG.warning("Stake %.2f exceeds the live balance %.2f; "
+                                "skipping", sig.stake_usdt, fresh)
+                    continue
                 quote = self._client.get_quote(rnd, sig.side, sig.stake_usdt)
 
                 # The quote is authoritative. Re-apply every price filter to it
@@ -2760,13 +3179,35 @@ class Trader:
         target = kelly_stake(bankroll + pos.committed_usdt, prob, price,
                              self._cfg, pos.rnd.fee_bps)
         topup = target - pos.committed_usdt
-        if topup < max(self._cfg.scale_in_min_topup, self._cfg.min_stake_usdt):
+        floor = max(self._cfg.scale_in_min_topup, self._cfg.min_stake_usdt)
+        if topup < floor:
             return
+
+        # Trim so the blended fill stays under the ceiling. Without this a
+        # top-up at a high price silently converts a position that needed six
+        # wins per loss into one needing fifteen.
+        allowed = max_topup_within_blend(
+            pos.committed_usdt, pos.signal.fill_price, price,
+            self._cfg.max_blended_price)
+        if allowed < floor:
+            LOG.debug("No top-up for %s: blended price would exceed %.2f",
+                      pos.rnd.slug, self._cfg.max_blended_price)
+            return
+        if topup > allowed:
+            LOG.info("Trimming top-up %.2f -> %.2f to hold the blended price "
+                     "under %.2f", topup, allowed,
+                     self._cfg.max_blended_price)
+            topup = allowed
         avg = walk_book(levels, topup)
         if avg is None or not clears_edge(prob, avg, self._cfg, pos.rnd.fee_bps):
             return
 
-        if self._cfg.live:
+        if self._live:
+            fresh = self._live_bankroll("scale-in")
+            if fresh is None or topup > fresh:
+                LOG.info("Skipping top-up: %.2f needed, %.2f available",
+                         topup, fresh if fresh is not None else -1.0)
+                return
             quote = self._client.get_quote(pos.rnd, pos.signal.side, topup)
             if quote.average_price > self._cfg.max_entry_price:
                 return
@@ -2783,8 +3224,9 @@ class Trader:
 
         blended = pos.average_price(topup, avg)
         LOG.info("SCALE-IN %s +%.2f at %.3f (prob %.3f, %.0fs left) -> "
-                 "committed %.2f, avg %.3f", pos.rnd.slug, topup, avg, prob,
-                 secs, pos.committed_usdt + topup, blended)
+                 "committed %.2f, blended %.3f, %.1f wins per loss",
+                 pos.rnd.slug, topup, avg, prob, secs,
+                 pos.committed_usdt + topup, blended, wins_per_loss(blended))
 
         self._position = replace(
             pos,
@@ -2792,6 +3234,33 @@ class Trader:
                            stake_usdt=pos.committed_usdt + topup),
             committed_usdt=pos.committed_usdt + topup,
             tranches=pos.tranches + 1)
+
+    def _live_bankroll(self, context: str) -> Optional[float]:
+        """Freshly read tradable balance, or None if it cannot be read."""
+        try:
+            return self._bankroll()
+        except (ApiError, requests.RequestException) as exc:
+            LOG.warning("Could not confirm the balance before %s: %s",
+                        context, exc)
+            return None
+
+    def _resize(self, sig: Signal, rnd: Round,
+                bankroll: float) -> Optional[Signal]:
+        """Re-derive the stake against a balance that has since changed."""
+        stake = kelly_stake(bankroll, sig.model_prob, sig.fill_price,
+                            self._cfg, rnd.fee_bps)
+        if stake <= 0:
+            LOG.info("Balance fell to %.2f; no stake clears the limits now",
+                     bankroll)
+            return None
+        if self._cfg.scale_in:
+            first = max(stake * self._cfg.scale_in_initial_pct,
+                        self._cfg.min_stake_usdt)
+            stake = min(first, stake)
+        if abs(stake - sig.stake_usdt) > EPS:
+            LOG.info("Resized %.2f -> %.2f against a live balance of %.2f",
+                     sig.stake_usdt, stake, bankroll)
+        return replace(sig, stake_usdt=stake)
 
     def _settle_open(self) -> None:
         pos = self._position
@@ -2808,7 +3277,7 @@ class Trader:
         settled = self._client.settled_outcome(pos.rnd)
         if settled is not None:
             winner, venue_pnl = settled
-            if self._cfg.live and venue_pnl is not None:
+            if self._live and venue_pnl is not None:
                 pnl = venue_pnl
         else:
             final = self._client.final_price(pos.rnd)
@@ -2834,10 +3303,10 @@ class Trader:
         if pnl is None:
             pnl = settle_pnl(max(pos.committed_usdt, pos.signal.stake_usdt),
                              pos.signal.fill_price, won, pos.rnd.fee_bps)
-        if not self._cfg.live:
+        if not self._live:
             self._paper_bankroll += pnl
 
-        if won and self._cfg.live:
+        if won and self._live:
             self._claim(pos)
 
         self._journal.resolve(pos.trade_id, won, pnl, source)
@@ -2989,7 +3458,7 @@ def preflight(cfg: Config) -> int:
     print()
     if failures:
         print(f"{failures} check(s) failed.\n"
-              "Override paths in endpoints.json, e.g.:\n"
+              "Override paths in the config file under \"endpoints\":\n"
               '  {"order_book": "/sapi/v1/w3w/wallet/prediction/order-book"}\n'
               "Valid keys: " + ", ".join(sorted(DEFAULT_ENDPOINTS)))
         return 1
@@ -3158,7 +3627,14 @@ def discover_min(cfg: Config) -> int:
 
 def main(argv: Optional[Iterable[str]] = None) -> int:
     ap = argparse.ArgumentParser(description="BTC 5m prediction market trader")
-    ap.add_argument("--live", action="store_true")
+    # Tri-state on purpose. Left unset, the config file governs and the mode
+    # can be changed by editing it while the bot runs. Set either way, the
+    # flag pins the mode and file edits to `live` are ignored with a warning,
+    # so a pinned mode can never appear to change when it cannot.
+    ap.add_argument("--live", dest="live", action="store_const", const=True,
+                    default=None, help="trade real money (pins the mode)")
+    ap.add_argument("--paper", dest="live", action="store_const", const=False,
+                    help="simulate only (pins the mode)")
     ap.add_argument("--preflight", action="store_true",
                     help="probe endpoints with your keys and exit")
     ap.add_argument("--calibration-report", action="store_true")
@@ -3171,7 +3647,10 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
     ap.add_argument("--report-profile", default=None,
                     help="restrict the report to one profile; default is "
                          "every profile in the journal, separately")
-    ap.add_argument("--profile", choices=sorted(PROFILES), default="buffer",
+    # No default: an argparse default would always beat the file's
+    # active_profile, making that setting dead exactly as --kelly's 0.25
+    # default silently overrode every profile's kelly_fraction.
+    ap.add_argument("--profile", choices=sorted(PROFILES), default=None,
                     help="buffer = big buffer late in the round; micro = "
                          "small accounts (default); favorite = favourites; "
                          "balanced = symmetric; convex = longshots")
@@ -3201,13 +3680,84 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                          "own figure so micro does not simulate a 100 USDT "
                          "account it will never have")
     ap.add_argument("--db", default="btc5m_journal.db")
-    ap.add_argument("--endpoints", default="endpoints.json")
+    ap.add_argument("--config", default="config.json",
+                    help="configuration file; created with --write-config. "
+                         "Re-read automatically whenever it changes.")
+    ap.add_argument("--write-config", action="store_true",
+                    help="write a complete config file with every setting "
+                         "at its current value, then exit")
+    ap.add_argument("--print-default-profile", action="store_true",
+                    help="print the default profile name and exit")
+    ap.add_argument("--check-config", action="store_true",
+                    help="validate the config file and exit; touches no "
+                         "network and no journal")
+    ap.add_argument("--no-hot-reload", action="store_true",
+                    help="read the config once and ignore later edits")
     ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args(list(argv) if argv is not None else None)
 
     logging.basicConfig(
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s %(levelname)-7s %(message)s")
+
+    # TRADING_MODE is the environment equivalent of --live/--paper, for
+    # hosted deployments where the command line is fixed by the platform.
+    # An explicit flag wins over it. Validated here, before any subcommand
+    # returns, so a typo is caught even by a command that ignores the mode.
+    live = args.live
+    env_mode = os.environ.get("TRADING_MODE", "").strip().lower()
+    if env_mode and env_mode not in ("live", "paper"):
+        print(f"TRADING_MODE must be 'live' or 'paper', got {env_mode!r}",
+              file=sys.stderr)
+        return 1
+    if live is None and env_mode:
+        live = env_mode == "live"
+        LOG.info("Mode pinned to %s by TRADING_MODE", env_mode.upper())
+
+    if args.print_default_profile:
+        # Exists so entrypoint.sh can read the default from the single source
+        # of truth instead of repeating it in shell.
+        print(DEFAULT_PROFILE)
+        return 0
+
+    if args.write_config:
+        if os.path.exists(args.config):
+            print(f"{args.config} already exists; refusing to overwrite.",
+                  file=sys.stderr)
+            return 1
+        with open(args.config, "w", encoding="utf-8") as fh:
+            json.dump(default_config_document(args.profile or DEFAULT_PROFILE),
+                      fh,
+                      indent=2, sort_keys=False)
+            fh.write("\n")
+        print(f"Wrote {args.config} with every setting at its current value.")
+        print("Edit it while the bot runs; changes are picked up within a "
+              "poll interval.")
+        return 0
+
+    if args.check_config:
+        # Validates without touching the network or the journal, so an edit
+        # can be checked before the running bot picks it up.
+        if not os.path.exists(args.config):
+            print(f"{args.config} does not exist.", file=sys.stderr)
+            return 1
+        try:
+            with open(args.config, encoding="utf-8") as fh:
+                document = json.load(fh)
+            checked = build_config(document, api_key="x", api_secret="x",
+                                   live=None, db_path=args.db,
+                                   profile=args.profile)
+        except (OSError, json.JSONDecodeError, ValueError, TypeError) as exc:
+            print(f"INVALID: {exc}", file=sys.stderr)
+            return 1
+        print(f"OK: {args.config} is valid.")
+        print(f"  profile        {checked.profile_name}")
+        print(f"  entry band     {checked.min_entry_price:.2f}"
+              f"-{checked.max_entry_price:.2f}")
+        print(f"  max stake      {checked.max_stake_pct:.0%} of bankroll")
+        print(f"  min buffer     {checked.min_buffer_sigmas} sigma")
+        print(f"  daily limit    {checked.daily_loss_limit_pct:.0%}")
+        return 0
 
     if args.calibration_report:
         print(Journal(args.db).calibration_report(args.report_profile))
@@ -3223,39 +3773,40 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         print("Set BINANCE_API_KEY and BINANCE_API_SECRET.", file=sys.stderr)
         return 1
 
+    overrides: dict = {}
+    if args.kelly is not None:
+        overrides["kelly_fraction"] = args.kelly
+    if args.min_edge is not None:
+        overrides["min_edge"] = args.min_edge
+    if args.fee_bps is not None:
+        overrides["fee_bps"] = args.fee_bps
+    if args.paper_bankroll is not None:
+        overrides["paper_start_bankroll"] = args.paper_bankroll
+    if args.min_buffer is not None:
+        overrides["min_buffer_sigmas"] = args.min_buffer
+    if args.scale_in is not None:
+        overrides["scale_in"] = args.scale_in
+    if args.report_every:
+        overrides["report_every"] = args.report_every
+    if args.no_fat_tails:
+        overrides["use_fat_tails"] = False
+
     try:
-        settings = dict(PROFILES[args.profile])
-        if args.min_edge is not None:
-            settings["min_edge"] = args.min_edge
-        if args.kelly is not None:
-            settings["kelly_fraction"] = args.kelly
-        if args.fee_bps is not None:
-            settings["fee_bps"] = args.fee_bps
-        if args.paper_bankroll is not None:
-            settings["paper_start_bankroll"] = args.paper_bankroll
-        if args.min_buffer is not None:
-            settings["min_buffer_sigmas"] = args.min_buffer
-        if args.scale_in is not None:
-            settings["scale_in"] = args.scale_in
-        if args.report_every:
-            settings["report_every"] = args.report_every
-        # Everything goes through ONE dict. Passing some keys positionally
-        # and others via **settings meant that adding a field to a profile
-        # collided with the explicit argument -- Config() got two values for
-        # kelly_fraction and the bot crashed on startup. Building a single
-        # mapping makes that collision impossible rather than merely fixed.
-        settings.update(
-            api_key=key, api_secret=secret, live=args.live,
-            use_fat_tails=not args.no_fat_tails, db_path=args.db,
-            endpoints=tuple(load_endpoints(args.endpoints).items()),
-            profile_name=args.profile)
-        cfg = Config(**settings)
-        LOG.info("Profile %r: entry %.2f-%.2f, edge >= %.2f abs and "
-                 "%.0f%% relative, max stake %.1f%% of bankroll, "
-                 "min order %.2f USDT",
-                 args.profile, cfg.min_entry_price, cfg.max_entry_price,
-                 cfg.min_edge, cfg.min_edge_ratio * 100,
-                 cfg.max_stake_pct * 100, cfg.min_stake_usdt)
+        config_path = args.config if os.path.exists(args.config) else None
+        if config_path is None and args.config != "config.json":
+            print(f"Config file {args.config} not found.", file=sys.stderr)
+            return 1
+        store = ConfigStore(
+            None if args.no_hot_reload and config_path is None else config_path,
+            api_key=key, api_secret=secret, live=live, db_path=args.db,
+            profile=args.profile, overrides=overrides)
+        cfg = store.current
+        if config_path:
+            LOG.info("Config from %s%s", config_path,
+                     "" if not args.no_hot_reload else " (hot reload off)")
+        else:
+            LOG.info("No config file; using built-in defaults. "
+                     "Run --write-config to create one.")
     except ValueError as exc:
         print(f"Invalid configuration: {exc}", file=sys.stderr)
         return 1
@@ -3292,16 +3843,16 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
             print("\nInterrupted.", file=sys.stderr)
             return 130
 
-    if args.live:
+    if cfg.live:
         print("\n*** LIVE MODE: this will spend real USDT. ***")
         print("Confirm you have (1) run --preflight clean, and (2) reviewed")
         print("--calibration-report over several hundred paper rounds.")
-        # if input('Type "I ACCEPT THE RISK" to continue: ') != "I ACCEPT THE RISK":
-        #     print("Aborted.")
-        #     return 1
+        if input('Type "I ACCEPT THE RISK" to continue: ') != "I ACCEPT THE RISK":
+            print("Aborted.")
+            return 1
 
     try:
-        Trader(cfg).run()
+        Trader(store if not args.no_hot_reload else cfg).run()
     except ApiError as exc:
         print(f"\nStopped [{exc.kind.value}]: {exc}", file=sys.stderr)
         return 1

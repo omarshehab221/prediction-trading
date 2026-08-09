@@ -3,23 +3,23 @@
 # THREE THINGS THAT WILL BREAK THIS IF IGNORED
 # --------------------------------------------
 # 1. REGION MUST NOT BE IN THE UNITED STATES.
-#    Binance returns HTTP 451 ("Unavailable For Legal Reasons") to restricted
-#    locations, which include the US. Render's oregon / ohio / virginia
-#    regions are all US and every API call will fail. Use frankfurt or
-#    singapore. Singapore is also the lower-latency choice for Binance.
+#    Binance returns HTTP 451 to restricted locations, which include the US.
+#    Render's oregon / ohio / virginia regions are all US and every API call
+#    fails there, including the public price feed. Use frankfurt or singapore.
 #
-# 2. THE JOURNAL NEEDS A PERSISTENT DISK.
-#    Render's filesystem is ephemeral: without a disk, the SQLite journal is
-#    wiped on every deploy and restart. That destroys the calibration record,
-#    which is the only thing that can tell you whether the strategy works.
+# 2. THE DISK HOLDS BOTH THE CONFIG AND THE JOURNAL.
+#    Render's filesystem is ephemeral. Without a disk the journal is wiped on
+#    every deploy -- and the journal is the calibration record, the only thing
+#    that can tell you whether the strategy has an edge. The config lives
+#    there too, so the edits you make are not lost on the next restart.
 #
 # 3. BACKGROUND WORKER, NOT WEB SERVICE.
-#    This is a long-running loop with no HTTP port. Free web services also
-#    spin down when idle, which would stop the loop. Workers are paid only.
+#    A long-running loop with no HTTP port. Free web services also spin down
+#    when idle, which would stop the loop mid-round. Workers are paid only.
 #
-# If your Binance API key uses an IP allowlist, you also need Render's
-# Dedicated IPs (a paid workspace add-on giving three static IPv4 addresses
-# per region). Shared outbound ranges rotate and will get you locked out.
+# The config file is written ONCE, on first boot, by entrypoint.sh. Later
+# starts keep whatever is on the disk, so hot reload and your edits survive
+# every deploy. To reset it, delete the file from the Render shell.
 
 services:
   - type: worker
@@ -27,25 +27,43 @@ services:
     runtime: python
     region: frankfurt          # NEVER a US region -- see note 1
     plan: starter
-    buildCommand: pip install -r requirements.txt
-    # Paper mode by default. Remove --live only after preflight is clean AND
-    # the calibration report over several hundred rounds looks sound.
-    startCommand: >
-      python btc_5m_predictor.py
-      --profile ${PROFILE}
-      --db /var/data/btc5m_journal.db
-      --live
+    # Verification runs twice on purpose. Here it fails the BUILD, so broken
+    # code never reaches a deploy at all. entrypoint.sh runs it again at boot,
+    # because the runtime environment is not the build environment.
+    buildCommand: >
+      pip install -r requirements.txt &&
+      chmod +x entrypoint.sh verify.sh &&
+      BINANCE_API_KEY=build BINANCE_API_SECRET=build ./verify.sh
+    startCommand: ./entrypoint.sh
     autoDeploy: false          # a redeploy mid-round interrupts a position
     disk:
-      name: journal
-      mountPath: /var/data     # must match the --db path above
+      name: data
+      mountPath: /var/data     # must match CONFIG_PATH and DB_PATH below
       sizeGB: 1
     envVars:
       - key: BINANCE_API_KEY
         sync: false            # set in the dashboard, never in git
       - key: BINANCE_API_SECRET
         sync: false
+      - key: CONFIG_PATH
+        value: /var/data/config.json
+      - key: DB_PATH
+        value: /var/data/btc5m_journal.db
       - key: PROFILE
-        value: buffer
+        value: buffer          # only when the config is first created;
+                               # must match DEFAULT_PROFILE in the module
+      # paper | live. Pins the mode, overriding the config file's `live`.
+      # Leave it unset to let config.json govern, which makes the mode
+      # hot-reloadable: edit the file and the bot switches once it is flat.
+      - key: TRADING_MODE
+        value: paper
       - key: PYTHONUNBUFFERED
-        value: "1"             # so logs appear live rather than in bursts
+        value: "1"             # stream logs live instead of in bursts
+      # Set to "1" only to start a bot whose checks are failing, while you
+      # investigate. It means the code has NOT been verified.
+      - key: SKIP_VERIFY
+        value: "0"
+      # Preflight probes the live API at boot. "0" downgrades a failure to a
+      # warning; "1" (default) refuses to start on one.
+      - key: PREFLIGHT_REQUIRED
+        value: "1"

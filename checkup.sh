@@ -8,7 +8,10 @@ cd "$DIR" || exit 1
 
 cp "$SRC/btc_5m_predictor.py" "$SRC/test_btc_5m.py" \
    "$SRC/conformance.py" "$SRC/fuzz.py" "$SRC/mutate.py" \
-   "$SRC/patterns.py" "$SRC/coherence.py" .
+   "$SRC/patterns.py" "$SRC/coherence.py" \
+   "$SRC/entrypoint.sh" "$SRC/render.yaml" "$SRC/Dockerfile" \
+   "$SRC/requirements.txt" .
+chmod +x entrypoint.sh 2>/dev/null || true
 rm -rf __pycache__ .pytest_cache
 export BINANCE_API_KEY=dummy BINANCE_API_SECRET=dummy
 export PYTHONDONTWRITEBYTECODE=1
@@ -129,7 +132,7 @@ PYX
 echo "  warnings   $(sort run_err.txt | uniq -c | awk '{printf "%s:%s ", $1, substr($2,1,18)}')"
 
 # 8. artifacts left behind in the working directory
-STRAY=$(ls -A | grep -vE '^(btc_5m_predictor.py|test_btc_5m.py|conformance.py|fuzz.py|mutate.py|patterns.py|coherence.py|cal_convex.db|cal_balanced.db|__pycache__|run_err.txt)$' | tr '\n' ' ')
+STRAY=$(ls -A | grep -vE '^(btc_5m_predictor.py|test_btc_5m.py|conformance.py|fuzz.py|mutate.py|patterns.py|coherence.py|entrypoint.sh|render.yaml|Dockerfile|requirements.txt|cal_convex.db|cal_balanced.db|__pycache__|run_err.txt)$' | tr '\n' ' ')
 echo "  stray      ${STRAY:-none}"
 
 cd / && rm -rf "$DIR"
