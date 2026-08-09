@@ -57,10 +57,10 @@ Two refinements matter:
 
 | File | Lines | What it is |
 |---|---|---|
-| `btc_5m_predictor.py` | 3,863 | The bot: client, pricing, risk, journal, CLI |
-| `test_btc_5m.py` | 4,464 | 490 tests across 76 classes |
+| `btc_5m_predictor.py` | 4068 | The bot: client, pricing, risk, journal, CLI |
+| `test_btc_5m.py` | 4694 | 512 tests across 78 classes |
 | `conformance.py` | 403 | Validates every API call against Binance's own schema |
-| `fuzz.py` | 362 | Property-based testing with hostile inputs |
+| `fuzz.py` | 363 | Property-based testing with hostile inputs |
 | `coherence.py` | 376 | Finds stale artifacts, dead code, config drift |
 | `patterns.py` | 546 | Tests whether kline patterns predict anything |
 | `mutate.py` | 155 | Mutation testing — measures test quality |
@@ -106,6 +106,9 @@ Only then consider `--live`.
 | `--whoami` | Show the outbound IP (for API key allowlists). |
 | `--calibration-report` | Is the model calibrated? Per profile. |
 | `--diagnose` | Is the edge real? Win rate vs break-even, per price band. |
+| `--symbols A,B,C` | Markets to trade, each independently. |
+| `--max-concurrent N` | How many markets may hold a position at once. |
+| `--report-symbol` | Scope a report to one market. |
 | `--live` / `--paper` | Pin the mode. Unset → the config file governs. |
 | `--profile NAME` | Override the file's `active_profile`. |
 | `--verbose` | Log the full signed request (signature redacted). |
@@ -116,7 +119,39 @@ Overrides: `--kelly`, `--min-edge`, `--fee-bps`, `--min-buffer`,
 
 ---
 
-## 5. Profiles
+## 5. Markets
+
+The bot trades any number of 5-minute up/down markets. Each is an independent
+instrument:
+
+```bash
+python3 btc_5m_predictor.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --max-concurrent 3
+```
+
+**Isolated per market:** position slot, loss streak, calibration statistics,
+volatility and tail estimates. A losing run on BTC does not gate ETH.
+
+**Shared, because there is one account:** the bankroll, the daily loss limit,
+the venue's daily quota.
+
+That distinction forces a constraint. Sizing each market against the *full*
+balance would let N markets quietly stack to N times the intended exposure — at
+10% per position, three markets is 30% against a 25% hard cap. So new positions
+size against **uncommitted** funds, and `reserve_pct` (30%) is held back
+regardless of how many markets look attractive at once:
+
+| Market | Available | Stake | Total committed |
+|---|---|---|---|
+| BTCUSDT | 70.00 | 7.00 | 7% |
+| ETHUSDT | 63.00 | 6.30 | 13% |
+| SOLUSDT | 56.70 | 5.67 | 19% |
+
+Reports break down per market, and `--diagnose --report-symbol ETHUSDT` scopes
+to one.
+
+---
+
+## 6. Profiles
 
 Five strategies, differing in which contracts they buy:
 
@@ -156,7 +191,7 @@ caps the blend; top-ups are trimmed to fit or skipped.
 
 ---
 
-## 6. Risk controls
+## 7. Risk controls
 
 Every one fails closed.
 
@@ -175,9 +210,9 @@ Every one fails closed.
 
 ---
 
-## 7. Configuration and hot reload
+## 8. Configuration and hot reload
 
-All 66 settings live in `config.json`. Layering: defaults → profile → file
+All 70 settings live in `config.json`. Layering: defaults → profile → file
 overrides → CLI.
 
 The file is **re-read whenever it changes** — no restart. Reload is atomic and
@@ -203,14 +238,14 @@ being tracked while its settlement is simulated.
 
 ---
 
-## 8. Verification
+## 9. Verification
 
 Five independent tools, because the tests alone were not enough — every serious
 bug in this project was found by running the thing, not by the suite.
 
 | Tool | What it catches | Why it exists |
 |---|---|---|
-| `test_btc_5m.py` | Behaviour | 490 tests, including meta-tests over the source |
+| `test_btc_5m.py` | Behaviour | 512 tests, including meta-tests over the source |
 | `conformance.py` | Wrong API calls | Validates against Binance's own OpenAPI connector — **not** my model of the API |
 | `fuzz.py` | Crashes, broken invariants | Random hostile input finds cases nobody would write |
 | `coherence.py` | Stale artifacts | Dead code, unread config, drifted defaults |
@@ -231,7 +266,7 @@ measures test *quality*, not correctness.
 
 ---
 
-## 9. Does the pattern idea work?
+## 10. Does the pattern idea work?
 
 `patterns.py` tests 19 features — candlestick patterns, momentum, order flow —
 against the next 5-minute outcome, with a chronological train/test split,
@@ -256,7 +291,7 @@ standard finding for candlestick patterns on short-horizon crypto.
 
 ---
 
-## 10. Deployment
+## 11. Deployment
 
 See `DEPLOY.md`. Three things will break it silently:
 
@@ -272,7 +307,7 @@ your edits) → `--check-config` → `--preflight` → `exec` the bot.
 
 ---
 
-## 11. What is verified, and what is not
+## 12. What is verified, and what is not
 
 **Verified by execution:** pricing model (vs scipy to machine precision), Kelly
 sizing, edge math, order-book walking, payload parsing, risk limits, settlement,
@@ -292,7 +327,7 @@ identical over a few dozen trades, and one loses money while the other compounds
 
 ---
 
-## 12. Things that turned out to be wrong
+## 13. Things that turned out to be wrong
 
 Kept because they are the useful part of the history.
 
@@ -314,6 +349,11 @@ Kept because they are the useful part of the history.
 - **Duplicate keyword.** `main()` passed `kelly_fraction` explicitly while
   profiles set it too. Crashed on the first run with 384 tests green — because
   no test invoked `main()`.
+- **Bankroll inflated by the gross payout.** Unclaimed winnings were added on
+  top of a portfolio figure that already included settled positions. A $1 stake
+  winning at 0.60 inflated the reported bankroll by **$1.67** (stake + profit)
+  rather than $0.65. The API reading is now authoritative, and every live
+  settlement is reconciled against the actual balance change.
 
 The pattern in all of them: **treating a specific signal as a generic one.** A
 numeric error code flattened to a string, a real balance replaced by a guessed
@@ -322,7 +362,7 @@ in `coherence.py` and `test_btc_5m.py` now enforce against that class directly.
 
 ---
 
-## 13. Honest expectations
+## 14. Honest expectations
 
 - The bot will often sit idle. With a 2% fee, a coin-flip contract loses ~2% per
   round by default, so declining to trade is correct behaviour.

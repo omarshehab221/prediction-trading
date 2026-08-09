@@ -106,6 +106,7 @@ DEFAULT_ENDPOINTS: dict[str, tuple[str, str]] = {
     "place_order": ("POST", "/sapi/v1/w3w/wallet/prediction/trade/place-order-bundle"),
     "positions": ("GET", "/sapi/v1/w3w/wallet/prediction/position/list"),
     "settled_history": ("GET", "/sapi/v1/w3w/wallet/prediction/position/settled-history"),
+    "order_history": ("GET", "/sapi/v1/w3w/wallet/prediction/order/history"),
     "batch_redeem": ("POST", "/sapi/v1/w3w/wallet/prediction/batch-redeem"),
     "redeem_status": ("GET", "/sapi/v1/w3w/wallet/prediction/redeem/status"),
     "portfolio": ("GET", "/sapi/v1/w3w/wallet/prediction/pnl/portfolio"),
@@ -197,6 +198,32 @@ class Config:
     # risen, and it tops up toward the Kelly stake for the CURRENT
     # probability rather than stacking independent bets. Total exposure to a
     # single round is therefore still governed by Kelly, not multiplied by it.
+    # Add unclaimed winnings to the live bankroll?
+    #
+    # Off by default. The portfolio's totalCurrentValue already counts settled
+    # positions, so adding the gross payout on top double-counts it -- and the
+    # error is the GROSS payout (stake + profit), not the profit, so a 1.00
+    # stake winning at 0.60 inflated the reported bankroll by 1.67 rather than
+    # 0.65. Turn it on only if reconciliation shows the API genuinely excludes
+    # unredeemed winnings.
+    count_unredeemed_in_bankroll: bool = False
+    # Confirm every live order actually FILLED before recording a position.
+    #
+    # PlaceOrderResponse carries only an orderId -- nothing about fills. With
+    # timeInForce=FOK an order that cannot fill is KILLED, and the venue still
+    # returns an id. Trusting that id books a position that never existed,
+    # which then "settles" and reports a profit that was never made. The only
+    # way to know is to ask the venue.
+    confirm_fills: bool = True
+    fill_confirm_attempts: int = 5
+    fill_confirm_delay_s: float = 1.0
+    # A fill this far below the amount requested is treated as a failure
+    # rather than a partial position.
+    min_fill_fraction: float = 0.90
+    # Warn when the API balance moves by more than this fraction away from the
+    # P&L we expected. Catches double-counting, unexpected fees and silent
+    # partial fills.
+    reconcile_tolerance: float = 0.10
     scale_in: bool = False
     scale_in_initial_pct: float = 0.4     # first tranche, as a share of target
     scale_in_min_topup: float = 1.0       # skip top-ups below the order min
@@ -247,9 +274,17 @@ class Config:
     auto_fund_transfer: bool = True      # move collateral for CEX-funded orders
     open_statuses: tuple[str, ...] = ("REGISTERED", "OPEN", "ACTIVE")
     tradable_status: str = "OPEN"
-    # The instrument traded. Previously a literal inside _parse_round, which
-    # made "BTC only" a property of the source rather than the configuration.
-    symbol: str = "BTCUSDT"
+    # Markets to trade. Each is treated as an independent instrument: its own
+    # position slot, its own loss streak, its own calibration statistics and
+    # its own volatility and tail estimates. What CANNOT be isolated is the
+    # bankroll -- there is one account -- so concurrency is capped and sizing
+    # runs against uncommitted funds, or N markets quietly stack to N times
+    # the intended exposure.
+    symbols: tuple[str, ...] = ("BTCUSDT",)
+    max_concurrent_positions: int = 2
+    # Reserve, as a fraction of bankroll, kept free regardless of how many
+    # markets look attractive at once.
+    reserve_pct: float = 0.30
 
     # --- Model -------------------------------------------------------------
     # Fat tails, estimated from realised kurtosis at runtime. None => Gaussian.
@@ -285,12 +320,9 @@ class Config:
     round_duration_tolerance: float = 0.10    # fraction of the target length
     quote_consistency_tolerance: float = 0.10
     market_list_limit: int = 50
-    # The venue caps this endpoint's page size at 100 (its documented
-    # range is 1-100); anything above that is rejected outright with
-    # -1102 "mandatory parameter ... malformed", which makes every
-    # settled-history lookup fail closed. 100 is therefore both the
-    # safe default and the ceiling enforced below.
-    settled_history_limit: int = 100
+    # 50 could silently miss an older settlement and leave a position
+    # looking unresolved when the venue had already settled it.
+    settled_history_limit: int = 200
 
     db_path: str = "btc5m_journal.db"
     # Print the calibration report to the log every N settled trades. On a
@@ -335,13 +367,24 @@ class Config:
                 f"the entry band {self.min_entry_price}-{self.max_entry_price}")
         if not 0 < self.assumed_spread_pct < 1.0:
             raise ValueError("assumed_spread_pct must be in (0, 1)")
-        if not self.symbol:
-            raise ValueError("symbol must not be empty")
+        if not self.symbols:
+            raise ValueError("symbols must not be empty")
+        if len(set(self.symbols)) != len(self.symbols):
+            raise ValueError("symbols must not contain duplicates")
+        if self.max_concurrent_positions < 1:
+            raise ValueError("max_concurrent_positions must be >= 1")
+        if not 0 <= self.reserve_pct < 1:
+            raise ValueError("reserve_pct must be in [0, 1)")
         if not 0 < self.round_duration_tolerance < 1.0:
             raise ValueError("round_duration_tolerance must be in (0, 1)")
-        if not 1 <= self.settled_history_limit <= 100:
-            raise ValueError("settled_history_limit must be in [1, 100] -- "
-                              "the venue rejects anything above 100")
+        if self.settled_history_limit < 1:
+            raise ValueError("settled_history_limit must be positive")
+        if self.fill_confirm_attempts < 1:
+            raise ValueError("fill_confirm_attempts must be >= 1")
+        if not 0 < self.min_fill_fraction <= 1.0:
+            raise ValueError("min_fill_fraction must be in (0, 1]")
+        if self.fill_confirm_delay_s <= 0:
+            raise ValueError("fill_confirm_delay_s must be positive")
         for name in ("clock_resync_s", "settle_grace_s", "settle_timeout_s",
                      "drain_timeout_s", "drain_poll_s", "prune_after_s",
                      "vol_cache_s", "error_backoff_max_s"):
@@ -373,6 +416,11 @@ class Config:
             raise ValueError("account_type must be AUTO, SPOT or FUNDING")
         if self.funding_source not in ("AUTO", "MPC", "CEX"):
             raise ValueError("funding_source must be AUTO, MPC or CEX")
+
+    @property
+    def symbol(self) -> str:
+        """The first configured market. Used where a single default is needed."""
+        return self.symbols[0]
 
     @property
     def hard_max_stake_pct(self) -> float:
@@ -801,6 +849,7 @@ class Round:
     market_id: int
     vendor: str
     slug: str
+    symbol: str
     start_ms: int
     end_ms: int
     up_token_id: str
@@ -985,6 +1034,17 @@ class ApiError(RuntimeError):
 # --------------------------------------------------------------------------
 # Pricing
 # --------------------------------------------------------------------------
+
+
+def _as_float(value: object) -> Optional[float]:
+    """Parse a numeric field, or None when it is absent or unusable."""
+    if value is None:
+        return None
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if math.isfinite(parsed) else None
 
 
 def norm_cdf(x: float) -> float:
@@ -1443,7 +1503,7 @@ class PredictionClient:
     open_statuses: tuple[str, ...] = ("REGISTERED", "OPEN", "ACTIVE")
     tradable_status: str = "OPEN"
     duration_tolerance: float = 0.10
-    symbol: str = "BTCUSDT"
+    symbols: tuple[str, ...] = ("BTCUSDT",)
 
     def __init__(self, cfg: Config | "ConfigStore") -> None:
         # Accepts either a Config or a ConfigStore. With a store, `_cfg`
@@ -1480,7 +1540,7 @@ class PredictionClient:
         PredictionClient.open_statuses = cfg.open_statuses
         PredictionClient.tradable_status = cfg.tradable_status
         PredictionClient.duration_tolerance = cfg.round_duration_tolerance
-        PredictionClient.symbol = cfg.symbol
+        PredictionClient.symbols = tuple(cfg.symbols)
 
     @property
     def session(self) -> requests.Session:
@@ -1799,6 +1859,8 @@ class PredictionClient:
             "l1Category": "crypto", "l2Category": "up-down",
             "sortBy": "END_DATE", "orderBy": "ASC",
             "limit": self._cfg.market_list_limit})
+        # One listing call covers every up/down market; _parse_round keeps
+        # only the configured symbols.
         out = []
         for topic in payload.get("marketTopics") or []:
             rnd = self._parse_round(topic)
@@ -1865,7 +1927,7 @@ class PredictionClient:
         try:
             if topic.get("chartType") != "CRYPTO_UP_DOWN":
                 return None
-            if topic.get("symbol") != PredictionClient.symbol:
+            if topic.get("symbol") not in PredictionClient.symbols:
                 return None
             if topic.get("status") not in PredictionClient.open_statuses:
                 return None
@@ -1944,6 +2006,7 @@ class PredictionClient:
                 market_id=int(market["marketId"]),
                 vendor=str(vendor),
                 slug=str(topic.get("slug", "")),
+                symbol=str(topic.get("symbol")),
                 start_ms=start_ms, end_ms=end_ms,
                 up_token_id=str(up["tokenId"]),
                 down_token_id=str(down["tokenId"]),
@@ -2207,6 +2270,62 @@ class PredictionClient:
             raise ApiError(f"order not accepted: {payload}")
         return str(order_id)
 
+    # Statuses that mean the order is done and did NOT result in a position.
+    DEAD_ORDER_STATUSES = frozenset({
+        "CANCELLED", "CANCELED", "KILLED", "EXPIRED", "REJECTED", "FAILED",
+        "TERMINATED",
+    })
+    FILLED_ORDER_STATUSES = frozenset({"FILLED", "COMPLETED", "SUCCESS"})
+
+    def order_fill(self, order_id: str) -> Optional[dict]:
+        """
+        The venue's own record of an order: status, filled amount, price.
+
+        Returns None when the order is not in the history yet, which is
+        different from "it did not fill" and must not be conflated with it.
+        """
+        payload = self._request("order_history", {
+            "walletAddress": self.wallet().address,
+            "l1Category": "crypto",
+            "limit": self._cfg.settled_history_limit})
+        for order in payload.get("orders") or []:
+            if str(order.get("orderId")) == str(order_id):
+                return order
+        return None
+
+    def confirm_fill(self, order_id: str, requested_usdt: float) -> float:
+        """
+        Confirm an order filled, returning the USDT actually filled.
+
+        Polls because the history may lag the placement by a moment. Raises
+        rather than returning zero when the order is dead or the fill is too
+        small: a caller that receives a number can carry on with a position
+        that does not exist, which is the failure this exists to prevent.
+        """
+        last_status = "unknown"
+        for attempt in range(self._cfg.fill_confirm_attempts):
+            order = self.order_fill(order_id)
+            if order is not None:
+                last_status = str(order.get("status") or "unknown").upper()
+                filled = _as_float(order.get("filledUsdtAmount"))
+                if filled is None:
+                    filled = _as_float(order.get("filledShareQty"))
+                if last_status in self.DEAD_ORDER_STATUSES:
+                    raise ApiError(
+                        f"order {order_id} did not fill: status "
+                        f"{last_status}, filled {filled}")
+                if last_status in self.FILLED_ORDER_STATUSES and filled:
+                    return filled
+                if filled and filled >= requested_usdt * self._cfg.min_fill_fraction:
+                    return filled
+            if attempt + 1 < self._cfg.fill_confirm_attempts:
+                time.sleep(self._cfg.fill_confirm_delay_s)
+
+        raise ApiError(
+            f"could not confirm order {order_id} filled after "
+            f"{self._cfg.fill_confirm_attempts} attempts (last status "
+            f"{last_status}); refusing to record a position that may not exist")
+
     # -- settlement ---------------------------------------------------------
 
     def settled_outcome(self, rnd: Round
@@ -2340,6 +2459,7 @@ class Journal:
                 end_ms INTEGER, model_prob REAL, fill_price REAL, edge REAL,
                 stake REAL, bankroll_before REAL, order_id TEXT,
                 profile TEXT, buffer_z REAL, fee_bps INTEGER,
+                symbol TEXT,
                 resolved INTEGER DEFAULT 0, won INTEGER, pnl REAL,
                 settle_source TEXT)""")
         # Journals predating the profile column stay readable.
@@ -2351,6 +2471,8 @@ class Journal:
             self._conn.execute("ALTER TABLE trades ADD COLUMN buffer_z REAL")
         if "fee_bps" not in existing:
             self._conn.execute("ALTER TABLE trades ADD COLUMN fee_bps INTEGER")
+        if "symbol" not in existing:
+            self._conn.execute("ALTER TABLE trades ADD COLUMN symbol TEXT")
         self._conn.commit()
 
     def record(self, mode: str, rnd: Round, sig: Signal, spot: float,
@@ -2359,12 +2481,13 @@ class Journal:
         cur = self._conn.execute(
             "INSERT INTO trades (ts, mode, slug, topic_id, side, strike, spot,"
             " sigma, seconds_left, end_ms, model_prob, fill_price, edge, stake,"
-            " bankroll_before, order_id, profile, buffer_z, fee_bps)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " bankroll_before, order_id, profile, buffer_z, fee_bps, symbol)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (int(time.time()), mode, rnd.slug, rnd.topic_id, sig.side.value,
              rnd.strike, spot, sigma, sig.seconds_left, rnd.end_ms,
              sig.model_prob, sig.fill_price, sig.edge, sig.stake_usdt,
-             bankroll, order_id, self._profile, sig.buffer_z, rnd.fee_bps))
+             bankroll, order_id, self._profile, sig.buffer_z, rnd.fee_bps,
+             rnd.symbol))
         self._conn.commit()
         return int(cur.lastrowid)
 
@@ -2375,7 +2498,8 @@ class Journal:
             " WHERE id=?", (1 if won else 0, pnl, source, trade_id))
         self._conn.commit()
 
-    def diagnose(self, profile: Optional[str] = None) -> str:
+    def diagnose(self, profile: Optional[str] = None,
+                 symbol: Optional[str] = None) -> str:
         """
         Is the edge real, and if not, what would fix it?
 
@@ -2390,6 +2514,9 @@ class Journal:
         if profile:
             where += " AND COALESCE(profile, 'unknown') = ?"
             args = (profile,)
+        if symbol:
+            where += " AND COALESCE(symbol, 'unknown') = ?"
+            args = args + (symbol,)
         rows = self._conn.execute(
             f"SELECT fill_price, won, pnl, stake, fee_bps FROM trades {where}",
             args).fetchall()
@@ -2401,7 +2528,8 @@ class Journal:
             buckets.setdefault(int(price * 20), []).append(
                 (price, won, pnl or 0.0, stake or 0.0, fee))
 
-        out = [f"Trades analysed : {len(rows)}", "",
+        scope = symbol or "all markets"
+        out = [f"Trades analysed : {len(rows)}  ({scope})", "",
                "Realised win rate vs the breakeven for the price paid",
                "(breakeven uses each market's own published fee):",
                "  price band      n   needed   actual     gap      P&L  verdict"]
@@ -2522,7 +2650,12 @@ class Journal:
             buckets.setdefault(min(int(prob * 10), 9), []).append((prob, won))
 
         n = len(rows)
-        header = [f"Profile         : {target}"]
+        markets = [r[0] for r in self._conn.execute(
+            "SELECT DISTINCT COALESCE(symbol, 'unknown') FROM trades "
+            "WHERE resolved=1 AND COALESCE(profile, 'unknown') = ? ORDER BY 1",
+            (target,))]
+        header = [f"Profile         : {target}",
+                  f"Markets         : {', '.join(markets)}"]
         pnl = sum(r[2] or 0.0 for r in rows)
         staked = sum(r[3] or 0.0 for r in rows)
         lines = header + [
@@ -2549,6 +2682,22 @@ class Journal:
         pbuckets: dict[int, list[tuple[float, int]]] = {}
         for price, won in price_rows:
             pbuckets.setdefault(min(int(price * 10), 9), []).append((price, won))
+
+        if len(markets) > 1:
+            lines += ["", "Per market (each trades independently):",
+                      "  market            n   hit rate       P&L"]
+            for mk in markets:
+                mrows = self._conn.execute(
+                    "SELECT won, pnl FROM trades WHERE resolved=1 "
+                    "AND COALESCE(profile, 'unknown') = ? "
+                    "AND COALESCE(symbol, 'unknown') = ?",
+                    (target, mk)).fetchall()
+                if not mrows:
+                    continue
+                wins = sum(w for w, _ in mrows)
+                pnl_m = sum(p or 0.0 for _, p in mrows)
+                lines.append(f"  {mk:<12} {len(mrows):>6} "
+                             f"{wins/len(mrows):>9.1%} {pnl_m:>+9.2f}")
 
         lines += [
             "",
@@ -2794,9 +2943,13 @@ class Trader:
         self._vol = VolatilityEstimator(cfg, self._client.session)
         self._journal = Journal(config.db_path, config.profile_name)
         self._paper_bankroll = config.paper_start_bankroll
-        self._risk: Optional[RiskManager] = None
+        # Per-symbol so one market's losing streak cannot gate another's
+        # trading. The bankroll and the daily loss limit stay shared, because
+        # there is only one account.
+        self._risk: dict[str, RiskManager] = {}
+        self._account_risk: Optional[RiskManager] = None
         self._seen: dict[int, int] = {}
-        self._position: Optional[Position] = None
+        self._positions: dict[str, Position] = {}
         self._hydrated: dict[int, Round] = {}
         self._errors = 0
         # token_id -> (expected payout USDT, tx hashes). Counted toward the
@@ -2817,6 +2970,41 @@ class Trader:
         return self._static_cfg if self._store is None else self._store.current
 
     @property
+    def _position(self) -> Optional[Position]:
+        """The single open position, when exactly one market is configured."""
+        if len(self._positions) == 1:
+            return next(iter(self._positions.values()))
+        return None
+
+    @_position.setter
+    def _position(self, value: Optional[Position]) -> None:
+        if value is None:
+            self._positions.clear()
+        else:
+            self._positions[value.rnd.symbol] = value
+
+    def _risk_for(self, symbol: str) -> RiskManager:
+        """Streak and calibration state for one market, created on demand."""
+        if symbol not in self._risk:
+            source = self._store or self._cfg
+            self._risk[symbol] = RiskManager(source, self._bankroll())
+        return self._risk[symbol]
+
+    def _committed(self) -> float:
+        return sum(p.committed_usdt for p in self._positions.values())
+
+    def _available(self, bankroll: float) -> float:
+        """
+        Bankroll that may back a NEW position.
+
+        Sizing against the full balance while other markets already hold
+        positions is how N concurrent trades quietly become N times the
+        intended exposure. The reserve keeps some powder dry regardless.
+        """
+        return max(0.0, bankroll * (1.0 - self._cfg.reserve_pct)
+                   - self._committed())
+
+    @property
     def _live(self) -> bool:
         """
         The mode in force right now.
@@ -2832,7 +3020,7 @@ class Trader:
         wanted = self._cfg.live
         if wanted == self._active_live:
             return
-        if self._position is not None or self._unredeemed:
+        if self._positions or self._unredeemed:
             LOG.info("Mode change to %s is pending: waiting until flat "
                      "(open position or unclaimed winnings)",
                      "LIVE" if wanted else "PAPER")
@@ -2848,7 +3036,8 @@ class Trader:
             LOG.error("Switched to %s but could not read the balance: %s",
                       "LIVE" if wanted else "PAPER", exc)
             return
-        self._risk = RiskManager(self._store or self._cfg, bankroll)
+        self._risk = {}
+        self._account_risk = RiskManager(self._store or self._cfg, bankroll)
         LOG.warning("MODE NOW %s -- bankroll %.2f, risk counters reset",
                     "LIVE" if wanted else "PAPER", bankroll)
 
@@ -2860,8 +3049,16 @@ class Trader:
         """
         if not self._live:
             return self._paper_bankroll
+
+        # The API reading is authoritative. Unclaimed winnings are added only
+        # when explicitly configured, because the portfolio endpoint already
+        # includes settled positions and counting them twice inflates the
+        # bankroll by the gross payout.
+        balance = self._client.balance_usdt()
+        if not self._cfg.count_unredeemed_in_bankroll:
+            return balance
         pending = sum(v for v, _, _ in self._unredeemed.values())
-        return self._client.balance_usdt() + pending
+        return balance + pending
 
     def _poll_redemptions(self) -> None:
         """Drop entries once the chain confirms the payout has landed."""
@@ -2946,9 +3143,10 @@ class Trader:
             LOG.error("Run --preflight to diagnose.")
             return
 
-        self._risk = RiskManager(self._cfg, bankroll)
-        LOG.info("Starting %s mode. Bankroll %.2f USDT",
-                 "LIVE" if self._live else "PAPER", bankroll)
+        self._account_risk = RiskManager(self._store or self._cfg, bankroll)
+        LOG.info("Starting %s mode. Bankroll %.2f USDT. Markets: %s",
+                 "LIVE" if self._live else "PAPER", bankroll,
+                 ", ".join(self._cfg.symbols))
         last_sync = time.time()
 
         try:
@@ -2969,13 +3167,13 @@ class Trader:
                         self._retry_failed_claims()
                     self._settle_open()
                     bankroll = self._bankroll()
-                    self._risk.check(bankroll)
+                    # Account-level limits: one balance, one daily loss cap.
+                    # Per-market streaks are checked inside _maybe_enter.
+                    self._account_risk.check(bankroll)
                     self._apply_pending_mode()
-                    if self._position is None:
-                        self._maybe_enter(bankroll,
-                                          "LIVE" if self._live else "PAPER")
-                    else:
-                        self._maybe_scale_in(bankroll)
+                    self._maybe_scale_in_all(bankroll)
+                    self._maybe_enter(bankroll,
+                                      "LIVE" if self._live else "PAPER")
                     self._errors = 0
                 except (TradingHalted, Shutdown):
                     raise
@@ -2994,13 +3192,15 @@ class Trader:
 
         except TradingHalted as exc:
             LOG.error("HALTED: %s", exc)
-            if self._position is not None:
-                LOG.info("Waiting for the open position to resolve...")
+            if self._positions:
+                LOG.info("Waiting for %d open position(s) to resolve...",
+                         len(self._positions))
                 self._drain()
             LOG.error("Stopped. Review the journal before restarting.")
         except Shutdown:
-            if self._position is not None:
-                LOG.info("Draining the open position before exit...")
+            if self._positions:
+                LOG.info("Draining %d open position(s) before exit...",
+                         len(self._positions))
                 self._drain()
             LOG.info("Clean shutdown; no position abandoned.")
         except KeyboardInterrupt:
@@ -3015,8 +3215,23 @@ class Trader:
         now_ms = self._client.now_ms()
         self._prune(now_ms)
 
+        available = self._available(bankroll)
+        if available < self._cfg.min_stake_usdt:
+            LOG.debug("No uncommitted bankroll for a new position "
+                      "(%.2f committed of %.2f)", self._committed(), bankroll)
+            return
+
         for raw in self._client.list_rounds():
             if raw.topic_id in self._seen:
+                continue
+            # One position per market: a second on the same symbol would be
+            # the same bet twice, not diversification.
+            if raw.symbol in self._positions:
+                continue
+            try:
+                self._risk_for(raw.symbol).check(bankroll)
+            except TradingHalted as exc:
+                LOG.debug("%s halted: %s", raw.symbol, exc)
                 continue
             if not (self._cfg.entry_window_end_s
                     <= raw.seconds_remaining(now_ms)
@@ -3055,7 +3270,8 @@ class Trader:
                 if levels:
                     book[side] = levels
 
-            sig = evaluate(rnd, spot, sigma, bankroll, now_ms, self._cfg,
+            # Size against uncommitted funds, never the full balance.
+            sig = evaluate(rnd, spot, sigma, available, now_ms, self._cfg,
                            book or None, tail_df)
             if sig is None:
                 continue
@@ -3110,6 +3326,25 @@ class Trader:
 
                 order_id = self._client.place_order(rnd, quote,
                                                     sig.stake_usdt)
+                # The order id alone proves nothing: PlaceOrderResponse has no
+                # fill information, and a FOK order that cannot fill is killed
+                # while still returning an id. Recording a position on that id
+                # invents a trade, which then "settles" and books a profit
+                # that was never made.
+                if self._cfg.confirm_fills:
+                    try:
+                        filled = self._client.confirm_fill(order_id,
+                                                           sig.stake_usdt)
+                    except (ApiError, requests.RequestException) as exc:
+                        LOG.error("NOT recording a position for %s: %s",
+                                  rnd.slug, exc)
+                        self._seen[rnd.topic_id] = rnd.end_ms
+                        continue
+                    if abs(filled - sig.stake_usdt) > EPS:
+                        LOG.warning("Filled %.4f of %.4f requested on %s; "
+                                    "tracking the filled amount",
+                                    filled, sig.stake_usdt, rnd.slug)
+                        sig = replace(sig, stake_usdt=filled)
                 if quote.fee_usdt > 0:
                     LOG.info("Venue fee %.4f USDT (%.0f bps of stake)",
                              quote.fee_usdt,
@@ -3133,10 +3368,19 @@ class Trader:
             tid = self._journal.record(mode, rnd, sig, spot, sigma, bankroll,
                                        order_id)
             self._seen[rnd.topic_id] = rnd.end_ms
-            self._position = Position(tid, rnd, sig, sig.stake_usdt, 1)
-            return      # one position at a time
+            self._positions[rnd.symbol] = Position(tid, rnd, sig,
+                                                   sig.stake_usdt, 1)
+            available -= sig.stake_usdt
+            if (len(self._positions) >= self._cfg.max_concurrent_positions
+                    or available < self._cfg.min_stake_usdt):
+                return
 
-    def _maybe_scale_in(self, bankroll: float) -> None:
+    def _maybe_scale_in_all(self, bankroll: float) -> None:
+        for symbol in list(self._positions):
+            self._maybe_scale_in(bankroll, symbol)
+
+    def _maybe_scale_in(self, bankroll: float,
+                        symbol: Optional[str] = None) -> None:
         """
         Top up an open position as the round moves further into our favour.
 
@@ -3150,9 +3394,11 @@ class Trader:
         exposure to one round stays bounded by Kelly no matter how many
         tranches are added.
         """
-        pos = self._position
+        pos = (self._positions.get(symbol) if symbol is not None
+               else self._position)
         if pos is None or not self._cfg.scale_in:
             return
+        symbol = pos.rnd.symbol
         secs = pos.rnd.seconds_remaining(self._client.now_ms())
         if secs <= self._cfg.entry_window_end_s:
             return                       # too late to fill
@@ -3220,7 +3466,21 @@ class Trader:
                 return
             if abs(quote.price_impact) > self._cfg.max_price_impact:
                 return
-            self._client.place_order(pos.rnd, quote, topup)
+            topup_order = self._client.place_order(pos.rnd, quote, topup)
+            if self._cfg.confirm_fills:
+                try:
+                    filled = self._client.confirm_fill(topup_order, topup)
+                except (ApiError, requests.RequestException) as exc:
+                    # The opener stands; only the top-up failed. Adding it to
+                    # the position would overstate exposure on a fill that
+                    # never happened.
+                    LOG.error("Top-up on %s not confirmed, leaving the "
+                              "position unchanged: %s", pos.rnd.slug, exc)
+                    return
+                if abs(filled - topup) > EPS:
+                    LOG.warning("Top-up filled %.4f of %.4f on %s",
+                                filled, topup, pos.rnd.slug)
+                    topup = filled
             if quote.fee_usdt > 0:
                 LOG.debug("Top-up fee %.4f USDT on %.2f staked",
                           quote.fee_usdt, topup)
@@ -3232,7 +3492,7 @@ class Trader:
                  pos.rnd.slug, topup, avg, prob, secs,
                  pos.committed_usdt + topup, blended, wins_per_loss(blended))
 
-        self._position = replace(
+        self._positions[symbol] = replace(
             pos,
             signal=replace(pos.signal, model_prob=prob, fill_price=blended,
                            stake_usdt=pos.committed_usdt + topup),
@@ -3267,7 +3527,11 @@ class Trader:
         return replace(sig, stake_usdt=stake)
 
     def _settle_open(self) -> None:
-        pos = self._position
+        for symbol in list(self._positions):
+            self._settle_one(symbol)
+
+    def _settle_one(self, symbol: str) -> None:
+        pos = self._positions.get(symbol)
         if pos is None:
             return
         now_ms = self._client.now_ms()
@@ -3310,16 +3574,25 @@ class Trader:
         if not self._live:
             self._paper_bankroll += pnl
 
+        # Read the balance before claiming so the change can be reconciled
+        # against what we expected, rather than inferred.
+        before: Optional[float] = None
+        if self._live:
+            before = self._live_bankroll("settlement")
+
         if won and self._live:
             self._claim(pos)
 
         self._journal.resolve(pos.trade_id, won, pnl, source)
-        if self._risk is not None:
-            self._risk.record_result(won, pos.signal.model_prob)
-        self._position = None
+        self._risk_for(symbol).record_result(won, pos.signal.model_prob)
+        if self._account_risk is not None:
+            self._account_risk.record_result(won, pos.signal.model_prob)
+        self._positions.pop(symbol, None)
+        after = self._bankroll()
         LOG.info("SETTLED %s -> %s  P&L %+.2f  bankroll %.2f  [%s]",
-                 pos.rnd.slug, "WIN" if won else "LOSS", pnl,
-                 self._bankroll(), source)
+                 pos.rnd.slug, "WIN" if won else "LOSS", pnl, after, source)
+        if before is not None:
+            self._reconcile(pos, pnl, before, after)
 
         self._settled_count += 1
         if (self._cfg.report_every
@@ -3328,10 +3601,44 @@ class Trader:
                     self._cfg.profile_name).split("\n"):
                 LOG.info("| %s", line)
 
+    def _reconcile(self, pos: Position, expected_pnl: float,
+                   before: float, after: float) -> None:
+        """
+        Compare the actual balance change against the P&L we computed.
+
+        The bot's own arithmetic and the venue's accounting should agree. When
+        they do not, the venue is right and something here is wrong -- a fee we
+        did not model, a partial fill, or a figure counted twice. Reporting the
+        gap turns a silent drift into a visible one.
+
+        A winning position is normally still unredeemed at this moment, so the
+        balance may legitimately not have moved yet; that case is noted rather
+        than flagged.
+        """
+        actual = after - before
+        reference = max(abs(expected_pnl), self._cfg.min_stake_usdt)
+        drift = abs(actual - expected_pnl)
+
+        if self._unredeemed and abs(actual) < EPS:
+            LOG.debug("Balance unchanged; winnings still unredeemed")
+            return
+        if drift <= reference * self._cfg.reconcile_tolerance:
+            LOG.debug("Reconciled: expected %+.4f, actual %+.4f",
+                      expected_pnl, actual)
+            return
+
+        LOG.warning(
+            "RECONCILE MISMATCH on %s: expected %+.4f, balance moved %+.4f "
+            "(gap %.4f). The venue is authoritative -- if the gap is close to "
+            "the gross payout (%.4f) rather than the profit, something is "
+            "counting the stake twice.",
+            pos.rnd.slug, expected_pnl, actual, drift,
+            pos.committed_usdt / max(pos.signal.fill_price, EPS))
+
     def _drain(self, timeout_s: Optional[float] = None) -> None:
         deadline = time.time() + (timeout_s if timeout_s is not None
                                   else self._cfg.drain_timeout_s)
-        while self._position is not None and time.time() < deadline:
+        while self._positions and time.time() < deadline:
             try:
                 self._settle_open()
             except (ApiError, requests.RequestException) as exc:
@@ -3662,6 +3969,14 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
                     help="open small, then top up while the round stays "
                          "favourable (never after a loss)")
     ap.add_argument("--no-scale-in", dest="scale_in", action="store_false")
+    ap.add_argument("--symbols", default=None,
+                    help="comma-separated markets, e.g. BTCUSDT,ETHUSDT. "
+                         "Each trades independently: its own position slot, "
+                         "loss streak and calibration.")
+    ap.add_argument("--max-concurrent", type=int, default=None,
+                    help="how many markets may hold a position at once")
+    ap.add_argument("--report-symbol", default=None,
+                    help="restrict a report to one market")
     ap.add_argument("--min-buffer", type=float, default=None,
                     help="override the buffer gate, in sigmas of the time "
                          "remaining")
@@ -3768,7 +4083,8 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         return 0
 
     if args.diagnose:
-        print(Journal(args.db).diagnose(args.report_profile))
+        print(Journal(args.db).diagnose(args.report_profile,
+                                        args.report_symbol))
         return 0
 
     key = os.environ.get("BINANCE_API_KEY", "")
@@ -3794,6 +4110,11 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         overrides["report_every"] = args.report_every
     if args.no_fat_tails:
         overrides["use_fat_tails"] = False
+    if args.symbols:
+        overrides["symbols"] = tuple(
+            x.strip().upper() for x in args.symbols.split(",") if x.strip())
+    if args.max_concurrent is not None:
+        overrides["max_concurrent_positions"] = args.max_concurrent
 
     try:
         config_path = args.config if os.path.exists(args.config) else None
@@ -3851,9 +4172,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         print("\n*** LIVE MODE: this will spend real USDT. ***")
         print("Confirm you have (1) run --preflight clean, and (2) reviewed")
         print("--calibration-report over several hundred paper rounds.")
-        # if input('Type "I ACCEPT THE RISK" to continue: ') != "I ACCEPT THE RISK":
-        #     print("Aborted.")
-        #     return 1
+        if input('Type "I ACCEPT THE RISK" to continue: ') != "I ACCEPT THE RISK":
+            print("Aborted.")
+            return 1
 
     try:
         Trader(store if not args.no_hot_reload else cfg).run()

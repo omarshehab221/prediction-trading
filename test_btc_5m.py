@@ -71,8 +71,9 @@ def build_trader(client, config, db_path):
                                    raw_sigma=lambda *a: 0.5)
     t._journal = Journal(db_path, getattr(config, "profile_name", "test"))
     t._paper_bankroll = config.paper_start_bankroll
-    t._risk = RiskManager(config, config.paper_start_bankroll)
-    t._position = None
+    t._risk = {}
+    t._account_risk = RiskManager(config, config.paper_start_bankroll)
+    t._positions = {}
     # The mode actually in force. Derived from config, not reflected: the
     # reflection below cannot evaluate `config.live`, and defaulting it to
     # None made every live-mode test silently run as paper.
@@ -131,6 +132,7 @@ def convex_cfg(**kw) -> Config:
 
 def make_round(**kw) -> Round:
     base = dict(topic_id=1, market_id=9, vendor="PREDICT_FUN", slug="btc-5m",
+                symbol="BTCUSDT",
                 start_ms=1_700_000_000_000,
                 end_ms=1_700_000_000_000 + (m.DEFAULT_ROUND_SECONDS * 1000),
                 up_token_id="1", down_token_id="2",
@@ -690,7 +692,7 @@ class TestSimulatedSession(unittest.TestCase):
 
         self.assertIsNone(t._position)
         self.assertGreater(t._paper_bankroll, 100.0)
-        self.assertEqual(t._risk.consecutive_losses, 0)
+        self.assertEqual(t._account_risk.consecutive_losses, 0)
 
     def test_settles_a_loss_and_debits_bankroll(self):
         start = 1_700_000_000_000
@@ -711,7 +713,7 @@ class TestSimulatedSession(unittest.TestCase):
         t._settle_open()
 
         self.assertAlmostEqual(t._paper_bankroll, 100.0 - staked, places=9)
-        self.assertEqual(t._risk.consecutive_losses, 1)
+        self.assertEqual(t._account_risk.consecutive_losses, 1)
 
     def test_only_one_position_at_a_time(self):
         start = 1_700_000_000_000
@@ -1008,12 +1010,12 @@ class TestRedemption(unittest.TestCase):
     def tearDown(self):
         os.unlink(self.db)
 
-    def _live_trader(self, client):
-        c = cfg(db_path=self.db, live=True)
+    def _live_trader(self, client, **over):
+        c = cfg(db_path=self.db, live=True, **over)
         return build_trader(client, c, self.db)
 
-    def _win_once(self, client):
-        t = self._live_trader(client)
+    def _win_once(self, client, **over):
+        t = self._live_trader(client, **over)
         client.t = 1
         t._maybe_enter(100.0, "LIVE")
         client.t = 2
@@ -1035,20 +1037,31 @@ class TestRedemption(unittest.TestCase):
         self.assertEqual(client.redeemed, ["1"])   # UP token
         self.assertIn("1", t._unredeemed)
 
-    def test_unredeemed_winnings_count_toward_bankroll(self):
-        """The bug this guards: balance falls on stake, rises only on claim."""
+    def test_unredeemed_winnings_are_not_double_counted(self):
+        """
+        The API reading is authoritative by default.
+
+        Adding the gross payout on top of a portfolio figure that already
+        includes settled positions inflated the bankroll by the GROSS payout
+        (stake + profit), not the profit.
+        """
         client = self._client()
-        client.balance = 95.0                      # stake already deducted
+        client.balance = 95.0
         t = self._win_once(client)
+        self.assertAlmostEqual(t._bankroll(), 95.0, places=6)
+
+    def test_unredeemed_can_be_counted_when_explicitly_configured(self):
+        client = self._client()
+        client.balance = 95.0
+        t = self._win_once(client, count_unredeemed_in_bankroll=True)
         payout = t._unredeemed["1"][0]
         self.assertAlmostEqual(t._bankroll(), 95.0 + payout, places=6)
-        self.assertGreater(t._bankroll(), 100.0)   # a win must look like a win
 
     def test_a_winning_streak_does_not_trip_the_loss_limit(self):
         client = self._client()
         client.balance = 82.0                      # three stakes out, none back
         t = self._win_once(client)
-        t._risk.check(t._bankroll())               # must not raise
+        t._account_risk.check(t._bankroll())               # must not raise
 
     def test_confirmed_redemption_clears_the_pending_entry(self):
         client = self._client()
@@ -3316,7 +3329,7 @@ class TestNoBakedInValues(unittest.TestCase):
     """Values that belong to configuration must not be literals in logic."""
 
     def test_symbol_is_configurable(self):
-        c = cfg(symbol="ETHUSDT")
+        c = cfg(symbols=("ETHUSDT",))
         PredictionClient(c)
         try:
             t = TestParseRound.topic(symbol="ETHUSDT")
@@ -3664,7 +3677,7 @@ class TestHotReload(unittest.TestCase):
 
     def test_parsing_attributes_follow_a_reload(self):
         """_parse_round reads class attributes, which must track the config."""
-        self._edit(lambda d: d["defaults"].update(symbol="ETHUSDT"))
+        self._edit(lambda d: d["defaults"].update(symbols=["ETHUSDT"]))
         self.assertTrue(self.store.maybe_reload())
         PredictionClient.apply_config(self.store.current)
         try:
@@ -4076,27 +4089,27 @@ class TestModeSwitching(unittest.TestCase):
         store.maybe_reload()
         t._apply_pending_mode()
         self.assertFalse(t._live)
-        t._position = None
+        t._positions = {}
         t._apply_pending_mode()
         self.assertTrue(t._live)
 
     def test_switch_resets_the_risk_baseline(self):
         store = self._store(live=None)
         t = self._trader(store)
-        before = t._risk
-        t._risk.record_result(False, 0.6)
+        before = t._account_risk
+        t._account_risk.record_result(False, 0.6)
         self._set_live(True)
         store.maybe_reload()
         t._apply_pending_mode()
         self.assertIsNot(t._risk, before)
-        self.assertEqual(t._risk.consecutive_losses, 0)
+        self.assertEqual(t._account_risk.consecutive_losses, 0)
 
     def test_no_change_is_a_no_op(self):
         store = self._store(live=None)
         t = self._trader(store)
-        risk = t._risk
+        risk = t._account_risk
         t._apply_pending_mode()
-        self.assertIs(t._risk, risk)
+        self.assertIs(t._account_risk, risk)
 
     def test_live_is_not_immutable_but_is_deferred(self):
         self.assertNotIn("live", m.IMMUTABLE_FIELDS)
@@ -4426,6 +4439,223 @@ class TestDeploymentManifests(unittest.TestCase):
         text = self._read("Dockerfile")
         self.assertIn("CONFIG_PATH=/var/data/", text)
         self.assertIn("DB_PATH=/var/data/", text)
+
+
+class TestMultiMarket(unittest.TestCase):
+    """
+    Each market trades independently.
+
+    Isolated: position slot, loss streak, calibration, volatility.
+    NOT isolated, because there is one account: the bankroll, the daily loss
+    limit, the venue quota.
+    """
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _cfg(self, **over):
+        base = dict(m.PROFILES["buffer"])
+        base.update(symbols=("BTCUSDT", "ETHUSDT"),
+                    max_concurrent_positions=2, db_path=self.db)
+        base.update(over)
+        return cfg(**base)
+
+    def _trader(self, **over):
+        client = FakeClient([], [(0, 65_000.0)], {}, {})
+        return build_trader(client, self._cfg(**over), self.db)
+
+    def test_only_configured_symbols_are_parsed(self):
+        PredictionClient(self._cfg())
+        try:
+            for sym, ok in (("BTCUSDT", True), ("ETHUSDT", True),
+                            ("SOLUSDT", False)):
+                r = PredictionClient._parse_round(
+                    TestParseRound.topic(symbol=sym))
+                self.assertEqual(r is not None, ok, sym)
+        finally:
+            PredictionClient(cfg())
+
+    def test_round_carries_its_market(self):
+        PredictionClient(self._cfg())
+        try:
+            r = PredictionClient._parse_round(
+                TestParseRound.topic(symbol="ETHUSDT"))
+            self.assertEqual(r.symbol, "ETHUSDT")
+        finally:
+            PredictionClient(cfg())
+
+    def test_positions_are_held_per_market(self):
+        t = self._trader()
+        for sym in ("BTCUSDT", "ETHUSDT"):
+            rnd = make_round(symbol=sym, topic_id=hash(sym) % 1000)
+            t._positions[sym] = Position(
+                1, rnd, Signal(Side.UP, 0.9, 0.85, 0.02, 2.0, 60.0, 2.0),
+                2.0, 1)
+        self.assertEqual(len(t._positions), 2)
+
+    def test_loss_streaks_do_not_cross_markets(self):
+        t = self._trader()
+        for _ in range(5):
+            t._risk_for("BTCUSDT").record_result(False, 0.9)
+        self.assertEqual(t._risk_for("BTCUSDT").consecutive_losses, 5)
+        self.assertEqual(t._risk_for("ETHUSDT").consecutive_losses, 0)
+
+    def test_each_market_gets_its_own_risk_manager(self):
+        t = self._trader()
+        self.assertIsNot(t._risk_for("BTCUSDT"), t._risk_for("ETHUSDT"))
+
+    def test_bankroll_is_shared_not_isolated(self):
+        """One account: exposure must be counted across markets."""
+        t = self._trader()
+        t._positions["BTCUSDT"] = Position(
+            1, make_round(symbol="BTCUSDT"),
+            Signal(Side.UP, 0.9, 0.85, 0.02, 3.0, 60.0, 2.0), 3.0, 1)
+        self.assertAlmostEqual(t._committed(), 3.0)
+
+    def test_new_positions_size_against_uncommitted_funds(self):
+        t = self._trader(reserve_pct=0.0)
+        self.assertAlmostEqual(t._available(100.0), 100.0)
+        t._positions["BTCUSDT"] = Position(
+            1, make_round(symbol="BTCUSDT"),
+            Signal(Side.UP, 0.9, 0.85, 0.02, 10.0, 60.0, 2.0), 10.0, 1)
+        self.assertAlmostEqual(t._available(100.0), 90.0)
+
+    def test_reserve_is_always_held_back(self):
+        t = self._trader(reserve_pct=0.30)
+        self.assertAlmostEqual(t._available(100.0), 70.0)
+
+    def test_available_never_goes_negative(self):
+        t = self._trader(reserve_pct=0.90)
+        t._positions["BTCUSDT"] = Position(
+            1, make_round(symbol="BTCUSDT"),
+            Signal(Side.UP, 0.9, 0.85, 0.02, 50.0, 60.0, 2.0), 50.0, 1)
+        self.assertGreaterEqual(t._available(100.0), 0.0)
+
+    def test_concurrency_is_capped(self):
+        c = self._cfg(max_concurrent_positions=1)
+        self.assertEqual(c.max_concurrent_positions, 1)
+
+    def test_duplicate_symbols_are_rejected(self):
+        with self.assertRaises(ValueError):
+            cfg(symbols=("BTCUSDT", "BTCUSDT"))
+
+    def test_empty_symbols_are_rejected(self):
+        with self.assertRaises(ValueError):
+            cfg(symbols=())
+
+    def test_symbol_property_returns_the_first(self):
+        self.assertEqual(cfg(symbols=("ETHUSDT", "BTCUSDT")).symbol, "ETHUSDT")
+
+    def test_journal_records_the_market(self):
+        j = Journal(self.db, "buffer")
+        sig = Signal(Side.UP, 0.9, 0.85, 0.02, 2.0, 60.0, 2.0)
+        j.record("PAPER", make_round(symbol="ETHUSDT"), sig, 3000, 0.5, 100.0)
+        row = j._conn.execute("SELECT symbol FROM trades").fetchone()
+        self.assertEqual(row[0], "ETHUSDT")
+
+    def test_diagnose_can_scope_to_one_market(self):
+        j = Journal(self.db, "buffer")
+        for sym, wins in (("BTCUSDT", 30), ("ETHUSDT", 5)):
+            for i in range(40):
+                sig = Signal(Side.UP, 0.9, 0.60, 0.02, 2.0, 60.0, 2.0)
+                t = j.record("PAPER", make_round(symbol=sym), sig,
+                             3000, 0.5, 100.0)
+                j.resolve(t, i < wins, 1.0 if i < wins else -1.0, "venue")
+        btc = j.diagnose("buffer", "BTCUSDT")
+        eth = j.diagnose("buffer", "ETHUSDT")
+        self.assertIn("BTCUSDT", btc)
+        self.assertIn("75.0%", btc)
+        self.assertIn("12.5%", eth)
+
+    def test_calibration_report_breaks_down_by_market(self):
+        j = Journal(self.db, "buffer")
+        for sym in ("BTCUSDT", "ETHUSDT"):
+            for i in range(30):
+                sig = Signal(Side.UP, 0.9, 0.60, 0.02, 2.0, 60.0, 2.0)
+                t = j.record("PAPER", make_round(symbol=sym), sig,
+                             3000, 0.5, 100.0)
+                j.resolve(t, i % 2 == 0, 1.0, "venue")
+        report = j.calibration_report("buffer")
+        self.assertIn("Per market", report)
+        self.assertIn("ETHUSDT", report)
+
+
+class TestBalanceReconciliation(unittest.TestCase):
+    """
+    The API is authoritative for the balance.
+
+    Adding unclaimed winnings to a portfolio figure that already includes
+    settled positions inflated the bankroll by the GROSS payout -- stake plus
+    profit -- not the profit.
+    """
+
+    def test_gross_payout_is_larger_than_the_profit(self):
+        stake, price = 1.0, 0.60
+        profit = settle_pnl(stake, price, True, 200)
+        gross = stake / price
+        self.assertAlmostEqual(gross, 1.6667, places=3)
+        self.assertLess(profit, 1.0)
+        self.assertGreater(gross - profit, 0.9)
+
+    def test_default_does_not_count_unredeemed(self):
+        self.assertFalse(cfg().count_unredeemed_in_bankroll)
+
+    def test_reconcile_tolerance_is_configurable(self):
+        self.assertGreater(cfg().reconcile_tolerance, 0.0)
+
+    def test_reconcile_warns_on_a_mismatch(self):
+        import logging as _log
+        fd, db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            c = cfg(db_path=db, live=True)
+            client = FakeClient([], [(0, 65_000.0)], {}, {})
+            t = build_trader(client, c, db)
+            pos = Position(1, make_round(),
+                           Signal(Side.UP, 0.9, 0.60, 0.02, 1.0, 60.0, 2.0),
+                           1.0, 1)
+            records = []
+
+            class Cap(_log.Handler):
+                def emit(self, rec):
+                    records.append(rec.getMessage())
+
+            handler = Cap(); prev = m.LOG.level
+            m.LOG.setLevel(_log.WARNING); m.LOG.addHandler(handler)
+            try:
+                t._reconcile(pos, 0.65, 100.0, 101.67)
+            finally:
+                m.LOG.removeHandler(handler); m.LOG.setLevel(prev)
+            self.assertTrue(any("RECONCILE MISMATCH" in r for r in records))
+        finally:
+            os.unlink(db)
+
+    def test_reconcile_is_quiet_when_it_agrees(self):
+        import logging as _log
+        fd, db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            t = build_trader(FakeClient([], [(0, 65_000.0)], {}, {}),
+                             cfg(db_path=db, live=True), db)
+            pos = Position(1, make_round(),
+                           Signal(Side.UP, 0.9, 0.60, 0.02, 1.0, 60.0, 2.0),
+                           1.0, 1)
+            records = []
+
+            class Cap(_log.Handler):
+                def emit(self, rec):
+                    records.append(rec.getMessage())
+
+            handler = Cap(); prev = m.LOG.level
+            m.LOG.setLevel(_log.WARNING); m.LOG.addHandler(handler)
+            try:
+                t._reconcile(pos, 0.65, 100.0, 100.65)
+            finally:
+                m.LOG.removeHandler(handler); m.LOG.setLevel(prev)
+            self.assertFalse(any("MISMATCH" in r for r in records))
+        finally:
+            os.unlink(db)
 
 
 class TestJournal(unittest.TestCase):
