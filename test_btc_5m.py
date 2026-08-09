@@ -4628,9 +4628,25 @@ class TestModeIsNotHardcoded(unittest.TestCase):
         path = _os.path.join(self.here, "render.yaml")
         if not _os.path.exists(path):
             self.skipTest("render.yaml not present")
-        hit = _re.search(r"key:\s*TRADING_MODE\s*\n\s*value:\s*(\w+)",
-                         open(path).read())
-        self.assertIn(hit.group(1), ("paper", "live"))
+        # The key and its live value may be separated by commented-out
+        # alternatives (`# value: paper`). Matching only the line immediately
+        # after the key made the test fail on a perfectly valid manifest, so
+        # scan forward past comments and blank lines to the first real value.
+        lines = open(path).read().split("\n")
+        value = None
+        for i, line in enumerate(lines):
+            if not _re.match(r"\s*-?\s*key:\s*TRADING_MODE\s*$", line):
+                continue
+            for follow in lines[i + 1:]:
+                if not follow.strip() or follow.strip().startswith("#"):
+                    continue
+                hit = _re.match(r"\s*value:\s*(\w+)\s*$", follow)
+                value = hit.group(1) if hit else None
+                break
+            break
+        self.assertIsNotNone(
+            value, "render.yaml declares no TRADING_MODE value")
+        self.assertIn(value, ("paper", "live"))
 
 
 class TestDeploymentManifests(unittest.TestCase):
@@ -5967,3 +5983,117 @@ class TestNewCliSurface(unittest.TestCase):
         for name in ("min_win_return", "trend_follow", "trend_stake_multiple",
                      "auth_wait_timeout_s"):
             self.assertIn(name, doc["defaults"], name)
+
+
+class TestLoopSurvivesUnexpectedFailures(unittest.TestCase):
+    """
+    The run loop's error handling, which nothing else in this file exercised.
+
+    Two guarantees, and they fail differently:
+      * a storage or OS fault is RECOVERABLE -- it goes through the backoff
+        counter like any API error rather than killing the process on its
+        first occurrence;
+      * a genuine bug is FATAL, but must still settle whatever is already
+        staked before the process goes away.
+    """
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _stub_trader(self, boom):
+        """A Trader whose loop body raises `boom`, with startup stubbed out."""
+        c = cfg(db_path=self.db, max_consecutive_errors=3,
+                poll_interval_s=0.001, error_backoff_max_s=0.001)
+        t = m.Trader.__new__(m.Trader)
+        t._static_cfg = c
+        t._store = None
+        t._positions = {}
+        t._unredeemed = {}
+        t._errors = 0
+        t._stopping = False
+        t._seen = {}
+        t._drained = False
+        t._active_live = False
+        t._pending_live = None
+        t._account_risk = None
+        t._risk = {}
+        t._missed = {}
+        t._failed_claims = {}
+
+        class _Client:
+            def sync_clock(self):
+                return 0
+
+            def now_ms(self):
+                return 0
+
+        t._client = _Client()
+        t._bankroll = lambda: 1000.0
+        t._install_signal_handlers = lambda: None
+        t._settle_open = lambda: None
+        t._tally_missed = lambda now_ms: None
+        t._apply_pending_mode = lambda: None
+        t._maybe_scale_in_all = lambda b: None
+
+        def _drain(timeout_s=None):
+            t._drained = True
+            t._positions.clear()
+
+        t._drain = _drain
+
+        def _enter(bankroll, mode):
+            raise boom
+
+        t._maybe_enter = _enter
+        return t
+
+    def test_journal_fault_is_recoverable_not_fatal(self):
+        """A locked or full journal must not end the process outright."""
+        import sqlite3 as _sq
+        t = self._stub_trader(_sq.OperationalError("database is locked"))
+        t.run()                       # halts cleanly rather than propagating
+        self.assertGreaterEqual(t._errors, 3)
+
+    def test_disk_fault_is_recoverable_not_fatal(self):
+        t = self._stub_trader(OSError(28, "No space left on device"))
+        t.run()
+        self.assertGreaterEqual(t._errors, 3)
+
+    def test_a_recoverable_fault_drains_when_it_finally_halts(self):
+        t = self._stub_trader(OSError(28, "No space left on device"))
+        t._positions["BTCUSDT"] = object()
+        t.run()
+        self.assertTrue(t._drained)
+
+    def test_an_unexpected_bug_drains_before_dying(self):
+        """The whole point: a crash must not abandon a staked position."""
+        t = self._stub_trader(ZeroDivisionError("bug"))
+        t._positions["BTCUSDT"] = object()
+        with self.assertRaises(ZeroDivisionError):
+            t.run()
+        self.assertTrue(t._drained,
+                        "unexpected exception abandoned an open position")
+
+    def test_an_unexpected_bug_still_stops_the_bot(self):
+        """Draining is not carrying on: the bot must still stop."""
+        t = self._stub_trader(ZeroDivisionError("bug"))
+        with self.assertRaises(ZeroDivisionError):
+            t.run()
+
+    def test_a_healthy_loop_resets_the_error_counter(self):
+        """Guards the fix: the counter must not creep up on success."""
+        t = self._stub_trader(ZeroDivisionError("unused"))
+        calls = {"n": 0}
+
+        def _enter(bankroll, mode):
+            calls["n"] += 1
+            if calls["n"] >= 3:
+                t._stopping = True
+
+        t._maybe_enter = _enter
+        t.run()
+        self.assertEqual(t._errors, 0)

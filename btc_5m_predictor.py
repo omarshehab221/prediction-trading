@@ -3838,7 +3838,14 @@ class Trader:
                     self._errors = 0
                 except (TradingHalted, Shutdown):
                     raise
-                except (ApiError, requests.RequestException) as exc:
+                # sqlite3.Error and OSError belong here for the same reason
+                # ApiError does: a full disk, a briefly locked journal or a
+                # socket the requests layer did not wrap are all transient
+                # conditions that the backoff-then-halt path already handles
+                # correctly. Left out, each one killed the process outright
+                # while a position was open.
+                except (ApiError, requests.RequestException,
+                        sqlite3.Error, OSError) as exc:
                     self._errors += 1
                     LOG.warning("Recoverable error %d/%d: %s", self._errors,
                                 self._cfg.max_consecutive_errors, exc)
@@ -3866,6 +3873,27 @@ class Trader:
             LOG.info("Clean shutdown; no position abandoned.")
         except KeyboardInterrupt:
             LOG.info("Interrupted; open position left in the journal.")
+        except Exception:                    # noqa: BLE001 - see below
+            # A bug is not a reason to walk away from money already staked.
+            # Every unanticipated exception previously escaped run(), killed
+            # the process and abandoned the open position: the journal row
+            # stayed unresolved and, in live mode, a winning token went
+            # unclaimed. Catching here costs nothing -- the bot still stops,
+            # and still stops loudly -- but it stops AFTER the position has
+            # been settled and claimed.
+            #
+            # Deliberately not catching BaseException: SystemExit from the
+            # second interrupt signal means "leave now", and KeyboardInterrupt
+            # is handled above.
+            LOG.exception("Unexpected error; shutting down")
+            if self._positions:
+                LOG.info("Draining %d open position(s) before exit...",
+                         len(self._positions))
+                try:
+                    self._drain()
+                except Exception:            # noqa: BLE001
+                    LOG.exception("Drain failed; positions remain open")
+            raise
 
     def _maybe_enter(self, bankroll: float, mode: str) -> None:
         # The cap the config actually declares. An earlier version returned
@@ -5057,6 +5085,15 @@ def main(argv: Iterable[str] | None = None) -> int:
         Trader(store if not args.no_hot_reload else cfg).run()
     except ApiError as exc:
         print(f"\nStopped [{exc.kind.value}]: {exc}", file=sys.stderr)
+        return 1
+    except Exception:                        # noqa: BLE001
+        # run() has already logged the traceback and drained. What is left is
+        # to exit non-zero with a pointer to the journal, rather than dumping
+        # a second copy of the same traceback onto the operator.
+        print("\nStopped by an unexpected error; see the log above.",
+              file=sys.stderr)
+        print("  Open positions were drained before exit. Check the journal "
+              "with --calibration-report before restarting.", file=sys.stderr)
         return 1
     return 0
 
