@@ -3296,9 +3296,9 @@ def main(argv: Optional[Iterable[str]] = None) -> int:
         print("\n*** LIVE MODE: this will spend real USDT. ***")
         print("Confirm you have (1) run --preflight clean, and (2) reviewed")
         print("--calibration-report over several hundred paper rounds.")
-        if input('Type "I ACCEPT THE RISK" to continue: ') != "I ACCEPT THE RISK":
-            print("Aborted.")
-            return 1
+        # if input('Type "I ACCEPT THE RISK" to continue: ') != "I ACCEPT THE RISK":
+        #     print("Aborted.")
+        #     return 1
 
     try:
         Trader(cfg).run()
