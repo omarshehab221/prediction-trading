@@ -271,7 +271,7 @@ def fuzz_parsers(rng: random.Random, trials: int) -> None:
                   str(rnd.decimal_precision))
 
 
-def fuzz_evaluate(rng: random.Random, trials: int) -> None:
+def fuzz_assess(rng: random.Random, trials: int) -> None:
     """Any Signal returned must satisfy every configured constraint."""
     for _ in range(trials):
         c = cfg(**m.PROFILES[rng.choice(list(m.PROFILES))])
@@ -289,6 +289,7 @@ def fuzz_evaluate(rng: random.Random, trials: int) -> None:
             fee_bps=rng.randint(0, 900), chain_id="56", collateral="USDT",
             venue_slippage_bps=1200, decimal_precision=2,
             liquidity=rng.uniform(0, 1e6), strike=strike, feed_symbol="BTCUSDT")
+        bankroll = rng.uniform(1, 1e5)
         now = rnd.end_ms - int(rng.uniform(0, 320) * 1000)
         book = None
         if rng.random() < 0.7:
@@ -298,15 +299,33 @@ def fuzz_evaluate(rng: random.Random, trials: int) -> None:
                 book[side] = sorted(
                     (min(base + i * rng.uniform(0, .05), 0.99),
                      rng.uniform(1, 1e5)) for i in range(rng.randint(1, 4)))
+        # A trend that may be confirmed, unconfirmed, dying or reversing.
+        # The boost widens the window and multiplies the stake, so every
+        # invariant below has to hold with it in play, not only without it.
+        trend = m.Trend(
+            direction=rng.choice([-1, 0, 1]),
+            impulse=rng.choice([0.0, 0.5, 1.3, 4.0, 1e6]),
+            z=rng.uniform(0.0, 6.0), efficiency=rng.uniform(0.0, 1.0),
+            run=rng.randint(0, 9), decay=rng.uniform(0.0, 1.5),
+            rounds_left=rng.choice([0.0, 0.5, 1.0, 3.0, 99.0]),
+            phase=rng.choice(["none", "building", "running", "fading"]))
         try:
-            sig = m.evaluate(rnd, strike * rng.uniform(0.97, 1.03),
-                             rng.uniform(0.05, 3.0), rng.uniform(1, 1e5),
-                             now, c, book, rng.choice([None, 3.0, 6.0]))
+            verdict = m.assess(rnd, strike * rng.uniform(0.97, 1.03),
+                               rng.uniform(0.05, 3.0), bankroll,
+                               now, c, book, rng.choice([None, 3.0, 6.0]),
+                               trend)
         except Exception as exc:           # noqa: BLE001
-            check("evaluate hostile input", False,
+            check("assess hostile input", False,
                   f"{type(exc).__name__}: {exc}")
             continue
+        sig = verdict.signal
         if sig is None:
+            # A declined round must always say why, or the operator cannot
+            # tell a quiet market from a broken one.
+            check("decline is explained", bool(verdict.blocked_by),
+                  "empty reason")
+            check("decline reason is known",
+                  verdict.blocked_by in m._DECLINE_ORDER, verdict.blocked_by)
             continue
         check("signal price band",
               c.min_entry_price <= sig.fill_price <= c.max_entry_price,
@@ -315,8 +334,30 @@ def fuzz_evaluate(rng: random.Random, trials: int) -> None:
               f"{sig.edge} < {c.min_edge}")
         check("signal stake positive", sig.stake_usdt > 0, str(sig.stake_usdt))
         check("signal within entry window",
-              c.entry_window_end_s <= sig.seconds_left <= c.entry_window_start_s,
+              c.entry_window_end_s <= sig.seconds_left
+              <= m.entry_window_start_s(c, sig.trend_boosted),
               str(sig.seconds_left))
+        # An early entry is only ever granted to the side the trend points
+        # at, and only while that trend is confirmed.
+        if sig.seconds_left > c.entry_window_start_s:
+            check("early entry implies a confirmed aligned trend",
+                  sig.trend_boosted and trend.confirmed(c)
+                  and trend.favours(sig.side),
+                  f"{sig.seconds_left}s left without a trend")
+        # The return floor binds on the price actually paid.
+        check("signal clears the return floor",
+              m.clears_return(sig.fill_price, rnd.fee_bps, c),
+              f"{sig.fill_price} pays "
+              f"{m.win_return(sig.fill_price, rnd.fee_bps):.4f} "
+              f"< {c.min_win_return}")
+        # Boosted or not, no stake may pass twice full Kelly. Measured
+        # against the same bankroll the sizing used, or the ratio is
+        # meaningless.
+        mult = m.kelly_multiple(sig.stake_usdt, bankroll, sig.model_prob,
+                                sig.fill_price, rnd.fee_bps)
+        if mult is not None:
+            check("stake never passes 2x full Kelly", mult <= 2.0 + 1e-6,
+                  f"{mult:.3f}x")
         check("signal prob valid", 0.0 <= sig.model_prob <= 1.0,
               str(sig.model_prob))
 
@@ -336,7 +377,7 @@ def main() -> int:
         ("settlement P&L", fuzz_settle),
         ("wei conversion", fuzz_wei),
         ("payload parsers", fuzz_parsers),
-        ("evaluate", fuzz_evaluate),
+        ("assess", fuzz_assess),
     ]
     for name, fn in suites:
         before = len(failures)

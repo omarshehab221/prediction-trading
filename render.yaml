@@ -56,7 +56,14 @@ services:
       # Leave it unset to let config.json govern, which makes the mode
       # hot-reloadable: edit the file and the bot switches once it is flat.
       - key: TRADING_MODE
-        value: paper
+        # value: paper
+        value: live
+      # Comma-separated markets to RESTRICT trading to, e.g. BTCUSDT,ETHUSDT.
+      # Pins `symbols`, overriding the config file, the same way TRADING_MODE
+      # pins `live`. Leave empty (the default) to discover and trade every
+      # 5-minute up/down market the venue lists.
+      - key: SYMBOLS
+        value: ""
       - key: PYTHONUNBUFFERED
         value: "1"             # stream logs live instead of in bursts
       # Set to "1" only to start a bot whose checks are failing, while you
@@ -67,3 +74,17 @@ services:
       # warning; "1" (default) refuses to start on one.
       - key: PREFLIGHT_REQUIRED
         value: "1"
+      # Seconds preflight waits for a signed request to be ACCEPTED before
+      # giving up. This exists because a starter worker has no dedicated IP:
+      # the outbound address is not knowable until the process is running and
+      # can change on any restart, so it cannot be added to Binance's
+      # allowlist in advance. Preflight prints the address and then keeps
+      # knocking, which turns a one-second race into a window long enough to
+      # paste it into the key's allowlist.
+      #
+      # Bounded, not infinite: a worker waiting forever on a key that is
+      # simply wrong costs money and reports nothing. Render restarts a
+      # failed worker, so a genuinely transient problem resolves on the next
+      # attempt. Set to "0" to fail on the first refusal.
+      - key: AUTH_WAIT_S
+        value: "600"

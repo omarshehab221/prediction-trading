@@ -112,8 +112,12 @@ echo "Edit $CONFIG_PATH at any time; changes apply within a poll interval."
 # while Python never sees it. The bot's graceful shutdown -- stop opening
 # positions, let the open one resolve -- would never run, and every redeploy
 # would abandon a position mid-round.
+# No --live or --paper here on purpose. A command-line flag BEATS the
+# TRADING_MODE environment variable, so hardcoding one makes that variable
+# dead: render.yaml could read TRADING_MODE=paper while the process traded
+# real money. Set TRADING_MODE=live to go live; leave it unset to let
+# config.json govern, which is what makes the mode hot-reloadable.
 exec python btc_5m_predictor.py \
   --config "$CONFIG_PATH" \
   --db "$DB_PATH" \
-  "$@" \
-  --live
+  "$@"

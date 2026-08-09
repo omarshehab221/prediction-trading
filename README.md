@@ -1,7 +1,9 @@
 # BTC 5-minute prediction market bot
 
-An automated trader for Binance Wallet Prediction Markets, restricted to the
-BTC 5-minute Up/Down contract.
+An automated trader for Binance Wallet Prediction Markets. By default it
+discovers and trades every 5-minute Up/Down contract the venue lists (BTC,
+ETH, whatever else is listed); it can be restricted to specific markets if
+you want fewer.
 
 **Read this first:** the bot is built to find out whether an edge exists, not
 to assume one. It spends most of its time doing nothing, and the most valuable
@@ -100,12 +102,13 @@ Only then consider `--live`.
 |---|---|
 | `--write-config` | Emit every setting to a file. Refuses to overwrite. |
 | `--check-config` | Validate the file. No network, no journal. |
-| `--preflight` | Probe region, keys, wallet, balance, book, quote. |
+| `--preflight` | Probe region, keys, wallet, balance, book, quote. Waits for IP allowlisting if `AUTH_WAIT_S` is set. |
 | `--discover-min` | Measure the venue's real minimum order size. |
 | `--whoami` | Show the outbound IP (for API key allowlists). |
+| `--wait-for-auth N` | Seconds `--preflight` waits for a signed request to be accepted, so a shared outbound IP can be allowlisted while it retries. Same as `AUTH_WAIT_S`; the flag wins. |
 | `--calibration-report` | Is the model calibrated? Per profile. |
 | `--diagnose` | Is the edge real? Win rate vs break-even, per price band. |
-| `--symbols A,B,C` | Markets to trade, each independently. |
+| `--symbols A,B,C` | RESTRICT trading to these markets. Default: none, meaning every market is discovered and traded automatically. Same as the `SYMBOLS` env var; the flag wins if both are set. |
 | `--max-concurrent N` | How many markets may hold a position at once. |
 | `--report-symbol` | Scope a report to one market. |
 | `--live` / `--paper` | Pin the mode. Unset → the config file governs. |
@@ -113,18 +116,33 @@ Only then consider `--live`.
 | `--verbose` | Log the full signed request (signature redacted). |
 
 Overrides: `--kelly`, `--min-edge`, `--fee-bps`, `--min-buffer`,
-`--paper-bankroll`, `--scale-in` / `--no-scale-in`, `--report-every`,
-`--no-fat-tails`, `--no-hot-reload`.
+`--min-return`, `--trend-follow` / `--no-trend-follow`, `--paper-bankroll`,
+`--scale-in` / `--no-scale-in`, `--report-every`, `--no-fat-tails`,
+`--no-hot-reload`.
 
 ---
 
 ## 5. Markets
 
-The bot trades any number of 5-minute up/down markets. Each is an independent
-instrument:
+By default the bot discovers and trades **every** 5-minute up/down market the
+venue lists — no need to name them. Each traded market is an independent
+instrument, capped by `max_concurrent_positions` (default 2) so an active
+listing does not silently multiply exposure:
+
+```bash
+python3 btc_5m_predictor.py                          # every market, auto-discovered
+python3 btc_5m_predictor.py --max-concurrent 3        # allow up to 3 concurrent positions
+```
+
+To restrict trading to specific markets instead, set `--symbols`, the
+`SYMBOLS` environment variable (handy on a host where the command line is
+fixed), or `symbols` in `config.json` — the flag wins if more than one is
+set, and the config file is hot-reloadable so editing it does not require a
+restart:
 
 ```bash
 python3 btc_5m_predictor.py --symbols BTCUSDT,ETHUSDT,SOLUSDT --max-concurrent 3
+# or:  SYMBOLS=BTCUSDT,ETHUSDT,SOLUSDT python3 btc_5m_predictor.py --max-concurrent 3
 ```
 
 **Isolated per market:** position slot, loss streak, calibration statistics,
@@ -156,16 +174,20 @@ Five strategies, differing in which contracts they buy:
 
 | Profile | Entry band | Max stake | Buffer gate | Entry window | Paper |
 |---|---|---|---|---|---|
-| `buffer` *(default)* | 0.80–0.97 | 10% | ≥1.5σ | 180–15s | $25 |
+| `buffer` *(default)* | 0.55–0.80 | 10% | ≥0.75σ | 270–15s | $25 |
 | `favorite` | 0.55–0.80 | 10% | — | 120–20s | $25 |
 | `micro` | 0.35–0.75 | 20% | — | 200–25s | $7 |
 | `balanced` | 0.10–0.90 | 5% | — | 150–25s | $100 |
 | `convex` | 0.05–0.35 | 2% | — | 280–30s | $100 |
 
-**`buffer`** encodes "wait for a large buffer late in the round, then size up".
-The gate is expressed in standard deviations of the *remaining* time, so the
-same buffer counts for more as the clock runs down: ~22 bps with 150s left,
-~10 bps with 30s.
+**`buffer`** encodes "wait for a buffer to open, back the side it favours,
+press it while the market has inertia — and refuse any price whose win is too
+small to be worth the loss it risks". The gate is expressed in standard
+deviations of the *remaining* time, so the same buffer counts for more as the
+clock runs down: ~11 bps with 150s left, ~5 bps with 30s.
+
+It is the only profile with a **return floor** (§6.1) and the only one that
+**follows trends** (§6.2).
 
 **`convex`** buys longshots — the opposite side of the market. Only one of these
 can be on the right side of any pricing bias, which is what the calibration
@@ -174,6 +196,97 @@ report's favourite-longshot table measures.
 **`micro`** exists because a small account cannot use a percentage cap: at $6.64
 a $1 minimum order *is* 15% of the balance. That risk is forced by arithmetic,
 not chosen.
+
+### 6.1 The return floor (`buffer` only)
+
+A positive edge says a bet is priced wrong. It says nothing about whether being
+right pays enough to be worth the loss it risks — and those are different
+questions, measured in different units.
+
+Buying at 0.94 with a model probability of 0.99 clears every edge test
+comfortably. It also returns about **6%** on a win, so **one loss erases
+sixteen wins**. A day of patient, correct trading is undone by a single round
+going the other way.
+
+`min_win_return` sets a floor on the net profit per unit staked, after the
+market's own fee. At `0.25` a win must pay at least a quarter of the stake,
+which caps the fill price at `(1-fee)/((1-fee)+0.25)` — about **0.797** at a
+2% fee. The ceiling is *derived from each market's published fee* rather than
+written down, so a market with a different fee automatically gets a different
+one. It is enforced everywhere money is committed: the screen, the walked book
+average, the venue's executable quote, every top-up, and the blended price
+across tranches.
+
+**What this costs, stated plainly.** Price and buffer move together. A 1.5σ
+buffer *is* a ~93% chance, and a market that has noticed will quote near 0.93 —
+which the floor now refuses. So the trades that remain are the ones where the
+buffer is real but **the book has not caught up**: the venue still quoting 0.75
+while spot has already moved. That is a genuine edge, and there are fewer such
+rounds than there were cheap-looking 0.94s. `min_buffer_sigmas` is 0.75 for the
+same reason — demanding 1.5σ while capping the price at 0.80 asks for a 93%
+chance at a 79% price, which almost never coexists.
+
+**Not trading is not the same as not looking.** The entry window is 270–15s,
+nearly the whole round, so the bot is watching when a good price appears rather
+than sampling a narrow slice of it. A round declined for price is *not* written
+off — it stays under review on every poll until it expires. And every expired
+round is tallied by what blocked it:
+
+```
+No trade in 75 round(s) so far: 61 win pays less than the return floor;
+  9 buffer too small for the time left; 5 edge below the floor
+  The prices on offer were fine bets but small wins. Lower min_win_return to
+  trade more of them, understanding that is the trade you asked not to make.
+```
+
+That line is the point. Silence is indistinguishable from a broken endpoint;
+a reason is something you can act on.
+
+### 6.2 Trend following (`buffer` only)
+
+BTC often runs the same way for several rounds. While that lasts, entering
+early is both cheaper and more likely to be right — which is where large
+cumulative profits come from.
+
+**The detector deliberately does not count consecutive rounds.** That detector
+is structurally late: by the time three rounds have confirmed a move, the move
+is three rounds old and the price is at its worst. Acting on a trend that has
+already spent itself is close to a guaranteed loss.
+
+So the trigger is the **current block**:
+
+| Measure | Question it answers |
+|---|---|
+| `impulse` | How large is the move happening *right now*, in σ of one round-length? **This is the trigger.** |
+| `run` | How many consecutive round-blocks agree? Corroboration and a brake — never the trigger. |
+| `decay` | Current block's size relative to the previous one. Below `trend_decay_floor` the move is dying. |
+| `rounds_left` | Projecting that decay: how many more rounds before it sinks under the noise floor? |
+| `efficiency` | Net displacement ÷ total distance travelled. Catches a market swinging across the strike. |
+| `z` | Net move over the run, in σ of the run. Confirms rather than announces. |
+
+Direction comes from the block in progress, so a **reversal reads as a new
+trend beginning at `run=1`**, not as the old trend continuing. A detector
+anchored to the older blocks would still be reading UP at the moment price
+turned down — the top of the move, and the single worst place to buy.
+
+Phases: `none` → nothing happening · `building` → first thrust, tradable ·
+`running` → confirmed and alive · `fading` → decaying, **refused**.
+
+`trend_min_rounds_left` defaults to 1.0, which asks the only question an entry
+actually poses: *does this move survive the round I am about to enter?*
+
+When confirmed **and** pointing the same way as the trade, two things change:
+the entry window widens by `trend_early_entry_s` (90s), and the stake is
+multiplied by `trend_stake_multiple` (1.5×) — clipped by both the hard stake
+cap and **2× full Kelly**, past which expected log growth is negative. The
+widened window applies *only* to the side the trend favours; using a trend as
+an excuse to trade against it is not a relaxation this grants.
+
+Everything is measured from the same klines the volatility estimate already
+fetches, so it costs no extra API calls, and `trend_z` is written to the
+journal so you can later ask whether boosted trades earned their extra size.
+
+---
 
 ### Scale-in (buffer only)
 
@@ -185,8 +298,11 @@ round turns against you, nothing is added.
 
 A counterintuitive constraint applies. Top-ups happen at a **higher** price, so
 each one raises the blended fill and *shrinks* the payout — a large top-up can
-turn a 6-wins-per-loss position into a 15-wins-per-loss one. `max_blended_price`
-caps the blend; top-ups are trimmed to fit or skipped.
+turn a 6-wins-per-loss position into a 15-wins-per-loss one. The effective cap
+is `min(max_blended_price, whatever price still clears min_win_return at this
+market's fee)`; top-ups are trimmed to fit or skipped. A position opened at
+trend size tops up to the trend-sized target, so the boost is not silently
+unwound halfway through the round.
 
 ---
 
@@ -276,8 +392,48 @@ See `DEPLOY.md`. Three things will break it silently:
 3. **`exec` in the entrypoint.** Without it the shell keeps PID 1, Python never
    receives SIGTERM, and every redeploy abandons a position mid-round.
 
+4. **Do not pin the mode in `entrypoint.sh`.** A `--live` flag on the exec line
+   beats `TRADING_MODE`, so the manifest can read `TRADING_MODE=paper` while
+   the process spends real money. `coherence.py` and the test suite both fail
+   the build on this. Set `TRADING_MODE=live` instead.
+
 Boot sequence: `verify.sh` → seed config (first boot only, never overwriting
 your edits) → `--check-config` → `--preflight` → `exec` the bot.
+
+### Shared outbound IP, and why preflight waits
+
+Binance's API-key allowlist accepts individual addresses. A Render worker
+without a dedicated IP does not know its outbound address until the process is
+already running, and that address can change on any restart — so it cannot be
+allowlisted in advance. Failing on the first refusal kills the deploy about a
+second after printing the one piece of information needed to fix it.
+
+`AUTH_WAIT_S` (default `600` in `render.yaml`) turns that race into a window.
+Preflight prints the address, then knocks on a signed, IP-gated endpoint every
+5 seconds until Binance accepts:
+
+```
+==> Outbound IP: 203.0.113.47
+    This exact address must be on the API key's allowlist -- not the CIDR
+    range a host's dashboard shows, which Binance cannot parse.
+    Waiting up to 600s for a signed request to be accepted, retrying every
+    5s. Add it now.
+
+  attempt 1: [AUTH] Invalid API-key, IP, or permissions  (retrying, 595s left)
+  attempt 2: [AUTH] Invalid API-key, IP, or permissions  (retrying, 590s left)
+  accepted after 12s (3 attempts).
+```
+
+Only **auth refusals and network errors** retry. An HTTP 451 is the server's
+*region*, not its address — no amount of waiting changes which continent the
+worker is on — so it fails immediately with that explanation. Anything else is
+a real fault and is reported at once rather than hidden behind ten minutes of
+silence. The wait is bounded for the same reason: a paid worker idling forever
+on a key that is simply wrong reports nothing, and Render restarts a failed
+worker anyway.
+
+`--whoami` samples the address repeatedly, which is how you find out whether it
+is stable across requests at all.
 
 ---
 

@@ -31,6 +31,15 @@ ENV DB_PATH=/var/data/btc5m_journal.db
 ENV PROFILE=buffer
 # paper | live. Pins the mode; unset it to let config.json govern, which makes
 # the mode hot-reloadable.
-ENV TRADING_MODE=paper
+# ENV TRADING_MODE=paper
+ENV TRADING_MODE=live
+# Seconds the boot-time preflight check waits for a signed request to be
+# ACCEPTED before giving up. On shared egress the outbound address is not knowable until the process
+# is running and can change on any restart, so it cannot be added to Binance's
+# key allowlist in advance. Preflight prints the address and keeps knocking,
+# which turns a one-second race into a window long enough to paste it in.
+# Bounded rather than infinite: a worker waiting forever on a key that is
+# simply wrong costs money and reports nothing. "0" fails on first refusal.
+ENV AUTH_WAIT_S=600
 
 ENTRYPOINT ["./entrypoint.sh"]

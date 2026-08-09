@@ -100,7 +100,11 @@ def check_config(src: str, tree: ast.Module, f: Findings) -> None:
         f.warn("could not locate PROFILES to audit defaults")
         return
     block = profiles.group(0)
-    overridden = set(re.findall(r"(\w+)\s*=", block))
+    # Profiles may write kwarg style (dict(key=value)) or dict-literal style
+    # ("key": value) -- both are matched so a pure style change never counts
+    # as every field going unoverridden.
+    overridden = (set(re.findall(r"(\w+)\s*=", block))
+                  | set(re.findall(r'"(\w+)"\s*:', block)))
 
     # Only fields that shape strategy or risk need per-profile values;
     # plumbing legitimately shares one default.
@@ -335,6 +339,29 @@ def check_default_profile(src: str, tree: ast.Module, f: Findings) -> None:
                     f"but DEFAULT_PROFILE is {expected!r}")
 
 
+def check_mode_flags(src: str, tree: ast.Module, f: Findings) -> None:
+    """
+    The entrypoint must not hardcode --live or --paper.
+
+    A command-line flag beats the TRADING_MODE environment variable, so a
+    hardcoded flag makes that variable dead: a manifest can read
+    TRADING_MODE=paper while the process trades real money.
+    """
+    here = os.path.dirname(os.path.abspath(SOURCE_PATH)) or "."
+    entry = os.path.join(here, "entrypoint.sh")
+    if not os.path.exists(entry):
+        return
+    text = open(entry, encoding="utf-8").read()
+    # Only the exec line matters; a mention in a comment is fine.
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        if re.search(r"(?<![\w-])--(live|paper)(?![\w-])", stripped):
+            f.error(f"entrypoint.sh hardcodes a mode flag ({stripped[:60]}); "
+                    f"this silently overrides TRADING_MODE")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--source", default="btc_5m_predictor.py")
@@ -348,7 +375,7 @@ def main() -> int:
     f = Findings()
     for check in (check_config, check_dead_functions, check_attributes,
                   check_cli, check_stale_prose, check_magic_numbers,
-                  check_default_profile):
+                  check_default_profile, check_mode_flags):
         check(src, tree, f)
 
     print(f"=== COHERENCE: {args.source} ===\n")

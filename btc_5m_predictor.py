@@ -162,6 +162,21 @@ class Config:
     # expressed as one number: the same buffer is worth more with less time
     # left, and z captures both at once. 0 disables the gate.
     min_buffer_sigmas: float = 0.0
+    # Minimum NET profit per unit staked on a win, after the venue's fee.
+    #
+    # A positive edge says a bet is worth making; it says nothing about
+    # whether the payout is worth the risk of ruin attached to it. Buying at
+    # 0.94 returns about 6% on a win, so one loss erases sixteen wins. The
+    # arithmetic is unforgiving in a way the edge test cannot see, because
+    # edge is measured in probability and this is measured in money.
+    #
+    # 0.25 means "a win must pay at least 25% of the stake", which caps the
+    # fill price at (1-fee)/((1-fee)+0.25) -- about 0.797 at a 2% fee. The
+    # cap is derived from the fee rather than written down, so a market with
+    # a different fee gets a different ceiling automatically.
+    #
+    # 0.0 disables it and the entry band alone governs.
+    min_win_return: float = 0.0
     # FALLBACK only. Each market publishes its own feeRateBps and that value
     # wins. Assuming 2% when the real rate is near zero silently demands about
     # a point of extra edge that does not exist, and suppresses valid trades.
@@ -281,7 +296,11 @@ class Config:
     # bankroll -- there is one account -- so concurrency is capped and sizing
     # runs against uncommitted funds, or N markets quietly stack to N times
     # the intended exposure.
-    symbols: tuple[str, ...] = ("BTCUSDT",)
+    #
+    # Empty (the default) means NO restriction: every 5-minute up/down market
+    # the venue lists is discovered and traded automatically, capped only by
+    # max_concurrent_positions. Set one or more tickers to trade only those.
+    symbols: tuple[str, ...] = ()
     max_concurrent_positions: int = 2
     # Reserve, as a fraction of bankroll, kept free regardless of how many
     # markets look attractive at once.
@@ -306,6 +325,61 @@ class Config:
     vol_ceiling_annual: float = 3.00
     halt_on_clamped_sigma: bool = True
 
+    # --- Trend (inertia) ---------------------------------------------------
+    # BTC often runs in one direction for several consecutive rounds. While
+    # that lasts, a trade taken early -- before the buffer is large enough
+    # for the venue to have repriced -- is both cheaper and more likely to
+    # win. That is the whole opportunity, and it is also the whole risk: the
+    # run can end on the very round you size up on, and a market oscillating
+    # around the strike produces a sequence of one-round "runs" that are pure
+    # noise. Every setting below exists to tell those two apart.
+    trend_follow: bool = False
+    # Minutes of 1m history the trend is measured over. Read from the same
+    # klines the volatility estimate already fetches, so this costs nothing.
+    trend_lookback_min: int = 30
+    # THE PRIMARY GATE. Size of the move over the last round-length, in
+    # standard deviations of one such block. This is what fires at the START
+    # of a trend: a thrust happening right now scores high on its first
+    # block, whereas a count of completed rounds cannot say anything until
+    # the move is already old and the price already bad.
+    trend_min_impulse: float = 1.2
+    # Blocks in the same direction. The MINIMUM is 1 on purpose -- a strong
+    # first thrust is a trend beginning, and demanding corroboration means
+    # systematically entering late.
+    trend_min_run: int = 1
+    # The maximum is the brake. A run that has already gone this far is
+    # nearer its end than its beginning, and this is the mechanical version
+    # of "keep an eye on it as it fades": the boost switches itself off
+    # rather than waiting for a loss to switch it off.
+    trend_max_run: int = 5
+    # Current block's size relative to the previous one. Below this the move
+    # is giving back momentum block over block and is dying, however
+    # impressive its history looks.
+    trend_decay_floor: float = 0.55
+    # Projected rounds of life left before the move decays under the impulse
+    # floor. 1.0 means "must survive the round I am about to enter", which is
+    # the only horizon an entry actually cares about. Raising it demands the
+    # move outlast the round with margin.
+    trend_min_rounds_left: float = 1.0
+    # Net move over the run, in sigmas of the run. Secondary to impulse:
+    # it confirms the move is real rather than announcing it.
+    trend_min_z: float = 0.8
+    # Net displacement divided by the total distance travelled, over the run.
+    # A market swinging across the strike covers a lot of ground and ends up
+    # nowhere, which scores near zero here and is exactly the case to sit out.
+    trend_min_efficiency: float = 0.35
+    # How much larger the stake may be while the trend is confirmed AND
+    # points the same way as the trade. Still bounded by the hard stake cap
+    # and by twice full Kelly, so the boost cannot reach a size that loses
+    # money in the long run.
+    trend_stake_multiple: float = 1.5
+    # How much earlier entry is allowed while the trend is confirmed, in
+    # seconds added to entry_window_start_s. Entering early is what makes the
+    # price worth having; the buffer gate still has to clear, and because it
+    # is measured in sigmas of the REMAINING time, clearing it early takes a
+    # genuinely larger move rather than a more lenient test.
+    trend_early_entry_s: int = 90
+
     # --- Plumbing ----------------------------------------------------------
     # --- Timing (previously hardcoded inside the loop) ------------------
     clock_resync_s: float = 300.0        # re-sync the server clock this often
@@ -316,6 +390,22 @@ class Config:
     prune_after_s: float = 3600.0        # forget rounds this long past expiry
     vol_cache_s: float = 60.0
     error_backoff_max_s: float = 30.0
+    # How long --preflight waits for a signed request to be ACCEPTED before
+    # it gives up, and how often it retries while waiting.
+    #
+    # On shared egress the outbound address is not known until the process is
+    # running and can change on any restart, so the address that has to be in
+    # Binance's allowlist cannot be added in advance. Without this, preflight
+    # fails in the first second of boot, the deploy dies, and the address is
+    # gone before it can be pasted anywhere. Waiting turns that race into a
+    # window: preflight prints the address, then keeps knocking until the
+    # allowlist entry lands.
+    #
+    # Bounded rather than infinite on purpose -- an unbounded wait is a paid
+    # worker sitting idle forever on a key that may simply be wrong. 0
+    # disables the wait and fails on the first refusal.
+    auth_wait_timeout_s: float = 0.0
+    auth_wait_poll_s: float = 5.0
 
     # --- Tolerances and paging (previously hardcoded) -------------------
     round_duration_tolerance: float = 0.10    # fraction of the target length
@@ -366,10 +456,21 @@ class Config:
             raise ValueError(
                 f"max_blended_price {self.max_blended_price} must lie within "
                 f"the entry band {self.min_entry_price}-{self.max_entry_price}")
+        if self.min_win_return < 0:
+            raise ValueError("min_win_return must be non-negative")
+        if self.min_win_return > 0:
+            # A floor the band can never satisfy is a bot that never trades
+            # and never says why, which is the worst of the three outcomes.
+            cap = max_price_for_return(self.min_win_return, self.fee_bps)
+            if cap <= self.min_entry_price:
+                raise ValueError(
+                    f"min_win_return {self.min_win_return} caps the fill "
+                    f"price at {cap:.4f} at {self.fee_bps} bps, which is at "
+                    f"or below min_entry_price {self.min_entry_price}: no "
+                    f"price could ever satisfy both")
         if not 0 < self.assumed_spread_pct < 1.0:
             raise ValueError("assumed_spread_pct must be in (0, 1)")
-        if not self.symbols:
-            raise ValueError("symbols must not be empty")
+        # Empty is valid: it means "no restriction, discover every market".
         if len(set(self.symbols)) != len(self.symbols):
             raise ValueError("symbols must not contain duplicates")
         if self.max_concurrent_positions < 1:
@@ -388,9 +489,44 @@ class Config:
             raise ValueError("fill_confirm_delay_s must be positive")
         for name in ("clock_resync_s", "settle_grace_s", "settle_timeout_s",
                      "drain_timeout_s", "drain_poll_s", "prune_after_s",
-                     "vol_cache_s", "error_backoff_max_s"):
+                     "vol_cache_s", "error_backoff_max_s", "auth_wait_poll_s"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.auth_wait_timeout_s < 0:
+            raise ValueError("auth_wait_timeout_s must be non-negative")
+        if self.trend_min_run < 1:
+            raise ValueError("trend_min_run must be >= 1")
+        if self.trend_max_run < self.trend_min_run:
+            raise ValueError("trend_max_run must be >= trend_min_run")
+        if self.trend_min_z < 0:
+            raise ValueError("trend_min_z must be non-negative")
+        if self.trend_min_impulse <= 0:
+            raise ValueError("trend_min_impulse must be positive")
+        if not 0 < self.trend_decay_floor <= 1.0:
+            # Above 1.0 it would demand acceleration on every block, which
+            # no real move sustains; at or below 0 it could never fire.
+            raise ValueError("trend_decay_floor must be in (0, 1]")
+        if self.trend_min_rounds_left < 0:
+            raise ValueError("trend_min_rounds_left must be non-negative")
+        if not 0 <= self.trend_min_efficiency <= 1:
+            raise ValueError("trend_min_efficiency must be in [0, 1]")
+        if self.trend_stake_multiple < 1.0:
+            # Below 1.0 the "boost" would shrink the stake on exactly the
+            # setups the profile is built to press, which is not a tuning
+            # choice but a sign inversion.
+            raise ValueError("trend_stake_multiple must be >= 1.0")
+        if self.trend_early_entry_s < 0:
+            raise ValueError("trend_early_entry_s must be non-negative")
+        if self.trend_follow:
+            # The run is counted in round-length blocks, so the window has to
+            # hold at least trend_max_run of them or the ceiling can never be
+            # reached and the fade rule silently never fires.
+            needed = self.trend_max_run * self.round_seconds / 60.0
+            if self.trend_lookback_min < needed:
+                raise ValueError(
+                    f"trend_lookback_min {self.trend_lookback_min} is shorter "
+                    f"than trend_max_run x round_seconds ({needed:.0f} min); "
+                    f"the run ceiling could never be reached")
         if self.report_every < 0:
             raise ValueError("report_every must be non-negative")
         if self.use_fat_tails and self.tail_df_floor <= 2.0:
@@ -420,8 +556,16 @@ class Config:
 
     @property
     def symbol(self) -> str:
-        """The first configured market. Used where a single default is needed."""
-        return self.symbols[0]
+        """
+        A representative single market.
+
+        Used only for informational purposes where exactly one symbol is
+        needed -- preflight's spot/volatility probe, and PredictionClient's
+        fallback when a venue settlement feed cannot be resolved to a
+        Binance ticker. Does NOT restrict what gets traded; that is `symbols`
+        (or its absence, which means "every market").
+        """
+        return self.symbols[0] if self.symbols else "BTCUSDT"
 
     @property
     def hard_max_stake_pct(self) -> float:
@@ -451,6 +595,10 @@ PROFILES: dict[str, dict] = {
                    "kelly_fraction": 0.20,
                    "min_liquidity": 0.0, "max_rounds_per_day": 200,
                    "paper_start_bankroll": 100.0,
+                   # No floor needed: the band's own top, 0.35, already pays
+                   # about 180% on a win. Stated rather than inherited so a
+                   # change to the default cannot silently reshape this.
+                   "min_win_return": 0.0,
                    # Inert here unless scale_in is enabled; sized to this
                    # profile's own band (0.05-0.35), not buffer's.
                    "max_blended_price": 0.3},
@@ -464,6 +612,10 @@ PROFILES: dict[str, dict] = {
                    "kelly_fraction": 0.25,
                      "min_liquidity": 0.0, "max_rounds_per_day": 200,
                      "paper_start_bankroll": 100.0,
+                     # Symmetric by design: it trades wherever an edge is,
+                     # including the expensive end, so a return floor would
+                     # amputate half of what this profile is for.
+                     "min_win_return": 0.0,
                      # Inert here unless scale_in is enabled; sized to this
                      # profile's own band (0.10-0.90), not buffer's.
                      "max_blended_price": 0.8},
@@ -497,30 +649,55 @@ PROFILES: dict[str, dict] = {
                      "min_liquidity": 0.0, "max_rounds_per_day": 200,
                      "entry_window_start_s": 120, "entry_window_end_s": 20,
                      "max_consecutive_losses": 10, "paper_start_bankroll": 25.0,
+                     # The 0.80 band top already implies ~25% at a 2% fee, so
+                     # a floor here would only duplicate the band -- and at a
+                     # market with a higher fee it would start rejecting
+                     # trades this profile was built to take.
+                     "min_win_return": 0.0,
                      # Inert here unless scale_in is enabled; sized to this
                      # profile's own band (0.55-0.80), not buffer's.
                      "max_blended_price": 0.72},
-    # YOUR METHOD, encoded. Wait for a large buffer late in the round, then
-    # size up. Trades the 0.80-0.97 band, which every other profile refuses.
+    # YOUR METHOD, encoded. Wait for a buffer to open up, back the side it
+    # favours, press it while the market has inertia -- and refuse any price
+    # whose win is too small to be worth the loss it risks.
     #
-    # The payoff shape is deliberately many small wins with rare large losses.
-    # That is only sound because sizing is by edge, not by payout: at an ask
-    # of 0.95 a true 0.99 is worth 0.80 of full Kelly, while a true 0.94 is
-    # NEGATIVE. A three-point model error at this end flips the sign, so this
-    # profile lives or dies on calibration in its top bucket -- check that
-    # bucket in --calibration-report before trusting it with size.
+    # THE RETURN FLOOR IS WHAT SHAPES THIS PROFILE
+    # --------------------------------------------
+    # An earlier version traded 0.80-0.95. Those are genuine edges, but at
+    # 0.94 a win pays about 6%, so ONE loss erases sixteen wins and a day of
+    # patient work is undone by a single round going the other way. The edge
+    # test cannot see this: edge is measured in probability and the problem
+    # is measured in money.
     #
-    # min_buffer_sigmas=2.0 means spot must sit two standard deviations of
-    # the REMAINING time away from the strike: roughly 14 bps with a minute
-    # left, or 28 bps with four minutes.
-    "buffer": {"max_entry_price": 0.95, "min_entry_price": 0.80,
+    # min_win_return=0.25 says a win must pay at least a quarter of the
+    # stake. At a 2% fee that caps the fill at about 0.797, so the band ends
+    # there and roughly four wins cover a loss instead of sixteen.
+    #
+    # WHAT THAT COSTS, STATED PLAINLY
+    # -------------------------------
+    # Price and buffer move together: a 1.5-sigma buffer is a ~93% chance and
+    # a market that has noticed will quote near 0.93, which this profile now
+    # refuses. So the trades that remain are the ones where the buffer is
+    # real but the BOOK HAS NOT CAUGHT UP -- the venue still quoting 0.75
+    # while spot has already moved. That is the manual edge being encoded,
+    # and there are fewer such rounds than there were cheap-looking 0.94s.
+    # Expect materially fewer trades and larger individual wins.
+    #
+    # min_buffer_sigmas is 0.75 for the same reason. Demanding 1.5 sigmas
+    # while capping the price at 0.80 asks for a 93% chance at a 79% price,
+    # which almost never coexists; 0.75 sigmas is a ~77% chance, so a venue
+    # quote at or under 0.797 is a live disagreement rather than a fantasy.
+    "buffer": {"max_entry_price": 0.80, "min_entry_price": 0.55,
                    "min_edge": 0.012, "min_edge_ratio": 0.010,
-                   # Lowered from 2.0: fewer sigmas means more trades, and
-                   # more trades is how the edge question gets answered at
-                   # all -- separating a 68% win rate from a 72% one needs
-                   # hundreds of samples. Each trade carries less edge, so
-                   # this is a deliberate trade of quality for sample size.
-                   "min_buffer_sigmas": 1.5,
+                   # A win must pay at least 25% of the stake, after fees.
+                   # This, not max_entry_price, is the binding ceiling: it
+                   # tracks each market's own published fee instead of
+                   # assuming one.
+                   "min_win_return": 0.25,
+                   # See the note above: the price cap and the buffer gate
+                   # pull against each other, and 0.75 is where both can be
+                   # satisfied often enough to produce trades.
+                   "min_buffer_sigmas": 0.75,
                    "max_stake_pct": 0.10, "min_stake_usdt": 1.0,
                    # A loss here costs a full 10% of bankroll, so the 20%
                    # default halted the day after TWO losses -- on 80% of
@@ -542,11 +719,35 @@ PROFILES: dict[str, dict] = {
                    # blended-price cap below.
                    "scale_in": True, "scale_in_initial_pct": 0.25,
                    "scale_in_min_topup": 1.0,
-                   # Never let the blend past 0.90: about nine wins per loss.
-                   # Raise it for a higher hit rate and smaller wins; lower it
-                   # for bigger wins and fewer of them.
-                   "max_blended_price": 0.90,
-                   "entry_window_start_s": 180, "entry_window_end_s": 15,
+                   # Inside the return floor's own ceiling on purpose. A
+                   # top-up is bought at a HIGHER price than the opener, so
+                   # the blend is the number that decides the payout, and
+                   # letting it drift to 0.797 would spend the whole return
+                   # budget on the last tranche.
+                   "max_blended_price": 0.78,
+                   # INERTIA, caught at its start rather than after the fact.
+                   # trend_min_impulse is the trigger and does its work on
+                   # the CURRENT block, so a move gets backed on its first
+                   # thrust; trend_min_run=1 is what allows that. The run
+                   # ceiling and the decay floor are the other half: a move
+                   # that has already run five rounds, or that is shedding
+                   # more than 45% of its size block over block, is bought at
+                   # its worst price and is refused. trend_min_rounds_left=1
+                   # asks the only question the entry actually poses -- does
+                   # this survive the round I am entering?
+                   "trend_follow": True,
+                   "trend_min_impulse": 1.2, "trend_min_run": 1,
+                   "trend_max_run": 5, "trend_decay_floor": 0.55,
+                   "trend_min_rounds_left": 1.0, "trend_min_z": 0.8,
+                   "trend_min_efficiency": 0.40,
+                   "trend_stake_multiple": 1.5, "trend_early_entry_s": 90,
+                   "trend_lookback_min": 30,
+                   # Nearly the whole round. The return floor means the good
+                   # price and the buffer rarely coexist for long, so the
+                   # window has to be open when they do -- a narrow window
+                   # turns "no trade was available" into "we were not
+                   # looking", and those are not the same thing.
+                   "entry_window_start_s": 270, "entry_window_end_s": 15,
                    "max_consecutive_losses": 6, "paper_start_bankroll": 25.0},
     "micro": {"max_entry_price": 0.75, "min_entry_price": 0.35,
                   "min_edge": 0.03, "min_edge_ratio": 0.06,
@@ -565,6 +766,9 @@ PROFILES: dict[str, dict] = {
                   "min_liquidity": 0.0, "max_rounds_per_day": 200,
                   "entry_window_start_s": 200, "entry_window_end_s": 25,
                   "max_consecutive_losses": 10, "paper_start_bankroll": 7.0,
+                  # A balance this small needs every trade it can get; a
+                  # return floor on top of the band would leave it flat.
+                  "min_win_return": 0.0,
                   # Inert here unless scale_in is enabled; sized to this
                   # profile's own band (0.35-0.75), not buffer's.
                   "max_blended_price": 0.65},
@@ -899,6 +1103,78 @@ class Quote:
 
 
 @dataclass(frozen=True)
+class Trend:
+    """
+    Whether the underlying is running, and whether it has anything left.
+
+    THE MISTAKE THIS IS BUILT TO AVOID
+    ----------------------------------
+    The obvious detector counts consecutive rounds that closed the same way
+    and acts once the count is high enough. That detector is guaranteed to be
+    late: by the time three rounds have confirmed a trend, the move it is
+    describing is three rounds old, and acting on a trend that has already
+    spent itself is close to a guaranteed loss -- the price is at its worst
+    exactly when the evidence is at its strongest.
+
+    So the primary signal here is the CURRENT block: `impulse` is the move
+    over the last round-length, measured in standard deviations of one such
+    block. A thrust that is happening right now scores high even when it is
+    the first one, which is what makes an entry at the START of a trend
+    possible. The run count is kept, but as corroboration and as a brake
+    (see trend_max_run), never as the trigger.
+
+    `decay` is the other half: the current block's size relative to the one
+    before it. A trend giving back momentum block over block is dying, and
+    `rounds_left` turns that ratio into the only question that actually
+    matters -- does this move survive the round I am about to enter?
+    """
+
+    direction: int = 0          # +1 up, -1 down, 0 flat or reversing
+    impulse: float = 0.0        # current block's move, in sigmas of one block
+    z: float = 0.0              # net move over the run, in sigmas of the run
+    efficiency: float = 0.0     # net displacement / total distance travelled
+    run: int = 0                # consecutive blocks moving in `direction`
+    decay: float = 1.0          # current block magnitude / previous block's
+    rounds_left: float = 0.0    # projected rounds before it decays into noise
+    phase: str = "none"         # none | building | running | fading
+
+    def confirmed(self, cfg: Config) -> bool:
+        """
+        Is there inertia, is it still alive, and will it outlast this round?
+
+        Four independent ways for this to be false, because a trend fails in
+        four different ways and one combined score would hide which:
+
+        * no thrust now (`impulse`) -- whatever happened is over
+        * the path wandered (`efficiency`) -- a market swinging across the
+          strike covers ground and ends up nowhere
+        * it is decaying (`phase`, `rounds_left`) -- entering a move with
+          less than a round of life left is buying the exhaustion
+        * it has run a long way already (trend_max_run) -- late is expensive
+        """
+        return (cfg.trend_follow
+                and self.direction != 0
+                and self.phase in ("building", "running")
+                and self.impulse >= cfg.trend_min_impulse
+                and self.z >= cfg.trend_min_z
+                and self.efficiency >= cfg.trend_min_efficiency
+                and cfg.trend_min_run <= self.run <= cfg.trend_max_run
+                # "Will it last THIS round?" is the question an entry
+                # actually asks, so it is asked in those units.
+                and self.rounds_left >= cfg.trend_min_rounds_left)
+
+    def favours(self, side: Side) -> bool:
+        return ((side is Side.UP and self.direction > 0)
+                or (side is Side.DOWN and self.direction < 0))
+
+    def describe(self) -> str:
+        arrow = {1: "UP", -1: "DOWN"}.get(self.direction, "flat")
+        return (f"{arrow}/{self.phase} impulse={self.impulse:.2f} "
+                f"run={self.run} decay={self.decay:.2f} "
+                f"left~{self.rounds_left:.1f}r eff={self.efficiency:.2f}")
+
+
+@dataclass(frozen=True)
 class Signal:
     side: Side
     model_prob: float
@@ -907,6 +1183,13 @@ class Signal:
     stake_usdt: float
     seconds_left: float
     buffer_z: float = 0.0
+    # Signed trend strength at entry: positive when the trend pointed the
+    # same way as the trade. Recorded so the journal can answer whether the
+    # boosted trades actually earned their extra size, rather than leaving
+    # that to memory.
+    trend_z: float = 0.0
+    # True when this entry used the trend's larger stake or earlier window.
+    trend_boosted: bool = False
 
 
 @dataclass(frozen=True)
@@ -1200,6 +1483,37 @@ def breakeven_probability(price: float, fee_bps: int) -> float:
     return price / (price + (1.0 - price) * (1.0 - f))
 
 
+def win_return(price: float, fee_bps: int) -> float:
+    """
+    Net profit per unit staked if a contract bought at `price` wins.
+
+    This is the number that decides how many wins one loss costs, and it is
+    NOT what the edge test measures. A trade can carry a large probability
+    edge and still return 6% on a win, in which case a single loss undoes
+    sixteen of them. Both questions have to be asked separately.
+    """
+    if not 0.0 < price < 1.0:
+        raise ValueError("price must be in (0, 1)")
+    return (1.0 - price) / price * (1.0 - fee_bps / 10_000.0)
+
+
+def max_price_for_return(min_return: float, fee_bps: int) -> float:
+    """
+    Highest fill price whose win still pays at least `min_return` per unit.
+
+    Inverts win_return, so the ceiling always tracks the market's own fee
+    instead of being a hardcoded number that is wrong on every market whose
+    fee differs from the one it was written for. Returns 1.0 when no floor is
+    asked for, which is the same as no ceiling.
+    """
+    if min_return <= 0:
+        return 1.0
+    net = 1.0 - fee_bps / 10_000.0
+    if net <= 0:
+        return 0.0                      # fee eats the entire payout
+    return net / (net + min_return)
+
+
 def kelly_stake(bankroll: float, model_prob: float, price: float,
                 cfg: Config, fee_bps: int | None = None) -> float:
     """
@@ -1296,6 +1610,31 @@ def walk_book(asks: list[tuple[float, float]], stake_usdt: float
     return stake_usdt / shares
 
 
+def _projected_rounds(impulse: float, decay: float,
+                      floor: float) -> float:
+    """
+    How many more rounds a decaying move stays above the noise floor.
+
+    Geometric decay: the size after n rounds is impulse * decay**n, and the
+    move stops being tradable once it drops under `floor`. Solving for n
+    gives the answer in
+    the units the decision is actually made in -- rounds, not ratios.
+
+    A move that is holding or growing (decay >= 1) is not decaying at all
+    and gets a large finite number rather than infinity, so callers can
+    compare it without special-casing.
+    """
+    if impulse <= 0 or floor <= 0:
+        return 0.0
+    if impulse < floor:
+        return 0.0                      # already under the floor
+    if decay >= 1.0:
+        return 99.0                     # holding or accelerating
+    if decay <= 0.0:
+        return 0.0                      # reversed outright
+    return math.log(floor / impulse) / math.log(decay)
+
+
 class VolatilityEstimator:
     """Annualised sigma AND tail thickness from recent 1m returns."""
 
@@ -1308,6 +1647,7 @@ class VolatilityEstimator:
         self._df_cache: dict[str, float | None] = {}
         self._clamped: dict[str, bool] = {}
         self._raw: dict[str, float] = {}
+        self._trend: dict[str, Trend] = {}
 
     @property
     def _cfg(self) -> Config:
@@ -1347,8 +1687,108 @@ class VolatilityEstimator:
                         "is no longer measuring the market", raw, annual, symbol)
 
         self._df_cache[symbol] = self._estimate_df(rets, statistics.pstdev(rets))
+        # Measured from the same closes rather than a second request: a trend
+        # read off a different fetch than the sigma it is compared against is
+        # two snapshots of two moments pretending to be one.
+        self._trend[symbol] = self._measure_trend(closes)
         self._cache[symbol] = (annual, time.time())
         return annual
+
+    def _measure_trend(self, closes: list[float]) -> Trend:
+        """
+        Direction, thrust, straightness and remaining life of the move.
+
+        Everything comes from the closes already in hand. The series is cut
+        into round-length blocks ending at NOW, so the last block is the move
+        currently in progress -- that block, not the count of finished ones,
+        is what says a trend is starting.
+
+        Direction is taken from that last block too. When it disagrees with
+        the blocks before it, this is a reversal and the run resets to one:
+        the correct reading of a fresh reversal is "a new trend beginning",
+        not "the old trend continuing", and a detector anchored to the older
+        blocks would call the top of a move a buy.
+        """
+        cfg = self._cfg
+        if not cfg.trend_follow:
+            return Trend()
+        window = [c for c in closes[-cfg.trend_lookback_min:] if c > 0]
+        if len(window) < 10:
+            return Trend()
+
+        steps = [math.log(b / a) for a, b in itertools.pairwise(window)]
+        sd_step = statistics.pstdev(steps)
+        block = max(1, round(cfg.round_seconds / 60.0))
+        if sd_step <= 0 or len(steps) < block:
+            return Trend()
+
+        # Blocks of one round each, oldest first, the last ending at now.
+        edges = list(range(len(window) - 1, -1, -block))[::-1]
+        if len(edges) < 2:
+            return Trend()
+        blocks = [math.log(window[b] / window[a])
+                  for a, b in itertools.pairwise(edges)]
+
+        current = blocks[-1]
+        if current == 0.0:
+            return Trend()
+        direction = 1 if current > 0 else -1
+
+        # One block of pure noise, as the yardstick every size is measured
+        # against. Without it "a big move" would mean a fixed number of basis
+        # points, which is a different thing in a calm hour than a wild one.
+        sigma_block = sd_step * math.sqrt(block)
+        impulse = abs(current) / sigma_block
+
+        run = 0
+        for value in reversed(blocks):
+            if value == 0 or (value > 0) != (direction > 0):
+                break
+            run += 1
+
+        # Straightness and strength are measured over the RUN, not over the
+        # whole lookback: including blocks that moved the other way describes
+        # a market that reversed, not the move being traded.
+        span = min(run * block, len(window) - 1)
+        segment = window[-(span + 1):]
+        net = math.log(segment[-1] / segment[0])
+        seg_steps = [math.log(b / a) for a, b in itertools.pairwise(segment)]
+        travelled = sum(abs(s) for s in seg_steps)
+        efficiency = abs(net) / travelled if travelled > 0 else 0.0
+        z = (abs(net) / (sd_step * math.sqrt(len(seg_steps)))
+             if seg_steps else 0.0)
+
+        # Decay, and what it implies about how much life is left. A move
+        # shedding half its size each block has nothing left for the round about
+        # to start, and that is the round the entry would be taken in.
+        decay = 1.0
+        if run >= 2 and abs(blocks[-2]) > 0:
+            decay = abs(current) / abs(blocks[-2])
+        rounds_left = _projected_rounds(impulse, decay,
+                                        cfg.trend_min_impulse)
+
+        # Order matters. "Nothing is happening" and "something was happening
+        # and has died" are different findings, and only the second is a
+        # warning. A weak block with a run behind it is the tail of a move,
+        # not the absence of one, so it is labelled fading rather than none.
+        if impulse < cfg.trend_min_impulse and run <= 1:
+            phase = "none"
+        elif (impulse < cfg.trend_min_impulse
+                or (run >= 2 and decay < cfg.trend_decay_floor)
+                or rounds_left < 1.0):
+            phase = "fading"
+        elif run <= 1:
+            phase = "building"
+        else:
+            phase = "running"
+
+        return Trend(direction=direction, impulse=impulse, z=z,
+                     efficiency=efficiency, run=run, decay=decay,
+                     rounds_left=rounds_left, phase=phase)
+
+    def trend(self, symbol: str | None = None) -> Trend:
+        """Trend state for `symbol`. Call sigma_annual first."""
+        return self._trend.get(symbol or self._cfg.symbol, Trend())
 
     def _estimate_df(self, rets: list[float], sd: float) -> float | None:
         """
@@ -1501,7 +1941,8 @@ class PredictionClient:
     open_statuses: tuple[str, ...] = ("REGISTERED", "OPEN", "ACTIVE")
     tradable_status: str = "OPEN"
     duration_tolerance: float = 0.10
-    symbols: tuple[str, ...] = ("BTCUSDT",)
+    # Empty means no restriction -- see Config.symbols.
+    symbols: tuple[str, ...] = ()
 
     def __init__(self, cfg: Config | ConfigStore) -> None:
         # Accepts either a Config or a ConfigStore. With a store, `_cfg`
@@ -1858,7 +2299,8 @@ class PredictionClient:
             "sortBy": "END_DATE", "orderBy": "ASC",
             "limit": self._cfg.market_list_limit})
         # One listing call covers every up/down market; _parse_round keeps
-        # only the configured symbols.
+        # only the configured symbols, or every symbol when none are
+        # configured -- that is how auto-discovery of new markets works.
         out = []
         for topic in payload.get("marketTopics") or []:
             rnd = self._parse_round(topic)
@@ -1917,7 +2359,8 @@ class PredictionClient:
         """
         Validate untrusted payload once, into a precise type.
 
-        Returns None for anything that is not a live BTC 5m up/down market.
+        Returns None for anything that is not a live 5-minute up/down market
+        in a configured symbol (every symbol, when none are configured).
         Downstream code may assume every Round is well-formed. `strike` is left
         None here: the list response often omits variantData, and requiring it
         would reject every round and leave the bot silently never trading.
@@ -1925,7 +2368,10 @@ class PredictionClient:
         try:
             if topic.get("chartType") != "CRYPTO_UP_DOWN":
                 return None
-            if topic.get("symbol") not in PredictionClient.symbols:
+            # Empty PredictionClient.symbols means no restriction: every
+            # symbol the venue lists is a candidate market.
+            if (PredictionClient.symbols
+                    and topic.get("symbol") not in PredictionClient.symbols):
                 return None
             if topic.get("status") not in PredictionClient.open_statuses:
                 return None
@@ -1965,7 +2411,17 @@ class PredictionClient:
                             topic.get("slug"))
                 return None
 
-            strike, symbol = PredictionClient._parse_variant(
+            # Distinct names on purpose: `market_symbol` is the venue's ticker
+            # for the contract (BTCUSDT), while `feed_symbol` is the oracle it
+            # settles against. Sharing one name built the Round with the
+            # ORACLE symbol -- or the string "None" when no feed was published
+            # -- so positions, per-market risk and the journal were all keyed
+            # on the wrong value.
+            market_symbol = str(topic.get("symbol") or "")
+            if not market_symbol:
+                LOG.warning("Market topic has no symbol; skipping")
+                return None
+            strike, feed_symbol = PredictionClient._parse_variant(
                 topic.get("variantData") or {})
 
             fee_raw = topic.get("feeRateBps")
@@ -2004,7 +2460,7 @@ class PredictionClient:
                 market_id=int(market["marketId"]),
                 vendor=str(vendor),
                 slug=str(topic.get("slug", "")),
-                symbol=str(topic.get("symbol")),
+                symbol=market_symbol,
                 start_ms=start_ms, end_ms=end_ms,
                 up_token_id=str(up["tokenId"]),
                 down_token_id=str(down["tokenId"]),
@@ -2015,7 +2471,7 @@ class PredictionClient:
                 venue_slippage_bps=int(topic.get("slippageBps") or 0),
                 decimal_precision=int(prec_raw),
                 liquidity=liquidity,
-                strike=strike, feed_symbol=symbol)
+                strike=strike, feed_symbol=feed_symbol)
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             # OverflowError is NOT a ValueError: int(float("inf")) raises it,
             # and "1e999" parses to inf before reaching int().
@@ -2457,7 +2913,7 @@ class Journal:
                 end_ms INTEGER, model_prob REAL, fill_price REAL, edge REAL,
                 stake REAL, bankroll_before REAL, order_id TEXT,
                 profile TEXT, buffer_z REAL, fee_bps INTEGER,
-                symbol TEXT,
+                symbol TEXT, trend_z REAL,
                 resolved INTEGER DEFAULT 0, won INTEGER, pnl REAL,
                 settle_source TEXT)""")
         # Journals predating the profile column stay readable.
@@ -2471,6 +2927,8 @@ class Journal:
             self._conn.execute("ALTER TABLE trades ADD COLUMN fee_bps INTEGER")
         if "symbol" not in existing:
             self._conn.execute("ALTER TABLE trades ADD COLUMN symbol TEXT")
+        if "trend_z" not in existing:
+            self._conn.execute("ALTER TABLE trades ADD COLUMN trend_z REAL")
         self._conn.commit()
 
     def record(self, mode: str, rnd: Round, sig: Signal, spot: float,
@@ -2479,13 +2937,14 @@ class Journal:
         cur = self._conn.execute(
             "INSERT INTO trades (ts, mode, slug, topic_id, side, strike, spot,"
             " sigma, seconds_left, end_ms, model_prob, fill_price, edge, stake,"
-            " bankroll_before, order_id, profile, buffer_z, fee_bps, symbol)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " bankroll_before, order_id, profile, buffer_z, fee_bps, symbol,"
+            " trend_z)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (int(time.time()), mode, rnd.slug, rnd.topic_id, sig.side.value,
              rnd.strike, spot, sigma, sig.seconds_left, rnd.end_ms,
              sig.model_prob, sig.fill_price, sig.edge, sig.stake_usdt,
              bankroll, order_id, self._profile, sig.buffer_z, rnd.fee_bps,
-             rnd.symbol))
+             rnd.symbol, sig.trend_z))
         self._conn.commit()
         return int(cur.lastrowid)
 
@@ -2787,10 +3246,125 @@ def clears_edge(model_prob: float, price: float, cfg: Config,
     return model_prob >= breakeven * (1.0 + cfg.min_edge_ratio)
 
 
-def evaluate(rnd: Round, spot: float, sigma: float, bankroll: float,
-             now_ms: int, cfg: Config,
-             ask_book: dict[Side, list[tuple[float, float]]] | None = None,
-             tail_df: float | None = None) -> Signal | None:
+def clears_return(price: float, fee_bps: int, cfg: Config) -> bool:
+    """
+    Would a win at this price pay enough to be worth the loss it risks?
+
+    Separate from clears_edge on purpose. Edge asks whether the bet is
+    priced wrong; this asks whether being right pays. At 0.94 a bet can be
+    mispriced by three points -- a large edge -- and still return 6%, so
+    sixteen of those wins are undone by one loss. Both have to hold.
+    """
+    if cfg.min_win_return <= 0:
+        return True
+    if not 0.0 < price < 1.0:
+        return False
+    return win_return(price, fee_bps) >= cfg.min_win_return - EPS
+
+
+def blended_price_cap(cfg: Config, fee_bps: int) -> float:
+    """
+    Ceiling on the blended fill price across every tranche of one round.
+
+    Two constraints, whichever binds first: the profile's own stated cap,
+    and whatever price still clears the minimum return at THIS market's fee.
+    Applying only the first would let a top-up drag the blend past the return
+    floor that the opening tranche had to satisfy, which is the same money
+    lost by a different route.
+    """
+    return min(cfg.max_blended_price,
+               max_price_for_return(cfg.min_win_return, fee_bps))
+
+
+def entry_window_start_s(cfg: Config, boosted: bool) -> float:
+    """
+    Earliest seconds-remaining at which an entry may be taken.
+
+    A confirmed trend widens it: when the move has already persisted across
+    rounds, the early part of a round is where the price still reflects
+    uncertainty the trend has largely resolved. Never past the round length,
+    since there is no such thing as entering before the round exists.
+    """
+    if not boosted:
+        return float(cfg.entry_window_start_s)
+    return min(float(cfg.round_seconds),
+               float(cfg.entry_window_start_s + cfg.trend_early_entry_s))
+
+
+def boosted_stake(stake: float, bankroll: float, model_prob: float,
+                  price: float, cfg: Config, fee_bps: int) -> float:
+    """
+    Size up while the trend is confirmed, without leaving the limits.
+
+    The multiplier is applied to the Kelly stake and then clipped by both the
+    hard stake cap and twice full Kelly. The second clip is the one that
+    matters: expected log growth is negative beyond 2x full Kelly, so a
+    trend-driven multiplier with no such bound would be a way of converting
+    a real edge into a real loss on a long enough run.
+
+    The ceiling wins outright, including over the incoming stake. An earlier
+    version returned max(stake, min(wanted, ceiling)) so that a boost could
+    never SHRINK a position -- which quietly meant an already-oversized stake
+    passed through untouched. kelly_stake never produces one, so the two
+    readings agree on every real input; where they disagree, the ruin bound
+    is the one worth keeping.
+    """
+    if stake <= 0 or bankroll <= 0 or cfg.trend_stake_multiple <= 1.0:
+        return stake
+    ceiling = bankroll * cfg.hard_max_stake_pct
+    b = ((1.0 - price) / price) * (1.0 - fee_bps / 10_000.0)
+    if b > 0:
+        full_kelly = (model_prob * b - (1.0 - model_prob)) / b
+        if full_kelly > 0:
+            ceiling = min(ceiling, bankroll * 2.0 * full_kelly)
+    return min(stake * cfg.trend_stake_multiple, ceiling)
+
+
+@dataclass(frozen=True)
+class Assessment:
+    """
+    The outcome of looking at one round: a trade, or the reason there wasn't.
+
+    The reason matters as much as the answer. A bot that declines silently is
+    indistinguishable from a bot that is broken, and with a return floor in
+    force the two look identical from the outside -- both produce no trades.
+    Recording WHICH gate bound turns "it isn't trading" into "it is refusing
+    the price, 40 rounds running", which is a fact you can act on.
+    """
+
+    signal: Signal | None = None
+    blocked_by: str = ""
+
+
+# Rejection reasons, ordered by how far the round got before being turned
+# away. The furthest-progressed reason is the informative one: "no edge" says
+# far more about a round than "outside the window", and reporting whichever
+# gate happened to fire first would bury it.
+_DECLINE_ORDER = (
+    "no strike published yet",
+    "outside the entry window",
+    "buffer too small for the time left",
+    "trend does not favour an early entry",
+    "price outside the entry band",
+    "win pays less than the return floor",
+    "edge below the floor",
+    "no stake clears the sizing limits",
+    "book too thin to fill",
+)
+
+
+def _worse(current: str, candidate: str) -> str:
+    """Whichever reason represents getting further into the checks."""
+    if not current:
+        return candidate
+    return max(current, candidate, key=_DECLINE_ORDER.index)
+
+
+def assess(rnd: Round, spot: float, sigma: float, bankroll: float,
+           now_ms: int, cfg: Config,
+           ask_book: dict[Side, list[tuple[float, float]]] | None = None,
+           tail_df: float | None = None,
+           trend: Trend | None = None) -> Assessment:
     """
     Decide whether this round is worth a trade. Pure: no I/O, no mutation.
 
@@ -2802,63 +3376,104 @@ def evaluate(rnd: Round, spot: float, sigma: float, bankroll: float,
     Returns None when nothing clears the edge, price and risk filters.
     """
     if rnd.strike is None:
-        return None
+        return Assessment(blocked_by="no strike published yet")
 
+    trend = trend or Trend()
+    confirmed = trend.confirmed(cfg)
     secs = rnd.seconds_remaining(now_ms)
-    if not (cfg.entry_window_end_s <= secs <= cfg.entry_window_start_s):
-        return None
+    if not (cfg.entry_window_end_s <= secs
+            <= entry_window_start_s(cfg, confirmed)):
+        return Assessment(blocked_by="outside the entry window")
 
     fee_bps = rnd.fee_bps        # the market's published rate, not an assumption
     z = buffer_sigmas(spot, rnd.strike, sigma, secs)
     if cfg.min_buffer_sigmas > 0 and abs(z) < cfg.min_buffer_sigmas:
-        return None                  # not enough buffer for the time left
+        return Assessment(blocked_by="buffer too small for the time left")
     p_up = digital_up_probability(spot, rnd.strike, sigma, secs, tail_df)
 
     best: Signal | None = None
+    blocked = ""
     for side, model_prob in ((Side.UP, p_up), (Side.DOWN, 1.0 - p_up)):
         # With a buffer gate, only back the side the buffer actually favours;
         # betting against a large buffer is the opposite of the rule.
         if cfg.min_buffer_sigmas > 0:  # noqa: SIM102
             if (side is Side.UP and z < 0) or (side is Side.DOWN and z > 0):
                 continue
+        # The widened window is not a general relaxation. It exists only for
+        # the side the trend actually points at; taking the other side early
+        # would be using the trend as an excuse to trade against it.
+        boost = confirmed and trend.favours(side)
+        if secs > cfg.entry_window_start_s and not boost:
+            blocked = _worse(blocked, "trend does not favour an early entry")
+            continue
+
         levels = (ask_book or {}).get(side)
         entry = (levels[0][0] if levels
                  else min(rnd.quote_for(side) * (1.0 + cfg.assumed_spread_pct),
                           0.999))
 
         if not (cfg.min_entry_price <= entry <= cfg.max_entry_price):
+            blocked = _worse(blocked, "price outside the entry band")
+            continue
+        if not clears_return(entry, fee_bps, cfg):
+            blocked = _worse(blocked, "win pays less than the return floor")
             continue
         if not clears_edge(model_prob, entry, cfg, fee_bps):
+            blocked = _worse(blocked, "edge below the floor")
             continue
 
         stake = kelly_stake(bankroll, model_prob, entry, cfg, fee_bps)
         if stake <= 0:
+            blocked = _worse(blocked, "no stake clears the sizing limits")
             continue
+        if boost:
+            stake = boosted_stake(stake, bankroll, model_prob, entry, cfg,
+                                  fee_bps)
 
         avg = walk_book(levels, stake) if levels else entry
         if avg is None:
+            blocked = _worse(blocked, "book too thin to fill")
             continue
         if not (cfg.min_entry_price <= avg <= cfg.max_entry_price):
+            blocked = _worse(blocked, "price outside the entry band")
             continue
 
         if not clears_edge(model_prob, avg, cfg, fee_bps):
+            blocked = _worse(blocked, "edge below the floor")
             continue
         # The venue quotes to its own precision, so a fill price carrying
         # more digits than that is fiction. Snap before pricing the edge.
         avg = rnd.round_price(avg)
         if not 0.0 < avg < 1.0:
+            blocked = _worse(blocked, "price outside the entry band")
+            continue
+        # Re-check on the price actually paid, not the one at the top of the
+        # book. Walking the ladder raises the average, and a return floor
+        # that only ever saw the best level would let exactly the trades it
+        # exists to stop through the moment the book is thin.
+        if not clears_return(avg, fee_bps, cfg):
+            blocked = _worse(blocked, "win pays less than the return floor")
             continue
         edge = model_prob - breakeven_probability(avg, fee_bps)
 
         stake = kelly_stake(bankroll, model_prob, avg, cfg, fee_bps)
         if stake <= 0:
+            blocked = _worse(blocked, "no stake clears the sizing limits")
             continue
+        if boost:
+            stake = boosted_stake(stake, bankroll, model_prob, avg, cfg,
+                                  fee_bps)
 
-        cand = Signal(side, model_prob, avg, edge, stake, secs, z)
+        cand = Signal(side, model_prob, avg, edge, stake, secs, z,
+                      trend_z=trend.impulse * (1 if trend.favours(side)
+                                               else -1),
+                      trend_boosted=boost)
         if best is None or cand.edge > best.edge:
             best = cand
 
-    return best
+    if best is not None:
+        return Assessment(signal=best)
+    return Assessment(blocked_by=blocked or "price outside the entry band")
 
 
 def max_topup_within_blend(committed: float, avg_price: float,
@@ -2907,7 +3522,7 @@ def settle_pnl(stake: float, fill_price: float, won: bool,
         raise ValueError("fill_price must be in (0, 1)")
     if not won:
         return -stake
-    return stake * (1.0 - fill_price) / fill_price * (1.0 - fee_bps / 10_000.0)
+    return stake * win_return(fill_price, fee_bps)
 
 
 # --------------------------------------------------------------------------
@@ -2947,6 +3562,12 @@ class Trader:
         self._risk: dict[str, RiskManager] = {}
         self._account_risk: RiskManager | None = None
         self._seen: dict[int, int] = {}
+        # topic_id -> (end_ms, latest reason this round is not tradable).
+        # A live round sits here and is re-examined on every poll; once it
+        # expires the reason is tallied and the entry dropped.
+        self._watching: dict[int, tuple[int, str]] = {}
+        self._missed: dict[str, int] = {}
+        self._missed_total = 0
         self._positions: dict[str, Position] = {}
         self._hydrated: dict[int, Round] = {}
         self._errors = 0
@@ -3105,6 +3726,42 @@ class Trader:
             self._seen.pop(tid, None)
             self._hydrated.pop(tid, None)
 
+    def _tally_missed(self, now_ms: int) -> None:
+        """
+        Count rounds that expired without a trade, by what blocked them.
+
+        Silence is the failure mode this exists to prevent. With a return
+        floor in force, "no trade" is the correct answer surprisingly often,
+        and it is indistinguishable from a broken endpoint or a stale book
+        unless the reason is written down. A periodic summary makes the
+        difference between "the market never offered a price worth taking"
+        and "the buffer gate is set too high to ever fire" visible without
+        having to read a debug log.
+        """
+        expired = [t for t, (end, _) in self._watching.items() if end < now_ms]
+        for tid in expired:
+            _, reason = self._watching.pop(tid)
+            self._missed[reason] = self._missed.get(reason, 0) + 1
+            self._missed_total += 1
+
+        if not expired or self._missed_total % 25 != 0:
+            return
+        ranked = sorted(self._missed.items(), key=lambda kv: -kv[1])
+        LOG.info("No trade in %d round(s) so far: %s", self._missed_total,
+                 "; ".join(f"{n} {reason}" for reason, n in ranked[:4]))
+        top = ranked[0][0]
+        if top == "win pays less than the return floor":
+            LOG.info("  The prices on offer were fine bets but small wins. "
+                     "Lower min_win_return to trade more of them, "
+                     "understanding that is the trade you asked not to make.")
+        elif top == "buffer too small for the time left":
+            LOG.info("  Spot is not moving far enough from the strike. "
+                     "Lower min_buffer_sigmas, or accept fewer setups.")
+        elif top == "edge below the floor":
+            LOG.info("  The venue is pricing these rounds close to the "
+                     "model. That is a market with no edge in it, not a "
+                     "misconfiguration.")
+
     def _install_signal_handlers(self) -> None:
         def handler(signum, _frame):
             name = signal.Signals(signum).name
@@ -3143,8 +3800,9 @@ class Trader:
 
         self._account_risk = RiskManager(self._store or self._cfg, bankroll)
         LOG.info("Starting %s mode. Bankroll %.2f USDT. Markets: %s",
-                 "LIVE" if self._live else "PAPER", bankroll,
-                 ", ".join(self._cfg.symbols))
+                 "LIVE" if self._live else "PAPER",
+                 bankroll, ", ".join(self._cfg.symbols) or
+                 "every 5m up/down market (auto-discovered)")
         last_sync = time.time()
 
         try:
@@ -3164,6 +3822,11 @@ class Trader:
                         self._poll_redemptions()
                         self._retry_failed_claims()
                     self._settle_open()
+                    # Driven from the loop, not from _maybe_enter: that
+                    # returns early while a position is open, and the rounds
+                    # passing unwatched during those minutes are exactly the
+                    # ones worth counting.
+                    self._tally_missed(self._client.now_ms())
                     bankroll = self._bankroll()
                     # Account-level limits: one balance, one daily loss cap.
                     # Per-market streaks are checked inside _maybe_enter.
@@ -3205,9 +3868,18 @@ class Trader:
             LOG.info("Interrupted; open position left in the journal.")
 
     def _maybe_enter(self, bankroll: float, mode: str) -> None:
-        # Enforced here, not only at the call site: silently replacing an open
-        # position would orphan it in the journal and double real exposure.
-        if self._position is not None:
+        # The cap the config actually declares. An earlier version returned
+        # whenever ANY position was open, which made
+        # max_concurrent_positions dead: its default of 2 could never be
+        # reached, every multi-market deployment silently traded one market
+        # at a time, and the setting read as configuration while behaving as
+        # a constant.
+        #
+        # What that guard was really protecting is narrower and is enforced
+        # per market below: never open a SECOND position on a symbol that
+        # already has one. That is the same bet twice, not diversification,
+        # and it would orphan the first in the journal.
+        if len(self._positions) >= self._cfg.max_concurrent_positions:
             return
 
         now_ms = self._client.now_ms()
@@ -3231,9 +3903,15 @@ class Trader:
             except TradingHalted as exc:
                 LOG.debug("%s halted: %s", raw.symbol, exc)
                 continue
+            # The widest window any trend could open. The exact one depends on
+            # the trend for THIS market's settlement feed, which is not known
+            # until the round is hydrated -- so screen loosely here and let
+            # evaluate() apply the real bound. Screening tightly would discard
+            # precisely the early rounds the trend exists to catch.
             if not (self._cfg.entry_window_end_s
                     <= raw.seconds_remaining(now_ms)
-                    <= self._cfg.entry_window_start_s):
+                    <= entry_window_start_s(self._cfg,
+                                            self._cfg.trend_follow)):
                 continue
 
             rnd = self._hydrated.get(raw.topic_id) or self._client.hydrate(raw)
@@ -3262,6 +3940,7 @@ class Trader:
                             "estimate would be unreliable", rnd.slug)
                 continue
             tail_df = self._vol.tail_df(symbol)
+            trend = self._vol.trend(symbol)
             book = {}
             for side in Side:
                 levels = self._client.asks_for(rnd, side)
@@ -3269,10 +3948,20 @@ class Trader:
                     book[side] = levels
 
             # Size against uncommitted funds, never the full balance.
-            sig = evaluate(rnd, spot, sigma, available, now_ms, self._cfg,
-                           book or None, tail_df)
-            if sig is None:
+            verdict = assess(rnd, spot, sigma, available, now_ms, self._cfg,
+                             book or None, tail_df, trend)
+            if verdict.signal is None:
+                # Deliberately NOT marked as seen. The round stays under
+                # review for as long as it is live, because the price that
+                # was too expensive a moment ago may not be in ten seconds --
+                # writing a round off on its first look is how a return floor
+                # turns into a bot that never trades.
+                self._watching[rnd.topic_id] = (rnd.end_ms, verdict.blocked_by)
+                LOG.debug("%s: %s (%.0fs left)", rnd.slug,
+                          verdict.blocked_by, rnd.seconds_remaining(now_ms))
                 continue
+            sig = verdict.signal
+            self._watching.pop(rnd.topic_id, None)
 
             if self._cfg.scale_in:
                 # Open with a fraction of the target so there is room to add
@@ -3308,6 +3997,14 @@ class Trader:
                 if quote.average_price > self._cfg.max_entry_price:
                     LOG.info("Quote %.4f above price ceiling %.2f; skipping",
                              quote.average_price, self._cfg.max_entry_price)
+                    continue
+                if not clears_return(quote.average_price, rnd.fee_bps,
+                                     self._cfg):
+                    LOG.info("Quote %.4f returns %.1f%% on a win, under the "
+                             "%.0f%% floor; skipping",
+                             quote.average_price,
+                             win_return(quote.average_price, rnd.fee_bps) * 100,
+                             self._cfg.min_win_return * 100)
                     continue
                 if not clears_edge(sig.model_prob, quote.average_price,
                                    self._cfg, rnd.fee_bps):
@@ -3359,9 +4056,13 @@ class Trader:
                             "venue minimum exceeds the Kelly size on a %.2f "
                             "bankroll", mult, bankroll)
             LOG.info("ENTER %s %s | fill %.3f model %.3f edge %+.3f "
-                     "stake %.2f%s (%.0fs left)", rnd.slug, sig.side.value,
+                     "pays %+.0f%% stake %.2f%s (%.0fs left)%s",
+                     rnd.slug, sig.side.value,
                      sig.fill_price, sig.model_prob, sig.edge,
-                     sig.stake_usdt, mult_s, sig.seconds_left)
+                     win_return(sig.fill_price, rnd.fee_bps) * 100,
+                     sig.stake_usdt, mult_s, sig.seconds_left,
+                     f"  TREND {trend.describe()}" if sig.trend_boosted
+                     else "")
 
             tid = self._journal.record(mode, rnd, sig, spot, sigma, bankroll,
                                        order_id)
@@ -3421,11 +4122,20 @@ class Trader:
         price = levels[0][0]
         if not (self._cfg.min_entry_price <= price <= self._cfg.max_entry_price):
             return
+        if not clears_return(price, pos.rnd.fee_bps, self._cfg):
+            return
         if not clears_edge(prob, price, self._cfg, pos.rnd.fee_bps):
             return
 
         target = kelly_stake(bankroll + pos.committed_usdt, prob, price,
                              self._cfg, pos.rnd.fee_bps)
+        if pos.signal.trend_boosted:
+            # The position was opened at trend size; topping up to the plain
+            # Kelly target would shrink it back mid-round, which is neither
+            # the trend rule nor the Kelly rule but an accident of applying
+            # one at entry and the other afterwards.
+            target = boosted_stake(target, bankroll + pos.committed_usdt,
+                                   prob, price, self._cfg, pos.rnd.fee_bps)
         topup = target - pos.committed_usdt
         floor = max(self._cfg.scale_in_min_topup, self._cfg.min_stake_usdt)
         if topup < floor:
@@ -3434,20 +4144,21 @@ class Trader:
         # Trim so the blended fill stays under the ceiling. Without this a
         # top-up at a high price silently converts a position that needed six
         # wins per loss into one needing fifteen.
+        cap = blended_price_cap(self._cfg, pos.rnd.fee_bps)
         allowed = max_topup_within_blend(
-            pos.committed_usdt, pos.signal.fill_price, price,
-            self._cfg.max_blended_price)
+            pos.committed_usdt, pos.signal.fill_price, price, cap)
         if allowed < floor:
-            LOG.debug("No top-up for %s: blended price would exceed %.2f",
-                      pos.rnd.slug, self._cfg.max_blended_price)
+            LOG.debug("No top-up for %s: blended price would exceed %.3f",
+                      pos.rnd.slug, cap)
             return
         if topup > allowed:
             LOG.info("Trimming top-up %.2f -> %.2f to hold the blended price "
-                     "under %.2f", topup, allowed,
-                     self._cfg.max_blended_price)
+                     "under %.3f", topup, allowed, cap)
             topup = allowed
         avg = walk_book(levels, topup)
         if avg is None or not clears_edge(prob, avg, self._cfg, pos.rnd.fee_bps):
+            return
+        if not clears_return(avg, pos.rnd.fee_bps, self._cfg):
             return
 
         if self._live:
@@ -3458,6 +4169,15 @@ class Trader:
                 return
             quote = self._client.get_quote(pos.rnd, pos.signal.side, topup)
             if quote.average_price > self._cfg.max_entry_price:
+                return
+            if not clears_return(quote.average_price, pos.rnd.fee_bps,
+                                 self._cfg):
+                return
+            if pos.average_price(topup, quote.average_price) > cap + EPS:
+                # The trim above was computed against the book; the venue's
+                # executable price can be worse, and the blend is what pays.
+                LOG.info("Top-up quote %.4f would blend past %.3f; skipping",
+                         quote.average_price, cap)
                 return
             if not clears_edge(prob, quote.average_price, self._cfg,
                                pos.rnd.fee_bps):
@@ -3515,6 +4235,9 @@ class Trader:
             LOG.info("Balance fell to %.2f; no stake clears the limits now",
                      bankroll)
             return None
+        if sig.trend_boosted:
+            stake = boosted_stake(stake, bankroll, sig.model_prob,
+                                  sig.fill_price, self._cfg, rnd.fee_bps)
         if self._cfg.scale_in:
             first = max(stake * self._cfg.scale_in_initial_pct,
                         self._cfg.min_stake_usdt)
@@ -3649,16 +4372,117 @@ class Trader:
 # --------------------------------------------------------------------------
 
 
+# Three services rather than one: any of them can be down, rate-limited or
+# blocked, and "could not determine the IP" is a much worse answer here than
+# a slightly slower one.
+IP_SERVICES = ("https://api.ipify.org?format=json",
+               "https://ifconfig.me/all.json",
+               "https://ipinfo.io/json")
+
+
+def outbound_ip(session: requests.Session,
+                timeout: float = 8.0) -> str | None:
+    """The address this process appears to come from, or None."""
+    for url in IP_SERVICES:
+        try:
+            response = session.get(url, timeout=timeout)
+            if response.status_code != 200:
+                continue
+            body = response.json()
+            found = body.get("ip") or body.get("ip_addr")
+            if found:
+                return str(found)
+        except (requests.RequestException, ValueError) as exc:
+            # Not silent: three services are tried precisely because any one
+            # can be down, but "all three failed" is a real finding and has
+            # to be visible under --verbose rather than reported as "no IP".
+            LOG.debug("IP lookup via %s failed: %s", url, exc)
+    return None
+
+
+def wait_for_auth(cfg: Config, client: PredictionClient) -> bool:
+    """
+    Knock on a signed, IP-gated endpoint until Binance accepts us.
+
+    WHY WAITING IS THE RIGHT ANSWER HERE
+    ------------------------------------
+    Binance's key allowlist accepts individual addresses. On shared egress
+    the address is not known until the process is already running, and it can
+    change on any restart -- so it cannot be added to the allowlist in
+    advance. Failing on the first refusal means the deploy dies within a
+    second of printing the one piece of information needed to fix it.
+
+    Retrying converts that race into a window: the address is on screen, and
+    the process keeps trying until the allowlist entry lands.
+
+    Only AUTH refusals and network errors are retried. A 451 is the server's
+    region, not its address, and no amount of waiting changes which continent
+    the worker is on; anything else is a real fault and is reported at once
+    rather than hidden behind several minutes of silence.
+    """
+    deadline = time.time() + cfg.auth_wait_timeout_s
+    started = time.time()
+    attempt = 0
+
+    while True:
+        attempt += 1
+        try:
+            client.sync_clock()
+            client.wallet()
+            if attempt > 1:
+                print(f"  accepted after {time.time() - started:.0f}s "
+                      f"({attempt} attempts).\n")
+            return True
+        except ApiError as exc:
+            if exc.kind is ErrorKind.GEO_BLOCKED:
+                print(f"  REFUSED [{exc.kind.value}]: {str(exc)[:100]}")
+                print("  HTTP 451 is the server's REGION, not its address. "
+                      "Waiting cannot fix it;\n  redeploy outside the US "
+                      "(e.g. Frankfurt or Singapore).\n")
+                return False
+            if exc.kind is not ErrorKind.AUTH:
+                print(f"  REFUSED [{exc.kind.value}]: {str(exc)[:100]}")
+                print("  Not an allowlist problem, so waiting would only "
+                      "delay the report.\n")
+                return False
+            reason = f"[{exc.kind.value}] {str(exc)[:80]}"
+        except requests.RequestException as exc:
+            reason = f"[network] {str(exc)[:80]}"
+
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            print(f"  still refused after {time.time() - started:.0f}s: "
+                  f"{reason}")
+            print("  -2015 covers the key, the allowlist and the key's "
+                  "permissions together,\n  so check the Wallet permission "
+                  "too before assuming it is the address.\n")
+            return False
+        print(f"  attempt {attempt}: {reason}  "
+              f"(retrying, {remaining:.0f}s left)")
+        time.sleep(min(cfg.auth_wait_poll_s, remaining))
+
+
 def preflight(cfg: Config) -> int:
     """Probe every endpoint and report which ones actually work."""
     client = PredictionClient(cfg)
     print("\n=== Preflight ===\n")
     failures = 0
-    
-    print(f"IP Address: {requests.get('https://api.ipify.org').text}")
-    
-    # Give me a chance to make sure the IP address is whitelisted
-    time.sleep(5)
+
+    ip = outbound_ip(client.session)
+    print(f"==> Outbound IP: {ip or 'could not be determined'}")
+    if cfg.auth_wait_timeout_s > 0:
+        print("    This exact address must be on the API key's allowlist -- "
+              "not the CIDR\n    range a host's dashboard shows, which "
+              "Binance cannot parse.")
+        print(f"    Waiting up to {cfg.auth_wait_timeout_s:.0f}s for a signed "
+              f"request to be accepted,\n    retrying every "
+              f"{cfg.auth_wait_poll_s:.0f}s. Add it now.\n")
+        if not wait_for_auth(cfg, client):
+            failures += 1
+    else:
+        print("    Set auth_wait_timeout_s (or AUTH_WAIT_S) to have preflight "
+              "wait here\n    while you add it to the allowlist.")
+    print()
 
     def check(label, fn):
         nonlocal failures
@@ -3734,7 +4558,9 @@ def preflight(cfg: Config) -> int:
 
     def list_rounds():
         rounds.extend(client.list_rounds())
-        return f"{len(rounds)} live {cfg.symbol} round(s)"
+        found = sorted({r.symbol for r in rounds})
+        where = ", ".join(found) if found else "none"
+        return f"{len(rounds)} live round(s): {where}"
 
     check("market list", list_rounds)
 
@@ -3794,27 +4620,12 @@ def whoami(cfg: Config, samples: int = 8) -> int:
     """
     import collections
 
-    services = ("https://api.ipify.org?format=json",
-                "https://ifconfig.me/all.json",
-                "https://ipinfo.io/json")
     session = requests.Session()
     seen: collections.Counter = collections.Counter()
-    errors: list[str] = []
 
     print(f"\nSampling the outbound IP {samples} times...\n")
     for i in range(samples):
-        got = None
-        for url in services:
-            try:
-                r = session.get(url, timeout=8)
-                if r.status_code != 200:
-                    continue
-                body = r.json()
-                got = body.get("ip") or body.get("ip_addr")
-                if got:
-                    break
-            except (requests.RequestException, ValueError) as exc:
-                errors.append(f"{url}: {exc}")
+        got = outbound_ip(session)
         if got:
             seen[got] += 1
             print(f"  sample {i+1}: {got}")
@@ -3824,8 +4635,8 @@ def whoami(cfg: Config, samples: int = 8) -> int:
 
     if not seen:
         print("\nNo IP could be determined. Outbound HTTP may be blocked.")
-        for e in errors[:3]:
-            print(f"  {e}")
+        print("  Tried: " + ", ".join(IP_SERVICES))
+        print("  Re-run with --verbose to see why each one failed.")
         return 1
 
     print(f"\n  distinct addresses observed: {len(seen)}")
@@ -3939,6 +4750,17 @@ def discover_min(cfg: Config) -> int:
 # --------------------------------------------------------------------------
 
 
+def _parse_symbols_arg(raw: str) -> tuple[str, ...]:
+    """
+    Comma-separated tickers -> a normalised tuple, e.g. "btc,eth" -> BTC,ETH.
+
+    Shared by --symbols and the SYMBOLS environment variable so the two
+    cannot silently drift apart. An empty or blank string yields (), which
+    means "no restriction" -- the same as leaving the setting unset.
+    """
+    return tuple(x.strip().upper() for x in raw.split(",") if x.strip())
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="BTC 5m prediction market trader")
     # Tri-state on purpose. Left unset, the config file governs and the mode
@@ -3973,9 +4795,13 @@ def main(argv: Iterable[str] | None = None) -> int:
                          "favourable (never after a loss)")
     ap.add_argument("--no-scale-in", dest="scale_in", action="store_false")
     ap.add_argument("--symbols", default=None,
-                    help="comma-separated markets, e.g. BTCUSDT,ETHUSDT. "
-                         "Each trades independently: its own position slot, "
-                         "loss streak and calibration.")
+                    help="comma-separated markets to RESTRICT trading to, "
+                         "e.g. BTCUSDT,ETHUSDT. Default: none, meaning every "
+                         "5m up/down market the venue lists is discovered "
+                         "and traded automatically. Each trades "
+                         "independently: its own position slot, loss streak "
+                         "and calibration. Same as the SYMBOLS environment "
+                         "variable; this flag wins if both are set.")
     ap.add_argument("--max-concurrent", type=int, default=None,
                     help="how many markets may hold a position at once")
     ap.add_argument("--report-symbol", default=None,
@@ -3983,6 +4809,22 @@ def main(argv: Iterable[str] | None = None) -> int:
     ap.add_argument("--min-buffer", type=float, default=None,
                     help="override the buffer gate, in sigmas of the time "
                          "remaining")
+    ap.add_argument("--min-return", type=float, default=None,
+                    help="minimum net profit per unit staked on a win, after "
+                         "fees; 0.25 means a win must pay at least 25%% and "
+                         "caps the fill price accordingly. 0 disables it.")
+    ap.add_argument("--trend-follow", dest="trend_follow",
+                    action="store_true", default=None,
+                    help="enter earlier and stake more while the underlying "
+                         "keeps running the same way")
+    ap.add_argument("--no-trend-follow", dest="trend_follow",
+                    action="store_false")
+    ap.add_argument("--wait-for-auth", type=float, default=None,
+                    help="seconds --preflight waits for a signed request to "
+                         "be accepted, so a shared outbound IP can be added "
+                         "to Binance's allowlist while it retries. Same as "
+                         "the AUTH_WAIT_S environment variable; this flag "
+                         "wins if both are set.")
     ap.add_argument("--whoami", action="store_true",
                     help="report the outbound IP actually in use and test "
                          "whether Binance accepts it")
@@ -4035,6 +4877,24 @@ def main(argv: Iterable[str] | None = None) -> int:
     if live is None and env_mode:
         live = env_mode == "live"
         LOG.info("Mode pinned to %s by TRADING_MODE", env_mode.upper())
+
+    # SYMBOLS is the environment equivalent of --symbols, same reasoning and
+    # the same precedence: an explicit flag wins over it.
+    env_symbols = os.environ.get("SYMBOLS", "").strip()
+
+    # AUTH_WAIT_S is the environment equivalent of --wait-for-auth. Parsed
+    # here, alongside TRADING_MODE and for the same reason: a typo must be
+    # caught even by a subcommand that never reads the value, or it silently
+    # becomes "do not wait" and takes the next deploy down with it.
+    env_auth_wait: float | None = None
+    raw_auth_wait = os.environ.get("AUTH_WAIT_S", "").strip()
+    if raw_auth_wait:
+        try:
+            env_auth_wait = float(raw_auth_wait)
+        except ValueError:
+            print(f"AUTH_WAIT_S must be a number of seconds, got "
+                  f"{raw_auth_wait!r}", file=sys.stderr)
+            return 1
 
     if args.print_default_profile:
         # Exists so entrypoint.sh can read the default from the single source
@@ -4107,6 +4967,17 @@ def main(argv: Iterable[str] | None = None) -> int:
         overrides["paper_start_bankroll"] = args.paper_bankroll
     if args.min_buffer is not None:
         overrides["min_buffer_sigmas"] = args.min_buffer
+    if args.min_return is not None:
+        overrides["min_win_return"] = args.min_return
+    if args.trend_follow is not None:
+        overrides["trend_follow"] = args.trend_follow
+    # AUTH_WAIT_S is the environment equivalent of --wait-for-auth, for hosted
+    # deployments where the command line is fixed by the platform. The flag
+    # wins when both are set, matching --symbols and --live.
+    if args.wait_for_auth is not None:
+        overrides["auth_wait_timeout_s"] = args.wait_for_auth
+    elif env_auth_wait is not None:
+        overrides["auth_wait_timeout_s"] = env_auth_wait
     if args.scale_in is not None:
         overrides["scale_in"] = args.scale_in
     if args.report_every:
@@ -4114,8 +4985,11 @@ def main(argv: Iterable[str] | None = None) -> int:
     if args.no_fat_tails:
         overrides["use_fat_tails"] = False
     if args.symbols:
-        overrides["symbols"] = tuple(
-            x.strip().upper() for x in args.symbols.split(",") if x.strip())
+        overrides["symbols"] = _parse_symbols_arg(args.symbols)
+    elif env_symbols:
+        overrides["symbols"] = _parse_symbols_arg(env_symbols)
+        LOG.info("Markets pinned to %s by SYMBOLS",
+                 ", ".join(overrides["symbols"]) or "(empty -> every market)")
     if args.max_concurrent is not None:
         overrides["max_concurrent_positions"] = args.max_concurrent
 

@@ -13,12 +13,15 @@ from __future__ import annotations
 
 import os
 import random
+import re
 import tempfile
 import types
 import math
 import sys
 import time
 import unittest
+
+import requests
 from dataclasses import replace
 from decimal import Decimal
 
@@ -26,7 +29,7 @@ import btc_5m_predictor as m
 from btc_5m_predictor import (
     Config, Journal, Position, PredictionClient, RiskManager, Round, Side,
     Signal, TradingHalted, Trader, breakeven_probability,
-    digital_up_probability, evaluate, kelly_stake, settle_pnl, walk_book,
+    assess, digital_up_probability, kelly_stake, settle_pnl, walk_book,
 )
 
 
@@ -68,7 +71,8 @@ def build_trader(client, config, db_path):
     t._vol = types.SimpleNamespace(sigma_annual=lambda *a: 0.5,
                                    tail_df=lambda *a: None,
                                    is_clamped=lambda *a: False,
-                                   raw_sigma=lambda *a: 0.5)
+                                   raw_sigma=lambda *a: 0.5,
+                                   trend=lambda *a: m.Trend())
     t._journal = Journal(db_path, getattr(config, "profile_name", "test"))
     t._paper_bankroll = config.paper_start_bankroll
     t._risk = {}
@@ -367,9 +371,23 @@ class TestParseRound(unittest.TestCase):
             {"name": "DOWN", "price": "0.48", "tokenId": "2"}]
         self.assertIsNotNone(PredictionClient._parse_round(t))
 
-    def test_rejects_wrong_symbol(self):
-        self.assertIsNone(PredictionClient._parse_round(
-            self.topic(symbol="ETHUSDT")))
+    def test_default_accepts_any_symbol(self):
+        """No `symbols` configured -> nothing is filtered by ticker."""
+        PredictionClient(cfg())
+        try:
+            for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT"):
+                self.assertIsNotNone(PredictionClient._parse_round(
+                    self.topic(symbol=sym)), sym)
+        finally:
+            PredictionClient(cfg())
+
+    def test_rejects_wrong_symbol_when_restricted(self):
+        PredictionClient(cfg(symbols=("BTCUSDT",)))
+        try:
+            self.assertIsNone(PredictionClient._parse_round(
+                self.topic(symbol="ETHUSDT")))
+        finally:
+            PredictionClient(cfg())
 
     def test_rejects_wrong_chart_type(self):
         self.assertIsNone(PredictionClient._parse_round(
@@ -432,23 +450,23 @@ class TestEvaluate(unittest.TestCase):
 
     def test_no_trade_without_strike(self):
         rnd = make_round(strike=None)
-        self.assertIsNone(evaluate(rnd, 100_500, 0.5, 1000, self.now, cfg()))
+        self.assertIsNone(assess(rnd, 100_500, 0.5, 1000, self.now, cfg()).signal)
 
     def test_no_trade_outside_entry_window(self):
         rnd = make_round()
         too_early = rnd.end_ms - 280_000
-        self.assertIsNone(evaluate(rnd, 100_500, 0.5, 1000, too_early, cfg()))
+        self.assertIsNone(assess(rnd, 100_500, 0.5, 1000, too_early, cfg()).signal)
         too_late = rnd.end_ms - 5_000
-        self.assertIsNone(evaluate(rnd, 100_500, 0.5, 1000, too_late, cfg()))
+        self.assertIsNone(assess(rnd, 100_500, 0.5, 1000, too_late, cfg()).signal)
 
     def test_no_trade_at_fair_prices(self):
         rnd = make_round(up_quote=0.5, down_quote=0.5)
-        self.assertIsNone(evaluate(rnd, 100_000, 0.5, 1000, self.now, cfg()))
+        self.assertIsNone(assess(rnd, 100_000, 0.5, 1000, self.now, cfg()).signal)
 
     def test_trades_when_book_is_underpriced(self):
         rnd = make_round()
         book = {Side.UP: [(0.55, 10_000)], Side.DOWN: [(0.90, 10_000)]}
-        sig = evaluate(rnd, 100_400, 0.5, 1000, self.now, cfg(), book)
+        sig = assess(rnd, 100_400, 0.5, 1000, self.now, cfg(), book).signal
         self.assertIsNotNone(sig)
         self.assertIs(sig.side, Side.UP)
         self.assertGreater(sig.edge, cfg().min_edge)
@@ -456,7 +474,7 @@ class TestEvaluate(unittest.TestCase):
     def test_picks_the_higher_edge_side(self):
         rnd = make_round()
         book = {Side.UP: [(0.90, 10_000)], Side.DOWN: [(0.30, 10_000)]}
-        sig = evaluate(rnd, 99_600, 0.5, 1000, self.now, cfg(), book)
+        sig = assess(rnd, 99_600, 0.5, 1000, self.now, cfg(), book).signal
         self.assertIsNotNone(sig)
         self.assertIs(sig.side, Side.DOWN)
 
@@ -464,8 +482,8 @@ class TestEvaluate(unittest.TestCase):
         rnd = make_round()
         thin = {Side.UP: [(0.55, 5), (0.65, 10_000)]}
         deep = {Side.UP: [(0.55, 10_000)]}
-        s_thin = evaluate(rnd, 100_400, 0.5, 1000, self.now, cfg(), thin)
-        s_deep = evaluate(rnd, 100_400, 0.5, 1000, self.now, cfg(), deep)
+        s_thin = assess(rnd, 100_400, 0.5, 1000, self.now, cfg(), thin).signal
+        s_deep = assess(rnd, 100_400, 0.5, 1000, self.now, cfg(), deep).signal
         self.assertIsNotNone(s_thin)
         self.assertGreater(s_thin.fill_price, s_deep.fill_price)
         self.assertLess(s_thin.edge, s_deep.edge)
@@ -474,31 +492,31 @@ class TestEvaluate(unittest.TestCase):
         rnd = make_round()
         book = {Side.UP: [(0.55, 0.5)]}      # ~0.27 USDT of depth
         self.assertIsNone(
-            evaluate(rnd, 100_400, 0.5, 100_000, self.now, cfg(), book))
+            assess(rnd, 100_400, 0.5, 100_000, self.now, cfg(), book).signal)
 
     def test_refuses_prices_above_the_cap(self):
         rnd = make_round()
         book = {Side.UP: [(0.97, 10_000)]}
         self.assertIsNone(
-            evaluate(rnd, 101_000, 0.5, 1000, self.now, cfg(), book))
+            assess(rnd, 101_000, 0.5, 1000, self.now, cfg(), book).signal)
 
     def test_falls_back_to_haircut_quote_without_book(self):
         rnd = make_round(up_quote=0.50, down_quote=0.50)
-        sig = evaluate(rnd, 100_600, 0.5, 1000, self.now, cfg(), None)
+        sig = assess(rnd, 100_600, 0.5, 1000, self.now, cfg(), None).signal
         self.assertIsNotNone(sig)
         self.assertAlmostEqual(sig.fill_price, 0.53, places=9)
 
     def test_edge_is_measured_against_breakeven_not_raw_price(self):
         rnd = make_round()
         book = {Side.UP: [(0.55, 10_000)]}
-        sig = evaluate(rnd, 100_400, 0.5, 1000, self.now, cfg(), book)
+        sig = assess(rnd, 100_400, 0.5, 1000, self.now, cfg(), book).signal
         expected = sig.model_prob - breakeven_probability(0.55, 200)
         self.assertAlmostEqual(sig.edge, expected, places=12)
 
     def test_stake_never_exceeds_cap(self):
         rnd = make_round()
         book = {Side.UP: [(0.20, 1_000_000)]}
-        sig = evaluate(rnd, 103_000, 0.5, 1000, self.now, cfg(), book)
+        sig = assess(rnd, 103_000, 0.5, 1000, self.now, cfg(), book).signal
         self.assertIsNotNone(sig)
         self.assertLessEqual(sig.stake_usdt, 1000 * cfg().max_stake_pct + 1e-9)
 
@@ -506,7 +524,7 @@ class TestEvaluate(unittest.TestCase):
         rnd = make_round()
         book = {Side.UP: [(0.55, 10_000)]}
         before = (rnd, dict(book))
-        evaluate(rnd, 100_400, 0.5, 1000, self.now, cfg(), book)
+        assess(rnd, 100_400, 0.5, 1000, self.now, cfg(), book).signal
         self.assertEqual(before[0], rnd)
         self.assertEqual(before[1], book)
 
@@ -719,6 +737,70 @@ class TestSimulatedSession(unittest.TestCase):
 
         self.assertAlmostEqual(t._paper_bankroll, 100.0 - staked, places=9)
         self.assertEqual(t._account_risk.consecutive_losses, 1)
+
+    def test_the_concurrency_cap_is_what_governs(self):
+        """
+        Regression. The entry guard used to return whenever ANY position was
+        open, which made max_concurrent_positions dead: its default of 2
+        could never be reached, and every multi-market deployment quietly
+        traded one market at a time while the config said otherwise.
+        """
+        start = 1_700_000_000_000
+        end = start + (m.DEFAULT_ROUND_SECONDS * 1000)
+        rounds = [make_round(topic_id=i, market_id=i, symbol=sym,
+                             feed_symbol="BTCUSDT", strike=None,
+                             start_ms=start, end_ms=end)
+                  for i, sym in enumerate(("BTCUSDT", "ETHUSDT", "SOLUSDT"), 1)]
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0)]
+        books = {(i, Side.UP): [(0.55, 10_000)] for i in (1, 2, 3)}
+        client = FakeClient(rounds, path, books, {})
+
+        t = self._trader(client, symbols=(), max_concurrent_positions=2)
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(len(t._positions), 2)
+        self.assertEqual(sorted(t._positions), ["BTCUSDT", "ETHUSDT"])
+
+        t._maybe_enter(100.0, "PAPER")      # cap reached; nothing more opens
+        self.assertEqual(len(t._positions), 2)
+
+    def test_a_cap_of_one_still_means_one(self):
+        start = 1_700_000_000_000
+        end = start + (m.DEFAULT_ROUND_SECONDS * 1000)
+        rounds = [make_round(topic_id=i, market_id=i, symbol=sym,
+                             feed_symbol="BTCUSDT", strike=None,
+                             start_ms=start, end_ms=end)
+                  for i, sym in enumerate(("BTCUSDT", "ETHUSDT"), 1)]
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0)]
+        books = {(i, Side.UP): [(0.55, 10_000)] for i in (1, 2)}
+        client = FakeClient(rounds, path, books, {})
+
+        t = self._trader(client, symbols=(), max_concurrent_positions=1)
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(len(t._positions), 1)
+
+    def test_a_second_position_on_one_market_is_refused(self):
+        """
+        The narrow thing the old guard was really protecting: the same bet
+        twice on one symbol is not diversification, and it would orphan the
+        first position in the journal.
+        """
+        start = 1_700_000_000_000
+        end = start + (m.DEFAULT_ROUND_SECONDS * 1000)
+        r1 = make_round(topic_id=1, market_id=1, strike=None,
+                        start_ms=start, end_ms=end)
+        r2 = make_round(topic_id=2, market_id=2, strike=None,
+                        start_ms=start, end_ms=end)     # same symbol
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0)]
+        books = {(1, Side.UP): [(0.55, 10_000)],
+                 (2, Side.UP): [(0.55, 10_000)]}
+        client = FakeClient([r1, r2], path, books, {})
+
+        t = self._trader(client, max_concurrent_positions=3)
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(len(t._positions), 1)
 
     def test_only_one_position_at_a_time(self):
         start = 1_700_000_000_000
@@ -1249,14 +1331,14 @@ class TestConvexProfile(unittest.TestCase):
         rnd = make_round()
         now = rnd.end_ms - 60_000
         book = {Side.UP: [(0.80, 10_000)]}
-        self.assertIsNone(evaluate(rnd, 103_000, 0.5, 1000, now, c, book))
+        self.assertIsNone(assess(rnd, 103_000, 0.5, 1000, now, c, book).signal)
 
     def test_buys_cheap_underpriced_contracts(self):
         c = convex_cfg()
         rnd = make_round()
         now = rnd.end_ms - 120_000
         book = {Side.UP: [(0.10, 100_000)]}
-        sig = evaluate(rnd, 100_120, 0.5, 1000, now, c, book, tail_df=3.0)
+        sig = assess(rnd, 100_120, 0.5, 1000, now, c, book, tail_df=3.0).signal
         self.assertIsNotNone(sig)
         self.assertLessEqual(sig.fill_price, c.max_entry_price)
 
@@ -1694,8 +1776,8 @@ class TestPerMarketFee(unittest.TestCase):
         now = rnd_free.end_ms - 60_000
         book = {Side.UP: [(0.55, 10_000)]}
         c = cfg(min_edge=0.04, min_edge_ratio=0.05)
-        s_free = evaluate(rnd_free, 100_150, 0.5, 1000, now, c, book)
-        s_paid = evaluate(rnd_paid, 100_150, 0.5, 1000, now, c, book)
+        s_free = assess(rnd_free, 100_150, 0.5, 1000, now, c, book).signal
+        s_paid = assess(rnd_paid, 100_150, 0.5, 1000, now, c, book).signal
         self.assertIsNotNone(s_free)
         if s_paid is not None:
             self.assertGreater(s_free.edge, s_paid.edge)
@@ -2021,14 +2103,14 @@ class TestFavoriteProfile(unittest.TestCase):
         rnd = make_round()
         now = rnd.end_ms - 60_000
         book = {Side.UP: [(0.15, 100_000)]}
-        self.assertIsNone(evaluate(rnd, 101_500, 0.5, 1000, now, c, book, 4.0))
+        self.assertIsNone(assess(rnd, 101_500, 0.5, 1000, now, c, book, 4.0).signal)
 
     def test_buys_an_underpriced_favourite(self):
         c = self._c()
         rnd = make_round(fee_bps=0)
         now = rnd.end_ms - 60_000
         book = {Side.UP: [(0.60, 100_000)]}
-        sig = evaluate(rnd, 100_250, 0.5, 1000, now, c, book)
+        sig = assess(rnd, 100_250, 0.5, 1000, now, c, book).signal
         self.assertIsNotNone(sig)
         self.assertGreaterEqual(sig.fill_price, c.min_entry_price)
         self.assertLessEqual(sig.fill_price, c.max_entry_price)
@@ -2895,14 +2977,18 @@ class TestBufferGate(unittest.TestCase):
         rnd = make_round(strike=65_000.0, fee_bps=0)
         now = rnd.end_ms - 60_000
         book = {Side.UP: [(0.85, 100_000)]}
-        self.assertIsNone(evaluate(rnd, 65_010, 0.5, 1000, now, c, book))
+        self.assertIsNone(assess(rnd, 65_010, 0.5, 1000, now, c, book).signal)
 
     def test_gate_allows_large_buffers(self):
         c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
         rnd = make_round(strike=65_000.0, fee_bps=0)
         now = rnd.end_ms - 60_000
-        book = {Side.UP: [(0.90, 100_000)]}
-        sig = evaluate(rnd, 65_180, 0.5, 1000, now, c, book)
+        # 0.78 rather than 0.90: the buffer is what admits the trade, and the
+        # return floor is what decides the price it may be taken at. A book
+        # priced above the floor is refused however large the buffer is,
+        # which is the whole point of the floor.
+        book = {Side.UP: [(0.78, 100_000)]}
+        sig = assess(rnd, 65_180, 0.5, 1000, now, c, book).signal
         self.assertIsNotNone(sig)
         self.assertGreaterEqual(abs(sig.buffer_z), c.min_buffer_sigmas)
 
@@ -2911,19 +2997,31 @@ class TestBufferGate(unittest.TestCase):
         rnd = make_round(strike=65_000.0, fee_bps=0)
         now = rnd.end_ms - 60_000
         book = {Side.UP: [(0.90, 1e5)], Side.DOWN: [(0.82, 1e5)]}
-        sig = evaluate(rnd, 65_180, 0.5, 1000, now, c, book)
+        sig = assess(rnd, 65_180, 0.5, 1000, now, c, book).signal
         if sig is not None:
             self.assertIs(sig.side, Side.UP)
 
-    def test_buffer_profile_trades_the_high_band(self):
-        c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
-        self.assertGreaterEqual(c.min_entry_price, 0.80)
-        self.assertLessEqual(c.max_entry_price, 0.97)
+    def test_buffer_profile_backs_favourites_that_still_pay(self):
+        """
+        The band's top is set by the return floor, not chosen separately.
 
-    def test_other_profiles_still_refuse_that_band(self):
-        for name in ("convex", "favorite", "micro"):
+        Buying a favourite is only sound while the win is large enough to
+        cover the loss it risks. If the ceiling ever drifts above what the
+        floor permits, the profile is back to 6% wins and one loss undoing
+        sixteen of them.
+        """
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        self.assertGreater(c.min_entry_price, 0.50)
+        self.assertLessEqual(
+            c.max_entry_price,
+            m.max_price_for_return(c.min_win_return, c.fee_bps) + 0.01)
+        self.assertGreaterEqual(c.min_win_return, 0.25)
+
+    def test_other_profiles_do_not_enforce_a_return_floor(self):
+        """Only buffer trades on the payout as well as the edge."""
+        for name in ("convex", "balanced", "favorite", "micro"):
             c = Config(api_key="k", api_secret="s", **m.PROFILES[name])
-            self.assertLess(c.max_entry_price, 0.90, name)
+            self.assertEqual(c.min_win_return, 0.0, name)
 
     def test_gate_disabled_by_default_elsewhere(self):
         for name in ("convex", "favorite", "micro", "balanced"):
@@ -3230,10 +3328,13 @@ class TestScaleIn(unittest.TestCase):
                          end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
         path = [(start, 65_000.0), (start + 120_000, spot_now),
                 (start + m.DEFAULT_ROUND_SECONDS * 1000 + 3_000, spot_now)]
-        book = {(1, Side.UP): [(0.88, 1e6)], (1, Side.DOWN): [(0.90, 1e6)]}
+        # Inside the buffer profile's band, which the return floor caps at
+        # ~0.80. Prices above it are refused before sizing is ever reached,
+        # so a fixture written at 0.88 would test nothing but the refusal.
+        book = {(1, Side.UP): [(0.72, 1e6)], (1, Side.DOWN): [(0.75, 1e6)]}
         client = FakeClient([rnd], path, book, {})
         t = build_trader(client, c, self.db)
-        sig = Signal(Side.UP, 0.90, 0.88, 0.02, 2.0, 120.0, 1.8)
+        sig = Signal(Side.UP, 0.90, 0.68, 0.02, 2.0, 120.0, 1.8)
         tid = t._journal.record("PAPER", rnd, sig, 65_000, 0.5, 100.0)
         t._position = Position(tid, rnd, sig, 2.0, 1)
         client.t = 1
@@ -3589,6 +3690,18 @@ class TestConfigFile(unittest.TestCase):
                            overrides={"max_stake_pct": 0.13})
         self.assertEqual(c.max_stake_pct, 0.13)   # CLI beats file overrides
 
+    def test_symbols_override_layers_the_same_way(self):
+        """--symbols / SYMBOLS reach Config via the exact same `overrides`
+        path as every other CLI/env-sourced setting, so they get the same
+        precedence: CLI/env pins it regardless of what the file says."""
+        doc = m.default_config_document()
+        doc["defaults"]["symbols"] = ["ETHUSDT"]
+        c = m.build_config(doc, api_key="k", api_secret="s", live=False,
+                           db_path="d",
+                           overrides={"symbols": m._parse_symbols_arg(
+                               "btcusdt, solusdt")})
+        self.assertEqual(c.symbols, ("BTCUSDT", "SOLUSDT"))
+
     def test_tuple_fields_survive_json(self):
         doc = m.default_config_document()
         doc["defaults"]["open_statuses"] = ["OPEN", "ACTIVE"]
@@ -3695,7 +3808,7 @@ class TestHotReload(unittest.TestCase):
 
     def test_client_sees_the_new_config_without_rebuilding(self):
         client = PredictionClient(self.store)
-        self.assertEqual(client._cfg.min_buffer_sigmas, 1.5)
+        self.assertEqual(client._cfg.min_buffer_sigmas, 0.75)
         self._edit(lambda d: d["profiles"]["buffer"].update(
             min_buffer_sigmas=2.75))
         self.store.maybe_reload()
@@ -4166,6 +4279,47 @@ class TestTradingModeEnv(unittest.TestCase):
         self.assertEqual(hit.group(1), "None")
 
 
+class TestSymbolsArgParsing(unittest.TestCase):
+    """The comma-separated parser shared by --symbols and SYMBOLS."""
+
+    def test_splits_and_uppercases(self):
+        self.assertEqual(m._parse_symbols_arg("btcusdt,ethusdt"),
+                         ("BTCUSDT", "ETHUSDT"))
+
+    def test_strips_whitespace_and_drops_blank_entries(self):
+        self.assertEqual(m._parse_symbols_arg(" btcusdt , , ethusdt "),
+                         ("BTCUSDT", "ETHUSDT"))
+
+    def test_blank_string_means_no_restriction(self):
+        self.assertEqual(m._parse_symbols_arg(""), ())
+        self.assertEqual(m._parse_symbols_arg("   "), ())
+        self.assertEqual(m._parse_symbols_arg(",,,"), ())
+
+
+class TestSymbolsEnv(unittest.TestCase):
+    """SYMBOLS is the environment equivalent of --symbols."""
+
+    def test_env_var_is_read(self):
+        import inspect
+        src = inspect.getsource(m.main)
+        self.assertIn('os.environ.get("SYMBOLS"', src)
+
+    def test_cli_flag_is_checked_before_the_env_fallback(self):
+        """--symbols must win when both are set."""
+        import inspect
+        src = inspect.getsource(m.main)
+        cli_at = src.index("if args.symbols:")
+        env_at = src.index("elif env_symbols:")
+        self.assertLess(cli_at, env_at)
+
+    def test_cli_and_env_share_one_parser(self):
+        """A shared helper is what keeps the two paths from drifting apart."""
+        import inspect
+        src = inspect.getsource(m.main)
+        self.assertEqual(src.count("_parse_symbols_arg(args.symbols)"), 1)
+        self.assertEqual(src.count("_parse_symbols_arg(env_symbols)"), 1)
+
+
 class TestPreflightGate(unittest.TestCase):
     """Preflight runs at boot, where real credentials and a region exist."""
 
@@ -4260,6 +4414,23 @@ class TestBlendedPriceCeiling(unittest.TestCase):
         self.assertLessEqual(c.max_blended_price, 0.95)
         self.assertGreater(c.max_blended_price, c.min_entry_price)
 
+    def test_the_return_floor_tightens_the_blend_cap(self):
+        """
+        A top-up is bought higher than the opener, so the blend is what
+        actually decides the payout. Enforcing the return floor on entry and
+        not on the blend would let the last tranche spend the whole return.
+        """
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        # A market whose fee is worse than the profile's fallback: the cap
+        # has to move with it rather than staying at the written number.
+        self.assertLess(m.blended_price_cap(c, 2000), c.max_blended_price)
+        self.assertLessEqual(m.blended_price_cap(c, 0), c.max_blended_price)
+
+    def test_blend_cap_ignores_the_floor_when_none_is_set(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["balanced"])
+        self.assertAlmostEqual(m.blended_price_cap(c, 200),
+                               c.max_blended_price)
+
     def test_invalid_ceiling_is_rejected(self):
         for bad in (0.0, 1.0, 1.5):
             with self.assertRaises(ValueError):
@@ -4270,7 +4441,7 @@ class TestBlendCapIsPerProfile(unittest.TestCase):
     """
     The blend cap is only meaningful against a profile's own band.
 
-    0.90 suits buffer (0.80-0.97) and is meaningless for convex (0.05-0.35),
+    0.78 suits buffer (0.55-0.80) and is meaningless for convex (0.05-0.35),
     where no fill could approach it. Leaving it as a shared default would
     repeat the pattern of one strategy's number quietly governing all of them.
     """
@@ -4294,7 +4465,7 @@ class TestBlendCapIsPerProfile(unittest.TestCase):
     def test_cap_below_the_band_is_rejected(self):
         """No position could satisfy it, so top-ups would never happen."""
         with self.assertRaises(ValueError):
-            cfg(min_entry_price=0.80, max_entry_price=0.97,
+            cfg(min_entry_price=0.60, max_entry_price=0.97,
                 max_blended_price=0.50)
 
     def test_caps_differ_across_profiles(self):
@@ -4352,10 +4523,10 @@ class TestScaleInSizing(unittest.TestCase):
                          end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
         path = [(start, 65_000.0), (start + 120_000, spot_now),
                 (start + m.DEFAULT_ROUND_SECONDS * 1000 + 3_000, spot_now)]
-        book = {(1, Side.UP): [(0.88, 1e6)], (1, Side.DOWN): [(0.90, 1e6)]}
+        book = {(1, Side.UP): [(0.72, 1e6)], (1, Side.DOWN): [(0.75, 1e6)]}
         client = FakeClient([rnd], path, book, {})
         t = build_trader(client, c, self.db)
-        sig = Signal(Side.UP, 0.88, 0.86, 0.02, 1.0, 120.0, 1.6)
+        sig = Signal(Side.UP, 0.88, 0.66, 0.02, 1.0, 120.0, 1.6)
         tid = t._journal.record("PAPER", rnd, sig, 65_000, 0.5, 100.0)
         t._position = Position(tid, rnd, sig, 1.0, 1)
         client.t = 1
@@ -4387,17 +4558,79 @@ class TestScaleInSizing(unittest.TestCase):
         total = t._position.committed_usdt
         self.assertLessEqual(total, (100.0 + total) * c.hard_max_stake_pct + 1e-6)
 
-    def test_no_topup_when_the_blend_would_breach(self):
-        """Opener already at the ceiling: nothing may be added above it."""
+    def test_no_topup_when_the_opener_is_already_past_the_ceiling(self):
+        """
+        Nothing may be added to a position that is already over the cap.
+
+        Fail-safe rather than clever: a cheaper top-up would in fact drag the
+        blend back DOWN, but distinguishing the two cases means trusting the
+        blend arithmetic at exactly the moment the position is already
+        outside its limits, and refusing is the cheaper mistake.
+        """
         t = self._setup(65_400.0)
         t._position = replace(
             t._position,
-            signal=replace(t._position.signal, fill_price=0.90))
+            signal=replace(t._position.signal, fill_price=0.79))
         before = t._position.committed_usdt
         t._maybe_scale_in(100.0)
-        self.assertLessEqual(t._position.signal.fill_price,
-                             t._cfg.max_blended_price + 1e-6)
-        self.assertGreaterEqual(t._position.committed_usdt, before)
+        self.assertEqual(t._position.committed_usdt, before)
+        self.assertEqual(t._position.tranches, 1)
+
+
+class TestModeIsNotHardcoded(unittest.TestCase):
+    """
+    The entrypoint must not pin the mode.
+
+    A command-line flag beats TRADING_MODE, so a hardcoded --live makes that
+    variable dead: render.yaml could read TRADING_MODE=paper while the process
+    spent real money.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import os as _os
+        cls.here = _os.path.dirname(_os.path.abspath(__file__))
+
+    def _entry(self):
+        import os as _os
+        path = _os.path.join(self.here, "entrypoint.sh")
+        if not _os.path.exists(path):
+            self.skipTest("entrypoint.sh not present")
+        return open(path).read()
+
+    def test_entrypoint_has_no_mode_flag(self):
+        import re as _re
+        for line in self._entry().split("\n"):
+            if line.strip().startswith("#"):
+                continue
+            self.assertIsNone(
+                _re.search(r"(?<![\w-])--(live|paper)(?![\w-])", line),
+                f"entrypoint pins the mode: {line.strip()}")
+
+    def test_cli_flag_would_beat_the_environment(self):
+        """Why the above matters, asserted rather than assumed."""
+        import json as _j, tempfile as _t, os as _os
+        fd, path = _t.mkstemp(suffix=".json"); _os.close(fd)
+        try:
+            _j.dump(m.default_config_document(), open(path, "w"))
+            doc = _j.load(open(path))
+            pinned = m.build_config(doc, api_key="k", api_secret="s",
+                                    live=True, db_path="d")
+            unpinned = m.build_config(doc, api_key="k", api_secret="s",
+                                      live=None, db_path="d")
+            self.assertTrue(pinned.live)
+            self.assertFalse(unpinned.live)
+        finally:
+            _os.unlink(path)
+
+    def test_render_declares_a_trading_mode(self):
+        import os as _os, re as _re
+        path = _os.path.join(self.here, "render.yaml")
+        if not _os.path.exists(path):
+            self.skipTest("render.yaml not present")
+        hit = _re.search(r"key:\s*TRADING_MODE\s*\n\s*value:\s*(\w+)",
+                         open(path).read())
+        self.assertIn(hit.group(1), ("paper", "live"))
 
 
 class TestDeploymentManifests(unittest.TestCase):
@@ -4492,6 +4725,55 @@ class TestMultiMarket(unittest.TestCase):
         finally:
             PredictionClient(cfg())
 
+    def test_market_ticker_is_not_the_oracle_feed(self):
+        """
+        Regression: `symbol` (the venue's contract ticker) and `feed_symbol`
+        (the oracle it settles against) shared one local name, so the Round
+        was built with the ORACLE value -- or the string "None" when no feed
+        was published. Positions, per-market risk and the journal were all
+        keyed on the wrong thing.
+        """
+        PredictionClient(self._cfg(symbols=()))
+        try:
+            t = TestParseRound.topic(symbol="ETHUSDT")
+            t["variantData"] = {"startPrice": "65000",
+                                "priceFeedSymbol": "Crypto.ETH/USD"}
+            r = PredictionClient._parse_round(t)
+            self.assertEqual(r.symbol, "ETHUSDT")
+            self.assertEqual(r.feed_symbol, "Crypto.ETH/USD")
+        finally:
+            PredictionClient(cfg())
+
+    def test_missing_feed_leaves_the_ticker_intact(self):
+        PredictionClient(self._cfg(symbols=()))
+        try:
+            t = TestParseRound.topic(symbol="SOLUSDT")
+            t["variantData"] = {"startPrice": "150"}
+            r = PredictionClient._parse_round(t)
+            self.assertEqual(r.symbol, "SOLUSDT")
+            self.assertIsNone(r.feed_symbol)
+        finally:
+            PredictionClient(cfg())
+
+    def test_a_topic_without_a_symbol_is_rejected(self):
+        PredictionClient(self._cfg(symbols=()))
+        try:
+            t = TestParseRound.topic()
+            del t["symbol"]
+            self.assertIsNone(PredictionClient._parse_round(t))
+        finally:
+            PredictionClient(cfg())
+
+    def test_discovery_accepts_every_listed_market(self):
+        PredictionClient(self._cfg(symbols=()))
+        try:
+            for sym in ("BTCUSDT", "ETHUSDT", "SOLUSDT", "DOGEUSDT"):
+                self.assertIsNotNone(
+                    PredictionClient._parse_round(
+                        TestParseRound.topic(symbol=sym)), sym)
+        finally:
+            PredictionClient(cfg())
+
     def test_positions_are_held_per_market(self):
         t = self._trader()
         for sym in ("BTCUSDT", "ETHUSDT"):
@@ -4547,12 +4829,19 @@ class TestMultiMarket(unittest.TestCase):
         with self.assertRaises(ValueError):
             cfg(symbols=("BTCUSDT", "BTCUSDT"))
 
-    def test_empty_symbols_are_rejected(self):
-        with self.assertRaises(ValueError):
-            cfg(symbols=())
+    def test_empty_symbols_means_every_market_is_traded(self):
+        """Not a rejection: the empty tuple is how auto-discovery is spelled."""
+        c = cfg(symbols=())
+        self.assertEqual(c.symbols, ())
 
     def test_symbol_property_returns_the_first(self):
         self.assertEqual(cfg(symbols=("ETHUSDT", "BTCUSDT")).symbol, "ETHUSDT")
+
+    def test_symbol_property_falls_back_when_unrestricted(self):
+        """`.symbol` still needs to hand back a single ticker for the
+        informational spots that use it (preflight's probe, the settlement-
+        feed fallback), even with no restriction configured."""
+        self.assertEqual(cfg(symbols=()).symbol, "BTCUSDT")
 
     def test_journal_records_the_market(self):
         j = Journal(self.db, "buffer")
@@ -4697,3 +4986,984 @@ class TestJournal(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestWinReturn(unittest.TestCase):
+    """
+    How much a win pays, which is a different question from whether the bet
+    is priced wrong. A trade can carry a large probability edge and still
+    return 6%, in which case one loss undoes sixteen wins.
+    """
+
+    def test_return_falls_as_price_rises(self):
+        prev = math.inf
+        for price in (0.55, 0.70, 0.80, 0.90, 0.95):
+            r = m.win_return(price, 0)
+            self.assertLess(r, prev)
+            prev = r
+
+    def test_the_expensive_end_pays_almost_nothing(self):
+        self.assertLess(m.win_return(0.94, 200), 0.07)
+        self.assertGreater(m.win_return(0.80, 200), 0.24)
+
+    def test_fees_reduce_the_return(self):
+        self.assertLess(m.win_return(0.70, 500), m.win_return(0.70, 0))
+
+    def test_rejects_impossible_prices(self):
+        for bad in (0.0, 1.0, -0.5, 2.0):
+            with self.assertRaises(ValueError):
+                m.win_return(bad, 200)
+
+    def test_settlement_uses_the_same_formula(self):
+        """One definition, or the payout and the gate can disagree."""
+        for price in (0.2, 0.55, 0.79, 0.9):
+            for fee in (0, 200, 900):
+                self.assertAlmostEqual(settle_pnl(10.0, price, True, fee),
+                                       10.0 * m.win_return(price, fee),
+                                       places=12)
+
+    def test_cap_inverts_the_return(self):
+        for target in (0.10, 0.25, 0.50, 1.0):
+            for fee in (0, 200, 900):
+                cap = m.max_price_for_return(target, fee)
+                self.assertAlmostEqual(m.win_return(cap, fee), target,
+                                       places=12)
+
+    def test_cap_tracks_the_market_fee(self):
+        """A hardcoded ceiling is wrong on every market with another fee."""
+        self.assertGreater(m.max_price_for_return(0.25, 0),
+                           m.max_price_for_return(0.25, 900))
+
+    def test_no_floor_means_no_ceiling(self):
+        self.assertEqual(m.max_price_for_return(0.0, 200), 1.0)
+        self.assertEqual(m.max_price_for_return(-1.0, 200), 1.0)
+
+
+class TestReturnFloor(unittest.TestCase):
+    """
+    A win must be large enough to be worth the loss it risks. Enforced
+    everywhere money is committed, not only on the first screen.
+    """
+
+    def setUp(self):
+        self.c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+
+    def test_disabled_floor_admits_everything(self):
+        loose = cfg(min_win_return=0.0)
+        self.assertTrue(m.clears_return(0.99, 200, loose))
+
+    def test_floor_rejects_a_thin_payout(self):
+        self.assertFalse(m.clears_return(0.94, 200, self.c))
+        self.assertTrue(m.clears_return(0.70, 200, self.c))
+
+    def test_evaluate_refuses_a_price_that_pays_too_little(self):
+        """
+        The case that motivated this: a real edge whose win is trivial.
+
+        The book sits at 0.94 and the model says 0.99, which clears every
+        edge test comfortably -- and pays about 6%, so one loss erases
+        sixteen wins. The floor is the only gate that sees it.
+        """
+        rnd = make_round(strike=65_000.0, fee_bps=200)
+        now = rnd.end_ms - 60_000
+        loose = cfg(**{**m.PROFILES["buffer"], "min_win_return": 0.0,
+                       "max_entry_price": 0.97})
+        book = {Side.UP: [(0.94, 1e6)]}
+        self.assertIsNotNone(assess(rnd, 65_200, 0.5, 1000, now, loose, book).signal)
+
+        strict = cfg(**{**m.PROFILES["buffer"], "max_entry_price": 0.97})
+        self.assertIsNone(assess(rnd, 65_200, 0.5, 1000, now, strict, book).signal)
+
+    def test_evaluate_checks_the_walked_price_not_just_the_top(self):
+        """
+        A thin top level at an acceptable price, with the depth behind it
+        priced past the floor. Screening only the best level would let the
+        trade through and fill it at a price the floor exists to refuse.
+        """
+        rnd = make_round(strike=65_000.0, fee_bps=0, decimal_precision=4)
+        now = rnd.end_ms - 60_000
+        book = {Side.UP: [(0.79, 0.5), (0.95, 1e6)]}
+        sig = assess(rnd, 65_200, 0.5, 1000, now, self.c, book).signal
+        if sig is not None:
+            self.assertTrue(m.clears_return(sig.fill_price, 0, self.c))
+
+    def test_accepted_signals_always_clear_the_floor(self):
+        rnd = make_round(strike=65_000.0, fee_bps=200)
+        for spot in (65_050, 65_120, 65_260, 64_800, 64_700):
+            for price in (0.56, 0.62, 0.71, 0.78, 0.795):
+                now = rnd.end_ms - 60_000
+                book = {Side.UP: [(price, 1e6)], Side.DOWN: [(price, 1e6)]}
+                sig = assess(rnd, spot, 0.5, 1000, now, self.c, book).signal
+                if sig is not None:
+                    self.assertGreaterEqual(
+                        m.win_return(sig.fill_price, 200),
+                        self.c.min_win_return - 1e-9,
+                        f"spot={spot} price={price}")
+
+    def test_the_live_quote_is_checked_too(self):
+        """
+        The screen looks at the book; the venue's quote is what executes.
+        A floor applied only to the screen is a floor the venue can step over.
+        """
+        import inspect
+        src = inspect.getsource(m.Trader._maybe_enter)
+        self.assertIn("clears_return(quote.average_price", src)
+
+    def test_top_ups_are_checked_too(self):
+        import inspect
+        src = inspect.getsource(m.Trader._maybe_scale_in)
+        self.assertIn("clears_return", src)
+        self.assertIn("blended_price_cap", src)
+
+    def test_a_floor_the_band_cannot_satisfy_is_rejected(self):
+        """
+        Otherwise the bot never trades and never says why -- the worst of
+        the three possible outcomes.
+        """
+        with self.assertRaises(ValueError):
+            cfg(min_entry_price=0.85, max_entry_price=0.95,
+                max_blended_price=0.90, min_win_return=0.25)
+
+    def test_negative_floor_is_rejected(self):
+        with self.assertRaises(ValueError):
+            cfg(min_win_return=-0.1)
+
+    def test_buffer_wins_now_cover_a_loss_in_four(self):
+        """The whole point: the wins/loss ratio at the band's worst price."""
+        c = self.c
+        worst = m.max_price_for_return(c.min_win_return, c.fee_bps)
+        self.assertLessEqual(m.wins_per_loss(worst), 4.5)
+
+
+class TestTrendDetection(unittest.TestCase):
+    """
+    Inertia measured so it can be acted on EARLY.
+
+    The detector these tests guard against is the obvious one: count
+    consecutive rounds that closed the same way, act once the count is high.
+    That detector is structurally late -- by the time three rounds confirm a
+    move, the move is three rounds old and the price is at its worst. So the
+    trigger here is the current block's thrust, and the run count is only
+    corroboration and a brake.
+    """
+
+    def _est(self, closes, **over):
+        settings = dict(m.PROFILES["buffer"]); settings.update(over)
+        c = Config(api_key="k", api_secret="s", **settings)
+        est = m.VolatilityEstimator.__new__(m.VolatilityEstimator)
+        est._store = None
+        est._static_cfg = c
+        return est._measure_trend(closes), c
+
+    @staticmethod
+    def _straight(n=30, step=20.0, start=65_000.0):
+        return [start + i * step for i in range(n)]
+
+    @staticmethod
+    def _chop(n=30, amp=60.0, start=65_000.0):
+        return [start + (amp if i % 2 else -amp) for i in range(n)]
+
+    @staticmethod
+    def _blocks(magnitudes, start=65_000.0, block=5):
+        """A series whose consecutive round-blocks move by `magnitudes`."""
+        out = [start]
+        for mag in magnitudes:
+            base = out[-1]
+            out.extend(base + mag * (i + 1) / block for i in range(block))
+        return out
+
+    def test_a_steady_climb_is_a_confirmed_up_trend(self):
+        trend, c = self._est(self._straight())
+        self.assertEqual(trend.direction, 1)
+        self.assertGreater(trend.efficiency, 0.9)
+        self.assertEqual(trend.phase, "running")
+        self.assertTrue(trend.confirmed(c))
+        self.assertTrue(trend.favours(Side.UP))
+        self.assertFalse(trend.favours(Side.DOWN))
+
+    def test_a_steady_fall_is_a_confirmed_down_trend(self):
+        trend, c = self._est(self._straight(step=-20.0))
+        self.assertEqual(trend.direction, -1)
+        self.assertTrue(trend.confirmed(c))
+        self.assertTrue(trend.favours(Side.DOWN))
+
+    def test_a_trend_is_caught_on_its_FIRST_block(self):
+        """
+        The requirement this whole design exists for.
+
+        Twenty-five flat minutes and then one decisive round. A run counter
+        would score this 1 and wait; the impulse test sees the thrust that is
+        happening right now and calls it a trend that is BUILDING.
+        """
+        trend, c = self._est(self._blocks([0, 0, 0, 0, 175.0]))
+        self.assertEqual(trend.run, 1)
+        self.assertEqual(trend.phase, "building")
+        self.assertGreater(trend.impulse, c.trend_min_impulse)
+        self.assertTrue(trend.confirmed(c))
+
+    def test_a_faded_trend_is_refused(self):
+        """
+        Blocks shrinking round over round. The history looks impressive and
+        the run count is at its maximum -- and there is nothing left to
+        trade. Entering here is buying the exhaustion.
+        """
+        trend, c = self._est(self._blocks([200, 120, 60, 24, 8]))
+        self.assertEqual(trend.run, 5)          # a run counter would fire
+        self.assertLess(trend.decay, c.trend_decay_floor)
+        self.assertEqual(trend.phase, "fading")
+        self.assertFalse(trend.confirmed(c))
+
+    def test_decay_alone_refuses_it_even_with_thrust_left(self):
+        """Decay is judged independently of size, not folded into it."""
+        trend, c = self._est(self._straight())
+        dying = replace(trend, decay=0.3, phase="fading")
+        self.assertFalse(dying.confirmed(c))
+
+    def test_a_move_with_under_a_round_left_is_refused(self):
+        """
+        The horizon that matters is the round being entered, so that is the
+        unit the test is written in.
+        """
+        trend, c = self._est(self._straight())
+        self.assertTrue(trend.confirmed(c))
+        self.assertFalse(replace(trend, rounds_left=0.4).confirmed(c))
+        self.assertTrue(replace(trend, rounds_left=1.0).confirmed(c))
+
+    def test_projection_answers_in_rounds(self):
+        # Halving each block, currently 4 sigmas, floor 1: 4 -> 2 -> 1, so
+        # two more rounds.
+        self.assertAlmostEqual(m._projected_rounds(4.0, 0.5, 1.0), 2.0)
+        self.assertEqual(m._projected_rounds(4.0, 1.0, 1.0), 99.0)
+        self.assertEqual(m._projected_rounds(0.5, 0.9, 1.0), 0.0)
+        self.assertEqual(m._projected_rounds(4.0, 0.0, 1.0), 0.0)
+
+    def test_chop_around_a_level_is_not_a_trend(self):
+        """
+        Price swinging across the strike travels a long way and ends up
+        nowhere. Efficiency is what catches it.
+        """
+        trend, c = self._est(self._chop())
+        self.assertLess(trend.efficiency, c.trend_min_efficiency)
+        self.assertFalse(trend.confirmed(c))
+
+    def test_a_flat_series_has_no_direction(self):
+        trend, c = self._est([65_000.0] * 30)
+        self.assertEqual(trend.direction, 0)
+        self.assertFalse(trend.confirmed(c))
+
+    def test_a_stretched_run_stops_being_boosted(self):
+        trend, c = self._est(self._straight(n=60, step=20.0, start=64_000.0))
+        self.assertFalse(replace(trend, run=c.trend_max_run + 1).confirmed(c))
+        self.assertTrue(replace(trend, run=c.trend_max_run).confirmed(c))
+
+    def test_a_weak_thrust_is_refused(self):
+        trend, c = self._est(self._straight())
+        weak = replace(trend, impulse=c.trend_min_impulse / 2)
+        self.assertFalse(weak.confirmed(c))
+
+    def test_run_is_counted_in_rounds_not_minutes(self):
+        """Five 1m closes make one 5m round, and the run counts rounds."""
+        trend, _ = self._est(self._straight(n=30))
+        self.assertLessEqual(trend.run, 30 // 5)
+
+    def test_a_reversal_becomes_a_NEW_trend_not_a_continuation(self):
+        """
+        Direction comes from the block in progress. A detector anchored to
+        the older blocks would still be reading UP at the moment price turned
+        down, which is the top of the move -- the single worst place to buy.
+        """
+        closes = self._blocks([150, 150, 150, -150])
+        trend, _ = self._est(closes)
+        self.assertEqual(trend.direction, -1)
+        self.assertEqual(trend.run, 1)
+        self.assertEqual(trend.phase, "building")
+
+    def test_nothing_is_measured_when_the_feature_is_off(self):
+        trend, c = self._est(self._straight(), trend_follow=False)
+        self.assertEqual(trend, m.Trend())
+        self.assertFalse(trend.confirmed(c))
+
+    def test_other_profiles_do_not_follow_trends(self):
+        for name in ("convex", "balanced", "favorite", "micro"):
+            c = Config(api_key="k", api_secret="s", **m.PROFILES[name])
+            self.assertFalse(c.trend_follow, name)
+
+    def test_too_little_history_is_no_trend(self):
+        trend, _ = self._est([65_000.0, 65_100.0, 65_200.0])
+        self.assertEqual(trend, m.Trend())
+
+    def test_a_lookback_too_short_for_the_run_ceiling_is_rejected(self):
+        """Otherwise the fade rule could never fire and would look enabled."""
+        with self.assertRaises(ValueError):
+            cfg(trend_follow=True, trend_lookback_min=10, trend_max_run=6)
+
+    def test_a_shrinking_multiplier_is_rejected(self):
+        with self.assertRaises(ValueError):
+            cfg(trend_stake_multiple=0.8)
+
+    def test_an_impossible_decay_floor_is_rejected(self):
+        for bad in (0.0, -0.2, 1.5):
+            with self.assertRaises(ValueError):
+                cfg(trend_decay_floor=bad)
+
+    def test_the_minimum_run_defaults_to_one(self):
+        """Demanding corroboration is the same as entering late."""
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        self.assertEqual(c.trend_min_run, 1)
+
+    def test_trend_is_read_off_the_same_klines_as_sigma(self):
+        """A second fetch would compare two moments pretending to be one."""
+        import inspect
+        src = inspect.getsource(m.VolatilityEstimator.sigma_annual)
+        self.assertIn("_measure_trend(closes)", src)
+
+
+class TestTrendBoost(unittest.TestCase):
+    """Enter earlier and stake more while the inertia lasts -- but bounded."""
+
+    def setUp(self):
+        self.c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        self.up = m.Trend(direction=1, impulse=2.0, z=2.0, efficiency=0.9,
+                          run=2, decay=0.95, rounds_left=8.0,
+                          phase="running")
+
+    def _round(self):
+        return make_round(strike=65_000.0, fee_bps=200)
+
+    def test_window_widens_only_when_confirmed(self):
+        c = self.c
+        self.assertEqual(m.entry_window_start_s(c, False),
+                         float(c.entry_window_start_s))
+        self.assertEqual(
+            m.entry_window_start_s(c, True),
+            min(float(c.round_seconds),
+                float(c.entry_window_start_s + c.trend_early_entry_s)))
+        self.assertGreater(m.entry_window_start_s(c, True),
+                           m.entry_window_start_s(c, False))
+
+    def test_window_never_exceeds_the_round(self):
+        c = cfg(**{**m.PROFILES["buffer"], "entry_window_start_s": 280,
+                   "trend_early_entry_s": 200})
+        self.assertLessEqual(m.entry_window_start_s(c, True), c.round_seconds)
+
+    def test_no_entry_before_the_window_without_a_trend(self):
+        rnd = self._round()
+        now = rnd.end_ms - 290_000          # earlier than the 270s window
+        book = {Side.UP: [(0.70, 1e6)]}
+        self.assertIsNone(assess(rnd, 65_500, 0.5, 1000, now, self.c, book).signal)
+
+    def test_a_confirmed_trend_admits_an_early_entry(self):
+        rnd = self._round()
+        now = rnd.end_ms - 290_000
+        book = {Side.UP: [(0.70, 1e6)]}
+        sig = assess(rnd, 65_500, 0.5, 1000, now, self.c, book,
+                       trend=self.up).signal
+        self.assertIsNotNone(sig)
+        self.assertTrue(sig.trend_boosted)
+        self.assertGreater(sig.seconds_left, self.c.entry_window_start_s)
+
+    def test_the_early_window_is_not_a_general_relaxation(self):
+        """
+        A trend pointing UP must not open the window for a DOWN trade. That
+        would be using the trend as an excuse to trade against it.
+        """
+        rnd = self._round()
+        now = rnd.end_ms - 290_000
+        book = {Side.DOWN: [(0.70, 1e6)]}
+        self.assertIsNone(assess(rnd, 64_500, 0.5, 1000, now, self.c, book,
+                                   trend=self.up).signal)
+
+    def test_the_buffer_gate_still_applies_early(self):
+        """
+        Entering early does not lower the bar. z is measured in sigmas of the
+        REMAINING time, so clearing it with four minutes to run takes a
+        genuinely larger move -- which is exactly what the trend supplies.
+        """
+        rnd = self._round()
+        now = rnd.end_ms - 290_000
+        book = {Side.UP: [(0.70, 1e6)]}
+        self.assertIsNone(assess(rnd, 65_010, 0.5, 1000, now, self.c, book,
+                                   trend=self.up).signal)
+
+    def test_a_confirmed_trend_stakes_more(self):
+        rnd = self._round()
+        now = rnd.end_ms - 60_000
+        book = {Side.UP: [(0.70, 1e6)]}
+        plain = assess(rnd, 65_200, 0.5, 1000, now, self.c, book).signal
+        boosted = assess(rnd, 65_200, 0.5, 1000, now, self.c, book,
+                           trend=self.up).signal
+        self.assertIsNotNone(plain)
+        self.assertIsNotNone(boosted)
+        self.assertGreater(boosted.stake_usdt, plain.stake_usdt)
+        self.assertFalse(plain.trend_boosted)
+
+    def test_an_unconfirmed_trend_changes_nothing(self):
+        rnd = self._round()
+        now = rnd.end_ms - 60_000
+        book = {Side.UP: [(0.70, 1e6)]}
+        weak = m.Trend(direction=1, impulse=0.2, z=0.2, efficiency=0.1,
+                       run=1, rounds_left=0.0, phase="none")
+        plain = assess(rnd, 65_200, 0.5, 1000, now, self.c, book).signal
+        same = assess(rnd, 65_200, 0.5, 1000, now, self.c, book, trend=weak).signal
+        self.assertAlmostEqual(plain.stake_usdt, same.stake_usdt)
+        self.assertFalse(same.trend_boosted)
+
+    def test_the_boost_never_leaves_the_hard_stake_cap(self):
+        for bankroll in (10.0, 100.0, 5000.0):
+            for price in (0.56, 0.70, 0.79):
+                stake = kelly_stake(bankroll, 0.95, price, self.c, 200)
+                out = m.boosted_stake(stake, bankroll, 0.95, price, self.c, 200)
+                self.assertLessEqual(out,
+                                     bankroll * self.c.hard_max_stake_pct + 1e-9)
+
+    def test_the_boost_never_passes_twice_full_kelly(self):
+        """Beyond 2x full Kelly, log growth is negative even with an edge."""
+        for price in (0.56, 0.70, 0.79):
+            for prob in (0.62, 0.75, 0.90):
+                bankroll = 500.0
+                stake = kelly_stake(bankroll, prob, price, self.c, 200)
+                if stake <= 0:
+                    continue
+                out = m.boosted_stake(stake, bankroll, prob, price, self.c, 200)
+                mult = m.kelly_multiple(out, bankroll, prob, price, 200)
+                if mult is not None:
+                    self.assertLessEqual(mult, 2.0 + 1e-9,
+                                         f"{price}/{prob}")
+
+    def test_the_boost_never_shrinks_a_stake(self):
+        for price in (0.56, 0.70, 0.79):
+            stake = kelly_stake(50.0, 0.85, price, self.c, 200)
+            self.assertGreaterEqual(
+                m.boosted_stake(stake, 50.0, 0.85, price, self.c, 200), stake)
+
+    def test_a_boosted_position_keeps_its_size_on_top_up(self):
+        """
+        Opening at trend size and topping up to the plain Kelly target would
+        shrink the position mid-round -- neither rule, just an accident of
+        applying one at entry and the other afterwards.
+        """
+        import inspect
+        src = inspect.getsource(m.Trader._maybe_scale_in)
+        self.assertIn("trend_boosted", src)
+        self.assertIn("boosted_stake", src)
+
+    def test_trend_z_is_signed_against_the_side_taken(self):
+        """
+        Positive means the trend agreed with the trade, negative that it did
+        not. Without the sign the journal cannot later separate the trades
+        the inertia paid for from the ones it did not.
+        """
+        rnd = self._round()
+        now = rnd.end_ms - 60_000
+        # Spot BELOW the strike, so the tradable side is DOWN while the
+        # trend points UP.
+        book = {Side.DOWN: [(0.70, 1e6)]}
+        sig = assess(rnd, 64_800, 0.5, 1000, now, self.c, book,
+                     trend=self.up).signal
+        if sig is not None:
+            self.assertIs(sig.side, Side.DOWN)
+            self.assertLess(sig.trend_z, 0.0)
+            self.assertFalse(sig.trend_boosted)
+
+        aligned = assess(rnd, 65_200, 0.5, 1000, now, self.c,
+                         {Side.UP: [(0.70, 1e6)]}, trend=self.up).signal
+        self.assertIsNotNone(aligned)
+        self.assertGreater(aligned.trend_z, 0.0)
+
+    def test_the_journal_records_the_trend(self):
+        fd, db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            j = Journal(db, "buffer")
+            sig = Signal(Side.UP, 0.9, 0.70, 0.05, 2.0, 200.0, 1.2,
+                         trend_z=2.5, trend_boosted=True)
+            tid = j.record("PAPER", make_round(), sig, 65_000, 0.5, 25.0)
+            row = j._conn.execute(
+                "SELECT trend_z FROM trades WHERE id=?", (tid,)).fetchone()
+            self.assertAlmostEqual(row[0], 2.5)
+        finally:
+            os.unlink(db)
+
+    def test_the_prefilter_does_not_drop_early_rounds(self):
+        """
+        The exact window needs the trend, which needs the hydrated round. So
+        the pre-hydration screen has to be the loose one, or it discards
+        precisely the rounds the trend exists to catch.
+        """
+        import inspect
+        src = inspect.getsource(m.Trader._maybe_enter)
+        self.assertIn("entry_window_start_s(self._cfg", src)
+
+
+class TestAuthWait(unittest.TestCase):
+    """
+    Preflight waits for a shared outbound IP to be allowlisted.
+
+    The address is not knowable until the process runs and can change on any
+    restart, so it cannot be added in advance. Failing on the first refusal
+    kills the deploy a second after printing the one thing needed to fix it.
+    """
+
+    def setUp(self):
+        self.slept = []
+        self._sleep = time.sleep
+        time.sleep = self.slept.append
+
+    def tearDown(self):
+        time.sleep = self._sleep
+
+    def _cfg(self, **kw):
+        base = dict(auth_wait_timeout_s=30.0, auth_wait_poll_s=5.0)
+        base.update(kw)
+        return cfg(**base)
+
+    @staticmethod
+    def _quiet(fn, *args):
+        """wait_for_auth reports progress on stdout; tests do not need it."""
+        import io, contextlib
+        with contextlib.redirect_stdout(io.StringIO()):
+            return fn(*args)
+
+    def _client(self, outcomes):
+        """A client whose wallet() yields `outcomes` in order."""
+        seq = iter(outcomes)
+
+        def wallet():
+            item = next(seq)
+            if isinstance(item, Exception):
+                raise item
+            return item
+
+        return types.SimpleNamespace(sync_clock=lambda: 0, wallet=wallet)
+
+    @staticmethod
+    def _auth_error():
+        return m.ApiError("Invalid API-key, IP, or permissions", code=-2015)
+
+    def test_accepts_immediately_when_the_ip_is_allowlisted(self):
+        client = self._client([m.WalletRef("0xabc", "1")])
+        self.assertTrue(self._quiet(m.wait_for_auth, self._cfg(), client))
+        self.assertEqual(self.slept, [])
+
+    def test_retries_an_auth_refusal_until_it_is_accepted(self):
+        client = self._client([self._auth_error(), self._auth_error(),
+                               m.WalletRef("0xabc", "1")])
+        self.assertTrue(self._quiet(m.wait_for_auth, self._cfg(), client))
+        self.assertEqual(self.slept, [5.0, 5.0])
+
+    def test_retries_a_network_error_too(self):
+        client = self._client([requests.RequestException("connection reset"),
+                               m.WalletRef("0xabc", "1")])
+        self.assertTrue(self._quiet(m.wait_for_auth, self._cfg(), client))
+
+    def test_gives_up_at_the_deadline(self):
+        client = self._client([self._auth_error()] * 50)
+        self.assertFalse(self._quiet(m.wait_for_auth,
+                                    self._cfg(auth_wait_timeout_s=0.0),
+                                    client))
+
+    def test_a_blocked_region_fails_at_once(self):
+        """
+        451 is the server's REGION, not its address. Waiting cannot change
+        which continent the worker is on, so retrying only delays the news.
+        """
+        blocked = m.ApiError("restricted location", status=451)
+        client = self._client([blocked, m.WalletRef("0xabc", "1")])
+        self.assertFalse(self._quiet(m.wait_for_auth, self._cfg(), client))
+        self.assertEqual(self.slept, [])
+
+    def test_a_non_auth_failure_fails_at_once(self):
+        other = m.ApiError("balance too low", code=-9000)
+        client = self._client([other, m.WalletRef("0xabc", "1")])
+        self.assertFalse(self._quiet(m.wait_for_auth, self._cfg(), client))
+        self.assertEqual(self.slept, [])
+
+    def test_the_wait_is_off_by_default(self):
+        """Existing deployments must not silently start hanging on boot."""
+        self.assertEqual(Config(api_key="k", api_secret="s",
+                                ).auth_wait_timeout_s, 0.0)
+        for name, prof in m.PROFILES.items():
+            self.assertNotIn("auth_wait_timeout_s", prof, name)
+
+    def test_a_negative_budget_is_rejected(self):
+        with self.assertRaises(ValueError):
+            cfg(auth_wait_timeout_s=-1.0)
+        with self.assertRaises(ValueError):
+            cfg(auth_wait_poll_s=0.0)
+
+    def test_preflight_prints_the_address_before_waiting(self):
+        """The address is useless after the process has already given up."""
+        import inspect
+        src = inspect.getsource(m.preflight)
+        self.assertLess(src.index("Outbound IP"), src.index("wait_for_auth"))
+
+    def test_one_ip_lookup_shared_by_preflight_and_whoami(self):
+        import inspect
+        self.assertIn("outbound_ip(", inspect.getsource(m.preflight))
+        self.assertIn("outbound_ip(", inspect.getsource(m.whoami))
+
+
+class TestNewLimitsActuallyBind(unittest.TestCase):
+    """
+    Mutation testing found these: clamps that no test ever pushed against.
+
+    A limit that is never reached in a test is a limit whose arithmetic is
+    unverified -- the suite would pass just as happily with the 2x-Kelly
+    ceiling written as 1x, or with the fee subtracted the wrong way. Each
+    test here drives a value INTO a bound and checks where it lands.
+    """
+
+    def setUp(self):
+        self.c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+
+    # --- boosted_stake ---------------------------------------------------
+
+    def test_the_boost_is_clipped_to_exactly_twice_full_kelly(self):
+        """
+        The bound that matters most: past 2x full Kelly, expected log growth
+        is negative even with a real edge, so a trend multiplier without this
+        clip is a way of turning an edge into a loss on a long enough run.
+        """
+        bankroll, price, prob, fee = 100.0, 0.70, 0.72, 200
+        b = ((1 - price) / price) * (1 - fee / 10_000)
+        full = (prob * b - (1 - prob)) / b
+        self.assertLess(bankroll * 2 * full,
+                        bankroll * self.c.hard_max_stake_pct,
+                        "fixture must make Kelly, not the hard cap, bind")
+        out = m.boosted_stake(8.0, bankroll, prob, price, self.c, fee)
+        self.assertAlmostEqual(out, bankroll * 2.0 * full, places=9)
+
+    def test_the_boost_is_clipped_by_the_hard_stake_cap(self):
+        bankroll, price, prob, fee = 100.0, 0.70, 0.95, 200
+        out = m.boosted_stake(20.0, bankroll, prob, price, self.c, fee)
+        self.assertAlmostEqual(out, bankroll * self.c.hard_max_stake_pct,
+                               places=9)
+
+    def test_an_unclipped_boost_is_the_full_multiple(self):
+        """Otherwise the two tests above could pass with the boost disabled."""
+        out = m.boosted_stake(1.0, 1000.0, 0.90, 0.70, self.c, 200)
+        self.assertAlmostEqual(out, self.c.trend_stake_multiple, places=9)
+
+    def test_no_boost_without_a_stake_or_a_bankroll(self):
+        self.assertEqual(m.boosted_stake(0.0, 100.0, 0.9, 0.7, self.c, 200), 0.0)
+        self.assertEqual(m.boosted_stake(5.0, 0.0, 0.9, 0.7, self.c, 200), 5.0)
+        self.assertEqual(m.boosted_stake(-1.0, 100.0, 0.9, 0.7, self.c, 200),
+                         -1.0)
+
+    def test_a_multiple_of_one_is_a_no_op(self):
+        flat = cfg(**{**m.PROFILES["buffer"], "trend_stake_multiple": 1.0})
+        self.assertEqual(m.boosted_stake(3.0, 100.0, 0.9, 0.7, flat, 200), 3.0)
+
+    def test_the_ceiling_wins_even_over_an_oversized_input(self):
+        """
+        No edge means no full-Kelly bound, so only the hard cap remains --
+        and it must bind even on a stake that already breaches it. Returning
+        max(stake, ...) would let an oversized position through untouched.
+        """
+        out = m.boosted_stake(30.0, 100.0, 0.10, 0.70, self.c, 200)
+        self.assertAlmostEqual(out, 100.0 * self.c.hard_max_stake_pct,
+                               places=9)
+
+    # --- the return floor at its exact boundary ---------------------------
+
+    def test_the_floor_admits_the_cap_price_and_refuses_a_hair_above(self):
+        cap = m.max_price_for_return(self.c.min_win_return, 200)
+        self.assertTrue(m.clears_return(cap, 200, self.c))
+        self.assertFalse(m.clears_return(cap + 1e-4, 200, self.c))
+
+    def test_a_fee_that_eats_the_payout_leaves_no_tradable_price(self):
+        self.assertEqual(m.max_price_for_return(0.25, 10_000), 0.0)
+        self.assertEqual(m.max_price_for_return(0.25, 20_000), 0.0)
+
+    def test_the_cap_moves_the_right_way_with_the_fee(self):
+        """A sign error here would relax the floor on expensive markets."""
+        self.assertGreater(m.max_price_for_return(0.25, 0),
+                           m.max_price_for_return(0.25, 500))
+        self.assertGreater(m.max_price_for_return(0.25, 500),
+                           m.max_price_for_return(0.25, 2000))
+
+    def test_an_impossible_price_never_clears_the_floor(self):
+        for bad in (0.0, 1.0, -0.2, 1.5):
+            self.assertFalse(m.clears_return(bad, 200, self.c))
+
+    # --- the entry window at its exact boundary ---------------------------
+
+    def test_the_window_start_is_inclusive(self):
+        rnd = make_round(strike=65_000.0, fee_bps=200)
+        book = {Side.UP: [(0.70, 1e6)]}
+        at = rnd.end_ms - self.c.entry_window_start_s * 1000
+        self.assertIsNotNone(
+            assess(rnd, 65_500, 0.5, 1000, at, self.c, book).signal)
+        just_before = at - 1000
+        self.assertIsNone(
+            assess(rnd, 65_500, 0.5, 1000, just_before, self.c, book).signal)
+
+    # --- Trend thresholds at their exact boundaries -----------------------
+
+    def test_impulse_and_z_thresholds_are_inclusive(self):
+        c = self.c
+        base = m.Trend(direction=1, impulse=c.trend_min_impulse,
+                       z=c.trend_min_z, efficiency=c.trend_min_efficiency,
+                       run=1, decay=1.0, rounds_left=c.trend_min_rounds_left,
+                       phase="building")
+        self.assertTrue(base.confirmed(c))
+        self.assertFalse(replace(base, impulse=c.trend_min_impulse - 1e-6)
+                         .confirmed(c))
+        self.assertFalse(replace(base, z=c.trend_min_z - 1e-6).confirmed(c))
+        self.assertFalse(
+            replace(base, efficiency=c.trend_min_efficiency - 1e-6)
+            .confirmed(c))
+        self.assertFalse(
+            replace(base, rounds_left=c.trend_min_rounds_left - 1e-6)
+            .confirmed(c))
+
+    def test_a_fading_phase_is_refused_even_with_every_number_perfect(self):
+        c = self.c
+        strong = m.Trend(direction=1, impulse=9.0, z=9.0, efficiency=1.0,
+                         run=2, decay=0.9, rounds_left=50.0, phase="fading")
+        self.assertFalse(strong.confirmed(c))
+        self.assertTrue(replace(strong, phase="running").confirmed(c))
+
+    def test_decay_is_only_measured_once_there_is_something_to_compare(self):
+        """A first block has no predecessor, so it cannot be 'decaying'."""
+        est = m.VolatilityEstimator.__new__(m.VolatilityEstimator)
+        est._store = None
+        est._static_cfg = self.c
+        closes = [65_000.0] * 25 + [65_000 + (i + 1) * 35 for i in range(5)]
+        trend = est._measure_trend(closes)
+        self.assertEqual(trend.run, 1)
+        self.assertEqual(trend.decay, 1.0)
+
+    def test_a_motionless_series_is_measured_as_no_trend(self):
+        est = m.VolatilityEstimator.__new__(m.VolatilityEstimator)
+        est._store = None
+        est._static_cfg = self.c
+        self.assertEqual(est._measure_trend([65_000.0] * 40), m.Trend())
+        # Too little history to say anything at all.
+        self.assertEqual(est._measure_trend([65_000.0 + i for i in range(9)]),
+                         m.Trend())
+
+    def test_non_positive_closes_are_discarded_not_trusted(self):
+        """One bad kline must not become a direction."""
+        est = m.VolatilityEstimator.__new__(m.VolatilityEstimator)
+        est._store = None
+        est._static_cfg = self.c
+        closes = [65_000.0 + i * 20 for i in range(30)]
+        closes[7] = 0.0
+        trend = est._measure_trend(closes)
+        self.assertEqual(trend.direction, 1)
+        self.assertTrue(math.isfinite(trend.impulse))
+
+
+class TestTrendArithmetic(unittest.TestCase):
+    """
+    The scale factors, pinned to numbers rather than to inequalities.
+
+    Mutation testing kept surviving here: a threshold test like
+    `impulse >= 1.2` passes whether the impulse is computed against one
+    block of noise or against five, because the mutant lands on the same
+    side of the bar. So these tests pin the VALUE.
+    """
+
+    def setUp(self):
+        self.c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        self.est = m.VolatilityEstimator.__new__(m.VolatilityEstimator)
+        self.est._store = None
+        self.est._static_cfg = self.c
+
+    def test_impulse_is_measured_against_ONE_block_of_noise(self):
+        """
+        Twenty-four alternating steps of size d, then five straight steps of
+        size d. Per-minute sigma is about d, and one block of noise is
+        d*sqrt(5), so a 5d thrust must score sqrt(5) ~ 2.24 sigmas.
+
+        Dividing by sqrt(5) instead of multiplying -- an easy slip -- would
+        score the same move at 11.2 and make the impulse gate fire on chop.
+        """
+        d = 50.0
+        closes = [65_000.0]
+        for i in range(24):
+            closes.append(closes[-1] + (d if i % 2 else -d))
+        for _ in range(5):
+            closes.append(closes[-1] + d)
+        trend = self.est._measure_trend(closes)
+        self.assertAlmostEqual(trend.impulse, math.sqrt(5), delta=0.15)
+
+    def test_efficiency_is_a_ratio_not_a_distance(self):
+        """A straight run is 1.0; a run that doubled back is measurably less."""
+        straight = [65_000.0 + i * 20 for i in range(30)]
+        self.assertAlmostEqual(
+            self.est._measure_trend(straight).efficiency, 1.0, places=6)
+
+    def test_a_zero_variance_series_is_refused_not_divided_by(self):
+        flat = [65_000.0] * 20 + [65_100.0] * 10
+        trend = self.est._measure_trend(flat)
+        self.assertTrue(math.isfinite(trend.impulse))
+        self.assertTrue(math.isfinite(trend.z))
+
+
+class TestProjectedRounds(unittest.TestCase):
+    """Turning a decay ratio into the horizon an entry actually asks about."""
+
+    def test_halving_from_four_sigmas_leaves_two_rounds(self):
+        self.assertAlmostEqual(m._projected_rounds(4.0, 0.5, 1.0), 2.0)
+
+    def test_a_quarter_each_round_leaves_one(self):
+        self.assertAlmostEqual(m._projected_rounds(4.0, 0.25, 1.0), 1.0)
+
+    def test_holding_or_growing_is_not_decaying(self):
+        self.assertEqual(m._projected_rounds(4.0, 1.0, 1.0), 99.0)
+        self.assertEqual(m._projected_rounds(4.0, 1.4, 1.0), 99.0)
+
+    def test_already_under_the_floor_has_nothing_left(self):
+        self.assertEqual(m._projected_rounds(0.9, 0.99, 1.0), 0.0)
+
+    def test_degenerate_inputs_never_raise_or_go_infinite(self):
+        for impulse, decay, floor in ((0.0, 0.5, 1.0), (-1.0, 0.5, 1.0),
+                                      (4.0, 0.5, 0.0), (4.0, 0.5, -1.0),
+                                      (4.0, 0.0, 1.0), (4.0, -0.5, 1.0)):
+            out = m._projected_rounds(impulse, decay, floor)
+            self.assertTrue(math.isfinite(out), f"{impulse}/{decay}/{floor}")
+            self.assertGreaterEqual(out, 0.0)
+
+
+class TestMissedRoundReporting(unittest.TestCase):
+    """
+    A declined round is watched until it expires, then tallied by reason.
+
+    Silence is indistinguishable from a broken endpoint. This is what turns
+    "it isn't trading" into "it is refusing the price, 40 rounds running".
+    """
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        c = cfg(db_path=self.db, **m.PROFILES["buffer"])
+        self.t = build_trader(FakeClient([], [(0, 65_000.0)], {}, {}), c,
+                              self.db)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def test_a_live_round_is_not_counted_yet(self):
+        self.t._watching[1] = (10_000, "edge below the floor")
+        self.t._tally_missed(9_000)
+        self.assertEqual(self.t._missed_total, 0)
+        self.assertIn(1, self.t._watching)
+
+    def test_an_expired_round_is_counted_and_dropped(self):
+        self.t._watching[1] = (10_000, "edge below the floor")
+        self.t._tally_missed(11_000)
+        self.assertEqual(self.t._missed_total, 1)
+        self.assertEqual(self.t._missed["edge below the floor"], 1)
+        self.assertNotIn(1, self.t._watching)
+
+    def test_reasons_accumulate_separately(self):
+        for i in range(3):
+            self.t._watching[i] = (100, "win pays less than the return floor")
+        self.t._watching[9] = (100, "buffer too small for the time left")
+        self.t._tally_missed(200)
+        self.assertEqual(self.t._missed_total, 4)
+        self.assertEqual(
+            self.t._missed["win pays less than the return floor"], 3)
+
+    def test_a_round_declined_for_price_is_not_marked_seen(self):
+        """
+        It must stay under review: the price that was too expensive a moment
+        ago may not be in ten seconds. Writing it off on the first look is
+        how a return floor turns into a bot that never trades.
+        """
+        import inspect
+        src = inspect.getsource(m.Trader._maybe_enter)
+        watch_at = src.index("self._watching[rnd.topic_id]")
+        # The only _seen assignments must come after a trade is attempted.
+        self.assertLess(watch_at, src.index("self._seen[rnd.topic_id]"))
+
+    def test_a_decline_always_carries_a_reason(self):
+        """
+        An empty reason would tally as a blank line in the summary, which is
+        the silence this whole mechanism exists to remove.
+        """
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        rnd = make_round(strike=65_000.0, fee_bps=200)
+        cases = [
+            (65_200, rnd.end_ms - 60_000, {Side.UP: [(0.94, 1e6)]}),
+            (65_001, rnd.end_ms - 60_000, {Side.UP: [(0.70, 1e6)]}),
+            (65_200, rnd.end_ms - 299_000, {Side.UP: [(0.70, 1e6)]}),
+            (65_200, rnd.end_ms - 60_000, {Side.UP: [(0.40, 1e6)]}),
+            (65_200, rnd.end_ms - 60_000, None),
+        ]
+        for spot, now, book in cases:
+            verdict = assess(rnd, spot, 0.5, 1000, now, c, book)
+            if verdict.signal is None:
+                self.assertTrue(verdict.blocked_by, f"{spot}/{book}")
+                self.assertIn(verdict.blocked_by, m._DECLINE_ORDER)
+
+    def test_a_round_with_no_strike_says_so(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        rnd = make_round(strike=None)
+        verdict = assess(rnd, 65_200, 0.5, 1000, rnd.end_ms - 60_000, c)
+        self.assertEqual(verdict.blocked_by, "no strike published yet")
+
+    def test_every_decline_reason_is_one_the_reporter_knows(self):
+        import inspect
+        src = inspect.getsource(m.assess)
+        for quoted in re.findall(r'blocked_by="([^"]+)"', src):
+            self.assertIn(quoted, m._DECLINE_ORDER, quoted)
+        for quoted in re.findall(r'_worse\(blocked, "([^"]+)"\)', src):
+            self.assertIn(quoted, m._DECLINE_ORDER, quoted)
+
+    def test_the_tally_runs_even_while_a_position_is_open(self):
+        """
+        _maybe_enter returns early while a position is open, so driving the
+        tally from there would blind it during exactly those minutes.
+        """
+        import inspect
+        self.assertIn("_tally_missed", inspect.getsource(m.Trader.run))
+
+
+class TestNewCliSurface(unittest.TestCase):
+    """The new knobs are reachable from the command line and the environment."""
+
+    def setUp(self):
+        self._env = dict(os.environ)
+        os.environ["BINANCE_API_KEY"] = "k"
+        os.environ["BINANCE_API_SECRET"] = "s"
+        fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+
+    def tearDown(self):
+        os.environ.clear(); os.environ.update(self._env)
+        os.unlink(self.db)
+
+    def _run(self, *argv):
+        import io, contextlib
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            code = m.main([*argv, "--db", self.db])
+        return code, buf.getvalue()
+
+    def test_auth_wait_env_must_be_a_number(self):
+        os.environ["AUTH_WAIT_S"] = "soon"
+        code, out = self._run("--calibration-report")
+        self.assertEqual(code, 1)
+        self.assertIn("AUTH_WAIT_S", out)
+
+    def test_auth_wait_env_is_accepted(self):
+        os.environ["AUTH_WAIT_S"] = "120"
+        code, out = self._run("--calibration-report")
+        self.assertEqual(code, 0, out)
+
+    def test_the_flag_wins_over_the_environment(self):
+        import inspect
+        src = inspect.getsource(m.main)
+        cli_at = src.index("if args.wait_for_auth is not None:")
+        env_at = src.index("elif env_auth_wait is not None:")
+        self.assertLess(cli_at, env_at)
+
+    def test_min_return_is_settable(self):
+        code, out = self._run("--min-return", "0.4", "--check-config")
+        self.assertIn(code, (0, 1), out)     # no config file in this temp dir
+
+    def test_the_new_settings_reach_the_config_document(self):
+        doc = m.default_config_document()
+        for name in ("min_win_return", "trend_follow", "trend_stake_multiple",
+                     "auth_wait_timeout_s"):
+            self.assertIn(name, doc["defaults"], name)
