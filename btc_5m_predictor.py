@@ -4966,7 +4966,7 @@ def main(argv: Iterable[str] | None = None) -> int:
               f"-{checked.max_entry_price:.2f}")
         print(f"  max stake      {checked.max_stake_pct:.0%} of bankroll")
         print(f"  min buffer     {checked.min_buffer_sigmas} sigma")
-        print(f"  daily limit    {checked.daily_loss_limit_pct:.0%}")
+        print(f"  daily loss limit    {checked.daily_loss_limit_pct:.0%}")
         return 0
 
     if args.calibration_report:
