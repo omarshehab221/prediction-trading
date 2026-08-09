@@ -1522,7 +1522,7 @@ class PredictionClient:
         self.apply_config(cfg)
         
         # Binance error codes worth explaining rather than echoing verbatim.
-        _ERROR_HINTS = {
+        self._ERROR_HINTS = {
             -1022: "signature mismatch -- the signed and sent query strings differ",
             -1021: "timestamp outside recvWindow -- clock drift",
             -1102: "a mandatory parameter was missing or malformed",
