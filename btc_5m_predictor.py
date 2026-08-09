@@ -51,24 +51,25 @@ REQUIREMENTS
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import hashlib
 import hmac
-import dataclasses
+import itertools
 import json
 import logging
 import math
 import os
+import re
 import signal
 import sqlite3
 import statistics
 import sys
 import time
-import re
 import urllib.parse
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
-from decimal import Decimal, ROUND_DOWN
+from decimal import ROUND_DOWN, Decimal
 from enum import Enum
-from typing import Iterable, Optional
 
 import requests
 
@@ -438,34 +439,34 @@ class Config:
 PROFILES: dict[str, dict] = {
     # Big wins, small losses. Buys cheap contracts, so it LOSES MOST ROUNDS by
     # construction; the winners have to be large enough to pay for them.
-    "convex": dict(max_entry_price=0.35, min_entry_price=0.05,
-                   min_edge=0.02, min_edge_ratio=0.30,
-                   max_stake_pct=0.02, entry_window_start_s=280,
-                   entry_window_end_s=30, max_consecutive_losses=60,
+    "convex": {"max_entry_price": 0.35, "min_entry_price": 0.05,
+                   "min_edge": 0.02, "min_edge_ratio": 0.30,
+                   "max_stake_pct": 0.02, "entry_window_start_s": 280,
+                   "entry_window_end_s": 30, "max_consecutive_losses": 60,
                    # Longshots: many small losses, so the default fits.
-                   daily_loss_limit_pct=0.20, assumed_spread_pct=0.10,
+                   "daily_loss_limit_pct": 0.20, "assumed_spread_pct": 0.10,
                    # Tail probabilities are the least reliable part of the
                    # model, and this profile lives on them, so size more
                    # cautiously than a mid-price strategy would.
-                   kelly_fraction=0.20,
-                   min_liquidity=0.0, max_rounds_per_day=200,
-                   paper_start_bankroll=100.0,
+                   "kelly_fraction": 0.20,
+                   "min_liquidity": 0.0, "max_rounds_per_day": 200,
+                   "paper_start_bankroll": 100.0,
                    # Inert here unless scale_in is enabled; sized to this
                    # profile's own band (0.05-0.35), not buffer's.
-                   max_blended_price=0.3),
+                   "max_blended_price": 0.3},
     # Symmetric: trades anywhere it finds an edge. Higher hit rate, smaller
     # payoffs, and correspondingly larger individual losses.
-    "balanced": dict(max_entry_price=0.90, min_entry_price=0.10,
-                     min_edge=0.04, min_edge_ratio=0.10,
-                     max_stake_pct=0.05, entry_window_start_s=150,
-                     entry_window_end_s=25, max_consecutive_losses=10,
-                     daily_loss_limit_pct=0.20, assumed_spread_pct=0.06,
-                   kelly_fraction=0.25,
-                     min_liquidity=0.0, max_rounds_per_day=200,
-                     paper_start_bankroll=100.0,
+    "balanced": {"max_entry_price": 0.90, "min_entry_price": 0.10,
+                     "min_edge": 0.04, "min_edge_ratio": 0.10,
+                     "max_stake_pct": 0.05, "entry_window_start_s": 150,
+                     "entry_window_end_s": 25, "max_consecutive_losses": 10,
+                     "daily_loss_limit_pct": 0.20, "assumed_spread_pct": 0.06,
+                   "kelly_fraction": 0.25,
+                     "min_liquidity": 0.0, "max_rounds_per_day": 200,
+                     "paper_start_bankroll": 100.0,
                      # Inert here unless scale_in is enabled; sized to this
                      # profile's own band (0.10-0.90), not buffer's.
-                     max_blended_price=0.8),
+                     "max_blended_price": 0.8},
     # For small accounts, where a percentage cap would fall under the venue's
     # order minimum and the bot would simply never trade. Targets the 0.40-0.75
     # band -- roughly 30-150% return per win. Those are large PERCENTAGE wins
@@ -488,17 +489,17 @@ PROFILES: dict[str, dict] = {
     # Entering late is a genuine information edge, not superstition: with
     # less time left, the same price move is far more decisive, so the
     # model's probability is sharper. The cost is a thinner book.
-    "favorite": dict(max_entry_price=0.80, min_entry_price=0.55,
-                     min_edge=0.03, min_edge_ratio=0.05,
-                     max_stake_pct=0.10, min_stake_usdt=1.0,
-                     daily_loss_limit_pct=0.30, assumed_spread_pct=0.04,
-                   kelly_fraction=0.25,
-                     min_liquidity=0.0, max_rounds_per_day=200,
-                     entry_window_start_s=120, entry_window_end_s=20,
-                     max_consecutive_losses=10, paper_start_bankroll=25.0,
+    "favorite": {"max_entry_price": 0.80, "min_entry_price": 0.55,
+                     "min_edge": 0.03, "min_edge_ratio": 0.05,
+                     "max_stake_pct": 0.10, "min_stake_usdt": 1.0,
+                     "daily_loss_limit_pct": 0.30, "assumed_spread_pct": 0.04,
+                   "kelly_fraction": 0.25,
+                     "min_liquidity": 0.0, "max_rounds_per_day": 200,
+                     "entry_window_start_s": 120, "entry_window_end_s": 20,
+                     "max_consecutive_losses": 10, "paper_start_bankroll": 25.0,
                      # Inert here unless scale_in is enabled; sized to this
                      # profile's own band (0.55-0.80), not buffer's.
-                     max_blended_price=0.72),
+                     "max_blended_price": 0.72},
     # YOUR METHOD, encoded. Wait for a large buffer late in the round, then
     # size up. Trades the 0.80-0.97 band, which every other profile refuses.
     #
@@ -512,61 +513,61 @@ PROFILES: dict[str, dict] = {
     # min_buffer_sigmas=2.0 means spot must sit two standard deviations of
     # the REMAINING time away from the strike: roughly 14 bps with a minute
     # left, or 28 bps with four minutes.
-    "buffer": dict(max_entry_price=0.95, min_entry_price=0.80,
-                   min_edge=0.012, min_edge_ratio=0.010,
+    "buffer": {"max_entry_price": 0.95, "min_entry_price": 0.80,
+                   "min_edge": 0.012, "min_edge_ratio": 0.010,
                    # Lowered from 2.0: fewer sigmas means more trades, and
                    # more trades is how the edge question gets answered at
                    # all -- separating a 68% win rate from a 72% one needs
                    # hundreds of samples. Each trade carries less edge, so
                    # this is a deliberate trade of quality for sample size.
-                   min_buffer_sigmas=1.5,
-                   max_stake_pct=0.10, min_stake_usdt=1.0,
+                   "min_buffer_sigmas": 1.5,
+                   "max_stake_pct": 0.10, "min_stake_usdt": 1.0,
                    # A loss here costs a full 10% of bankroll, so the 20%
                    # default halted the day after TWO losses -- on 80% of
                    # days at an 85% win rate. The limit has to match the
                    # profile's own loss shape or it stops a healthy bot.
-                   daily_loss_limit_pct=0.35,
+                   "daily_loss_limit_pct": 0.35,
                    # Near-certainties late in a round sit in thin books;
                    # a wide fill destroys an edge measured in single points.
-                   max_price_impact=0.02,
-                   assumed_spread_pct=0.03,
-                   kelly_fraction=0.25,
+                   "max_price_impact": 0.02,
+                   "assumed_spread_pct": 0.03,
+                   "kelly_fraction": 0.25,
                    # Near-certainties late in a round sit in thin books, and
                    # this is the one profile where an empty book is common.
-                   min_liquidity=1000.0, max_rounds_per_day=250,
+                   "min_liquidity": 1000.0, "max_rounds_per_day": 250,
                    # A smaller first tranche leaves more room to add once the
                    # round has proven itself, so the top-up genuinely is the
                    # larger bet -- roughly 4x the opener rather than 1.5x.
                    # Total exposure is still bounded by Kelly, and by the
                    # blended-price cap below.
-                   scale_in=True, scale_in_initial_pct=0.25,
-                   scale_in_min_topup=1.0,
+                   "scale_in": True, "scale_in_initial_pct": 0.25,
+                   "scale_in_min_topup": 1.0,
                    # Never let the blend past 0.90: about nine wins per loss.
                    # Raise it for a higher hit rate and smaller wins; lower it
                    # for bigger wins and fewer of them.
-                   max_blended_price=0.90,
-                   entry_window_start_s=180, entry_window_end_s=15,
-                   max_consecutive_losses=6, paper_start_bankroll=25.0),
-    "micro": dict(max_entry_price=0.75, min_entry_price=0.35,
-                  min_edge=0.03, min_edge_ratio=0.06,
-                  max_stake_pct=0.20, min_stake_usdt=1.0,
+                   "max_blended_price": 0.90,
+                   "entry_window_start_s": 180, "entry_window_end_s": 15,
+                   "max_consecutive_losses": 6, "paper_start_bankroll": 25.0},
+    "micro": {"max_entry_price": 0.75, "min_entry_price": 0.35,
+                  "min_edge": 0.03, "min_edge_ratio": 0.06,
+                  "max_stake_pct": 0.20, "min_stake_usdt": 1.0,
                   # 20% per trade means the 20% default halted after ONE loss.
                   # Even 45% halts after 2.25. At this stake fraction the
                   # stake cap and the daily limit are in genuine tension --
                   # that tension is forced by a 1.00 order minimum on a ~7
                   # balance, not chosen. Trading a bigger account is the only
                   # real fix; 55% is the least-bad compromise.
-                  daily_loss_limit_pct=0.55,
-                  assumed_spread_pct=0.05,
+                  "daily_loss_limit_pct": 0.55,
+                  "assumed_spread_pct": 0.05,
                   # A tiny balance forces a large stake fraction, so cap the
                   # hard ceiling tightly and let Kelly stay conservative.
-                   kelly_fraction=0.25,
-                  min_liquidity=0.0, max_rounds_per_day=200,
-                  entry_window_start_s=200, entry_window_end_s=25,
-                  max_consecutive_losses=10, paper_start_bankroll=7.0,
+                   "kelly_fraction": 0.25,
+                  "min_liquidity": 0.0, "max_rounds_per_day": 200,
+                  "entry_window_start_s": 200, "entry_window_end_s": 25,
+                  "max_consecutive_losses": 10, "paper_start_bankroll": 7.0,
                   # Inert here unless scale_in is enabled; sized to this
                   # profile's own band (0.35-0.75), not buffer's.
-                  max_blended_price=0.65),
+                  "max_blended_price": 0.65},
 }
 
 
@@ -640,9 +641,9 @@ def _coerce(name: str, value: object) -> object:
 
 
 def build_config(document: dict, *, api_key: str, api_secret: str,
-                 live: Optional[bool], db_path: str,
-                 profile: Optional[str] = None,
-                 overrides: Optional[dict] = None) -> Config:
+                 live: bool | None, db_path: str,
+                 profile: str | None = None,
+                 overrides: dict | None = None) -> Config:
     """
     Assemble a Config from a configuration document.
 
@@ -652,7 +653,7 @@ def build_config(document: dict, *, api_key: str, api_secret: str,
     twice.
     """
     if not isinstance(document, dict):
-        raise ValueError("configuration must be a JSON object")
+        raise TypeError("configuration must be a JSON object")
 
     profiles = document.get("profiles") or {}
     name = profile or document.get("active_profile") or DEFAULT_PROFILE
@@ -715,24 +716,24 @@ class ConfigStore:
     rather than silent.
     """
 
-    def __init__(self, path: Optional[str], *, api_key: str, api_secret: str,
-                 live: Optional[bool], db_path: str,
-                 profile: Optional[str] = None,
-                 overrides: Optional[dict] = None) -> None:
+    def __init__(self, path: str | None, *, api_key: str, api_secret: str,
+                 live: bool | None, db_path: str,
+                 profile: str | None = None,
+                 overrides: dict | None = None) -> None:
         self._path = path
-        self._identity = dict(api_key=api_key, api_secret=api_secret,
-                              live=live, db_path=db_path, profile=profile,
-                              overrides=overrides or {})
-        self._mtime: Optional[float] = None
+        self._identity = {"api_key": api_key, "api_secret": api_secret,
+                              "live": live, "db_path": db_path, "profile": profile,
+                              "overrides": overrides or {}}
+        self._mtime: float | None = None
         self._document = self._read()
         self._current = build_config(self._document, **self._as_kwargs())
         self.reload_count = 0
 
     def _as_kwargs(self) -> dict:
         d = dict(self._identity)
-        return dict(api_key=d["api_key"], api_secret=d["api_secret"],
-                    live=d["live"], db_path=d["db_path"],
-                    profile=d["profile"], overrides=d["overrides"])
+        return {"api_key": d["api_key"], "api_secret": d["api_secret"],
+                    "live": d["live"], "db_path": d["db_path"],
+                    "profile": d["profile"], "overrides": d["overrides"]}
 
     def _read(self) -> dict:
         if not self._path:
@@ -747,7 +748,7 @@ class ConfigStore:
         return self._current
 
     @property
-    def path(self) -> Optional[str]:
+    def path(self) -> str | None:
         return self._path
 
     def changed_on_disk(self) -> bool:
@@ -809,8 +810,7 @@ class ConfigStore:
             present |= set(layer)
         ignored = present & IMMUTABLE_FIELDS
         if "live" in present and self.live_is_pinned:
-            ignored = ignored | {"live (pinned by --live/--paper or "
-                                 "TRADING_MODE)"}
+            ignored = ignored | {"live (pinned by --live/--paper or TRADING_MODE)"}
         return ignored
 
     @staticmethod
@@ -865,9 +865,9 @@ class Round:
     venue_slippage_bps: int
     decimal_precision: int
     # None means the venue did not publish it -- distinct from a real zero.
-    liquidity: Optional[float]
-    strike: Optional[float] = None      # variantData.startPrice
-    feed_symbol: Optional[str] = None   # oracle the venue resolves against
+    liquidity: float | None
+    strike: float | None = None      # variantData.startPrice
+    feed_symbol: str | None = None   # oracle the venue resolves against
 
     @property
     def duration_ms(self) -> int:
@@ -1006,8 +1006,8 @@ class ApiError(RuntimeError):
     wrong instead of re-parsing the message.
     """
 
-    def __init__(self, message: str, code: Optional[int] = None,
-                 status: Optional[int] = None) -> None:
+    def __init__(self, message: str, code: int | None = None,
+                 status: int | None = None) -> None:
         super().__init__(message)
         self.code = code
         self.status = status
@@ -1036,7 +1036,7 @@ class ApiError(RuntimeError):
 # --------------------------------------------------------------------------
 
 
-def _as_float_or_none(value: object) -> Optional[float]:
+def _as_float_or_none(value: object) -> float | None:
     """Parse a numeric field, or None when it is absent or unusable."""
     try:
         parsed = float(value)          # float(None) raises TypeError too
@@ -1152,7 +1152,7 @@ def buffer_sigmas(spot: float, strike: float, sigma_annual: float,
 
 def digital_up_probability(spot: float, strike: float, sigma_annual: float,
                            seconds_left: float,
-                           tail_df: Optional[float] = None) -> float:
+                           tail_df: float | None = None) -> float:
     """
     P(spot finishes above strike), driftless, with optional fat tails.
 
@@ -1201,7 +1201,7 @@ def breakeven_probability(price: float, fee_bps: int) -> float:
 
 
 def kelly_stake(bankroll: float, model_prob: float, price: float,
-                cfg: Config, fee_bps: Optional[int] = None) -> float:
+                cfg: Config, fee_bps: int | None = None) -> float:
     """
     Fractional-Kelly stake, with a bounded override for small accounts.
 
@@ -1254,7 +1254,7 @@ def kelly_stake(bankroll: float, model_prob: float, price: float,
 
 
 def kelly_multiple(stake: float, bankroll: float, model_prob: float,
-                   price: float, fee_bps: int) -> Optional[float]:
+                   price: float, fee_bps: int) -> float | None:
     """How many times the full-Kelly fraction a stake represents. None if no edge."""
     if bankroll <= 0 or not 0.0 < price < 1.0:
         return None
@@ -1268,7 +1268,7 @@ def kelly_multiple(stake: float, bankroll: float, model_prob: float,
 
 
 def walk_book(asks: list[tuple[float, float]], stake_usdt: float
-              ) -> Optional[float]:
+              ) -> float | None:
     """
     Average fill price for spending `stake_usdt` against sorted ask levels.
 
@@ -1299,13 +1299,13 @@ def walk_book(asks: list[tuple[float, float]], stake_usdt: float
 class VolatilityEstimator:
     """Annualised sigma AND tail thickness from recent 1m returns."""
 
-    def __init__(self, cfg: Config | "ConfigStore",
+    def __init__(self, cfg: Config | ConfigStore,
                  session: requests.Session) -> None:
         self._store = None if isinstance(cfg, Config) else cfg
         self._static_cfg = cfg if isinstance(cfg, Config) else None
         self._session = session
         self._cache: dict[str, tuple[float, float]] = {}
-        self._df_cache: dict[str, Optional[float]] = {}
+        self._df_cache: dict[str, float | None] = {}
         self._clamped: dict[str, bool] = {}
         self._raw: dict[str, float] = {}
 
@@ -1313,7 +1313,7 @@ class VolatilityEstimator:
     def _cfg(self) -> Config:
         return self._static_cfg if self._store is None else self._store.current
 
-    def sigma_annual(self, symbol: Optional[str] = None) -> float:
+    def sigma_annual(self, symbol: str | None = None) -> float:
         symbol = symbol or self._cfg.symbol
         cached = self._cache.get(symbol)
         if cached is not None and time.time() - cached[1] < self._cfg.vol_cache_s:
@@ -1331,7 +1331,7 @@ class VolatilityEstimator:
 
         # Guard BOTH endpoints: a single malformed close (0 or negative) would
         # otherwise raise a math domain error and take the whole loop down.
-        rets = [math.log(b / a) for a, b in zip(closes, closes[1:])
+        rets = [math.log(b / a) for a, b in itertools.pairwise(closes)
                 if a > 0 and b > 0]
         if len(rets) < 10:
             raise ApiError("insufficient valid returns for volatility")
@@ -1350,7 +1350,7 @@ class VolatilityEstimator:
         self._cache[symbol] = (annual, time.time())
         return annual
 
-    def _estimate_df(self, rets: list[float], sd: float) -> Optional[float]:
+    def _estimate_df(self, rets: list[float], sd: float) -> float | None:
         """
         Degrees of freedom implied by realised excess kurtosis.
 
@@ -1375,15 +1375,15 @@ class VolatilityEstimator:
         return max(self._cfg.tail_df_floor,
                    min(self._cfg.tail_df_ceiling, df))
 
-    def tail_df(self, symbol: Optional[str] = None) -> Optional[float]:
+    def tail_df(self, symbol: str | None = None) -> float | None:
         """Tail parameter for `symbol`. Call sigma_annual first."""
         return self._df_cache.get(symbol or self._cfg.symbol)
 
-    def raw_sigma(self, symbol: Optional[str] = None) -> Optional[float]:
+    def raw_sigma(self, symbol: str | None = None) -> float | None:
         """Measured sigma before clamping, for diagnostics."""
         return self._raw.get(symbol or self._cfg.symbol)
 
-    def is_clamped(self, symbol: Optional[str] = None) -> bool:
+    def is_clamped(self, symbol: str | None = None) -> bool:
         """True if the last sigma hit a bound and is therefore not a measurement."""
         return self._clamped.get(symbol or self._cfg.symbol, False)
 
@@ -1396,7 +1396,7 @@ class VolatilityEstimator:
 class RiskManager:
     """Owns every reason to stop. Fails closed on all of them."""
 
-    def __init__(self, cfg: Config | "ConfigStore",
+    def __init__(self, cfg: Config | ConfigStore,
                  starting_bankroll: float) -> None:
         self._store = None if isinstance(cfg, Config) else cfg
         self._static_cfg = cfg if isinstance(cfg, Config) else None
@@ -1404,7 +1404,7 @@ class RiskManager:
         self._day_key = time.strftime("%Y-%m-%d")
         self.consecutive_losses = 0
         self.rounds_today = 0
-        self.halted_reason: Optional[str] = None
+        self.halted_reason: str | None = None
         # Poisson-binomial accumulators: each trade contributes its own model
         # probability, so expectation is well defined even though every trade
         # has different odds.
@@ -1417,7 +1417,7 @@ class RiskManager:
     def _cfg(self) -> Config:
         return self._static_cfg if self._store is None else self._store.current
 
-    def calibration_z(self) -> Optional[float]:
+    def calibration_z(self) -> float | None:
         """
         How far observed wins sit below what the model predicted, in sigmas.
 
@@ -1477,7 +1477,7 @@ class RiskManager:
         raise TradingHalted(reason)
 
     def record_result(self, won: bool,
-                      model_prob: Optional[float] = None) -> None:
+                      model_prob: float | None = None) -> None:
         self.rounds_today += 1
         self.consecutive_losses = 0 if won else self.consecutive_losses + 1
         if model_prob is not None:
@@ -1503,12 +1503,12 @@ class PredictionClient:
     duration_tolerance: float = 0.10
     symbols: tuple[str, ...] = ("BTCUSDT",)
 
-    def __init__(self, cfg: Config | "ConfigStore") -> None:
+    def __init__(self, cfg: Config | ConfigStore) -> None:
         # Accepts either a Config or a ConfigStore. With a store, `_cfg`
         # resolves to the current configuration on every access, so a hot
         # reload takes effect without rebuilding the client or its session.
-        self._store: Optional["ConfigStore"] = None
-        self._static_cfg: Optional[Config] = None
+        self._store: ConfigStore | None = None
+        self._static_cfg: Config | None = None
         if isinstance(cfg, Config):
             self._static_cfg = cfg
         else:
@@ -1517,9 +1517,23 @@ class PredictionClient:
         self._session = requests.Session()
         self._session.headers.update({"X-MBX-APIKEY": cfg.api_key})
         self._clock_offset_ms = 0
-        self._wallet: Optional[WalletRef] = None
+        self._wallet: WalletRef | None = None
         self._symbol_cache: dict[str, str] = {}
         self.apply_config(cfg)
+        
+        # Binance error codes worth explaining rather than echoing verbatim.
+        _ERROR_HINTS = {
+            -1022: "signature mismatch -- the signed and sent query strings differ",
+            -1021: "timestamp outside recvWindow -- clock drift",
+            -1102: "a mandatory parameter was missing or malformed",
+            -2014: "API-key format invalid",
+            -2015: "invalid API key, IP not whitelisted, or missing permissions",
+            -1002: "not authorised for this endpoint",
+            -9000: "the account balance cannot cover this order size",
+            -3026: ("a parameter combination the venue rejected -- most often "
+                    "fundingSource not matching accountType (SPOT/FUNDING are "
+                    "CEX accounts, not MPC), or a missing fundTransferAmount"),
+        }
     @property
     def _cfg(self) -> Config:
         return self._static_cfg if self._store is None else self._store.current
@@ -1584,29 +1598,15 @@ class PredictionClient:
                              query.encode(), hashlib.sha256).hexdigest()
         return f"{query}&signature={signature}"
 
-    # Binance error codes worth explaining rather than echoing verbatim.
-    _ERROR_HINTS = {
-        -1022: "signature mismatch -- the signed and sent query strings differ",
-        -1021: "timestamp outside recvWindow -- clock drift",
-        -1102: "a mandatory parameter was missing or malformed",
-        -2014: "API-key format invalid",
-        -2015: "invalid API key, IP not whitelisted, or missing permissions",
-        -1002: "not authorised for this endpoint",
-        -9000: "the account balance cannot cover this order size",
-        -3026: ("a parameter combination the venue rejected -- most often "
-                "fundingSource not matching accountType (SPOT/FUNDING are "
-                "CEX accounts, not MPC), or a missing fundTransferAmount"),
-    }
-
     @staticmethod
-    def _json_or_none(response) -> Optional[object]:
+    def _json_or_none(response) -> object | None:
         """Parsed JSON, or None when the body is not JSON at all."""
         try:
             return response.json()
         except ValueError:
             return None
 
-    def _request(self, name: str, params: Optional[dict] = None) -> dict:
+    def _request(self, name: str, params: dict | None = None) -> dict:
         """Call a named endpoint. The verb comes from the table, never a caller."""
         method, path = self._cfg.ep(name)
         query = self._signed_query(params or {})
@@ -1634,7 +1634,7 @@ class PredictionClient:
                 # Not a JSON error envelope; the raw text is the best detail
                 # available and is preserved rather than discarded.
                 detail = r.text[:200] or "<empty response body>"
-            code_int: Optional[int] = None
+            code_int: int | None = None
             if code is not None:
                 try:
                     code_int = int(code)
@@ -1655,7 +1655,7 @@ class PredictionClient:
 
     # -- public spot (model input only) -------------------------------------
 
-    def market_symbol(self, feed_symbol: Optional[str]) -> str:
+    def market_symbol(self, feed_symbol: str | None) -> str:
         """
         Map the venue's oracle symbol to a tradable Binance symbol.
 
@@ -1691,7 +1691,7 @@ class PredictionClient:
         self._symbol_cache[feed_symbol] = resolved
         return resolved
 
-    def spot_price(self, symbol: Optional[str] = None) -> float:
+    def spot_price(self, symbol: str | None = None) -> float:
         r = self._session.get(BASE + "/api/v3/ticker/price",
                               params={"symbol": symbol or self._cfg.symbol},
                               timeout=self._cfg.http_timeout_s)
@@ -1718,7 +1718,7 @@ class PredictionClient:
         raise ApiError("no prediction wallet found -- create one in the "
                        "Binance app and complete SAS authorization")
 
-    def prediction_wallet_value(self) -> Optional[float]:
+    def prediction_wallet_value(self) -> float | None:
         """
         Current value held inside the prediction wallet, from the portfolio.
 
@@ -1762,7 +1762,7 @@ class PredictionClient:
                         bal, bool(item.get("enabled", True))))
         return out
 
-    def funding_plan(self) -> tuple[str, str, Optional[str]]:
+    def funding_plan(self) -> tuple[str, str, str | None]:
         """
         Decide how an order gets paid for: (accountType, fundingSource, holder).
 
@@ -1839,7 +1839,7 @@ class PredictionClient:
                            "and the portfolio could not be read")
         return best
 
-    def remaining_quota_usdt(self) -> Optional[float]:
+    def remaining_quota_usdt(self) -> float | None:
         """
         Venue-imposed daily trading limit, or None if the venue reports none.
 
@@ -1870,7 +1870,7 @@ class PredictionClient:
         return self._request("market_detail",
                              {"marketTopicId": topic_id})
 
-    def hydrate(self, rnd: Round) -> Optional[Round]:
+    def hydrate(self, rnd: Round) -> Round | None:
         """
         Fill in strike and feed symbol from market/detail.
 
@@ -1891,7 +1891,7 @@ class PredictionClient:
                                                    feed_symbol=symbol)
 
     @staticmethod
-    def _parse_variant(vd: dict) -> tuple[Optional[float], Optional[str]]:
+    def _parse_variant(vd: dict) -> tuple[float | None, str | None]:
         """(startPrice, priceFeedSymbol) from a variantData block."""
         if not isinstance(vd, dict):
             return None, None
@@ -1913,7 +1913,7 @@ class PredictionClient:
         return price, symbol
 
     @staticmethod
-    def _parse_round(topic: dict) -> Optional[Round]:
+    def _parse_round(topic: dict) -> Round | None:
         """
         Validate untrusted payload once, into a precise type.
 
@@ -2023,7 +2023,7 @@ class PredictionClient:
             return None
 
     def asks_for(self, rnd: Round, side: Side
-                 ) -> Optional[list[tuple[float, float]]]:
+                 ) -> list[tuple[float, float]] | None:
         """Ask ladder for one outcome. `vendor` is a required parameter."""
         try:
             payload = self._request("order_book", {
@@ -2035,7 +2035,7 @@ class PredictionClient:
         return self._parse_asks(payload)
 
     @staticmethod
-    def _parse_asks(payload: dict) -> Optional[list[tuple[float, float]]]:
+    def _parse_asks(payload: dict) -> list[tuple[float, float]] | None:
         """Levels are {price, size} strings per the connector schema."""
         raw = payload.get("asks")
         if raw is None:
@@ -2155,8 +2155,8 @@ class PredictionClient:
             fee_usdt=0.0 if fee_raw is None else float(from_wei(fee_raw)))
 
     def discover_min_stake(self, rnd: Round, side: Side,
-                           low: float = 0.25, high: Optional[float] = None,
-                           tolerance: float = 0.05) -> Optional[float]:
+                           low: float = 0.25, high: float | None = None,
+                           tolerance: float = 0.05) -> float | None:
         """
         Find the venue's actual minimum order size by probing get-quote.
 
@@ -2230,7 +2230,7 @@ class PredictionClient:
             return self.discover_min_stake(rnd, side, low, ceiling, tolerance)
 
     def place_order(self, rnd: Round, quote: Quote,
-                    stake_usdt: Optional[float] = None) -> str:
+                    stake_usdt: float | None = None) -> str:
         """
         Phase 2: execute a quote. MARKET orders are FOK -- fill-or-kill, so
         there are no partial fills at prices the model never approved.
@@ -2275,7 +2275,7 @@ class PredictionClient:
     })
     FILLED_ORDER_STATUSES = frozenset({"FILLED", "COMPLETED", "SUCCESS"})
 
-    def order_fill(self, order_id: str) -> Optional[dict]:
+    def order_fill(self, order_id: str) -> dict | None:
         """
         The venue's own record of an order: status, filled amount, price.
 
@@ -2327,7 +2327,7 @@ class PredictionClient:
     # -- settlement ---------------------------------------------------------
 
     def settled_outcome(self, rnd: Round
-                        ) -> Optional[tuple[Side, Optional[float]]]:
+                        ) -> tuple[Side, float | None] | None:
         """
         Authoritative result: (winning side, realised PnL in USDT).
 
@@ -2402,7 +2402,7 @@ class PredictionClient:
                      payload["batchId"])
         return hashes
 
-    def redeem_status(self, tx_hash: str) -> Optional[str]:
+    def redeem_status(self, tx_hash: str) -> str | None:
         """Status of a redemption transaction, or None if unknown."""
         try:
             payload = self._request("redeem_status", {
@@ -2413,7 +2413,7 @@ class PredictionClient:
         status = payload.get("status")
         return None if status is None else str(status).upper()
 
-    def final_price(self, rnd: Round) -> Optional[float]:
+    def final_price(self, rnd: Round) -> float | None:
         """variantData.endPrice once the round has resolved."""
         try:
             topic = self.market_detail(rnd.topic_id)
@@ -2475,7 +2475,7 @@ class Journal:
 
     def record(self, mode: str, rnd: Round, sig: Signal, spot: float,
                sigma: float, bankroll: float,
-               order_id: Optional[str] = None) -> int:
+               order_id: str | None = None) -> int:
         cur = self._conn.execute(
             "INSERT INTO trades (ts, mode, slug, topic_id, side, strike, spot,"
             " sigma, seconds_left, end_ms, model_prob, fill_price, edge, stake,"
@@ -2496,8 +2496,8 @@ class Journal:
             " WHERE id=?", (1 if won else 0, pnl, source, trade_id))
         self._conn.commit()
 
-    def diagnose(self, profile: Optional[str] = None,
-                 symbol: Optional[str] = None) -> str:
+    def diagnose(self, profile: str | None = None,
+                 symbol: str | None = None) -> str:
         """
         Is the edge real, and if not, what would fix it?
 
@@ -2601,8 +2601,8 @@ class Journal:
         else:
             out += [
                 "",
-                f"Inconclusive: {len(unclear)} band(s) lack the sample to call,"
-                f" {len(winning)} show edge, {len(losing)} show none.",
+                (f"Inconclusive: {len(unclear)} band(s) lack the sample to call,"
+                f" {len(winning)} show edge, {len(losing)} show none."),
                 "",
                 "Over a few dozen trades a 68% win rate and a 76% win rate are",
                 "indistinguishable, yet one loses money and the other compounds.",
@@ -2612,7 +2612,7 @@ class Journal:
             ]
         return "\n".join(out)
 
-    def calibration_report(self, profile: Optional[str] = None) -> str:
+    def calibration_report(self, profile: str | None = None) -> str:
         """
         Report per profile, or every profile in turn.
 
@@ -2627,8 +2627,8 @@ class Journal:
             return "No resolved trades yet. Let paper mode run first."
 
         if profile is None and len(profiles) > 1:
-            parts = [f"Journal contains {len(profiles)} profiles: "
-                     f"{', '.join(profiles)}", ""]
+            parts = [(f"Journal contains {len(profiles)} profiles: "
+                     f"{', '.join(profiles)}"), ""]
             for name in profiles:
                 parts.append(f"{'=' * 62}\nPROFILE: {name}\n{'=' * 62}")
                 parts.append(self.calibration_report(name))
@@ -2772,7 +2772,7 @@ class Journal:
 
 
 def clears_edge(model_prob: float, price: float, cfg: Config,
-                fee_bps: Optional[int] = None) -> bool:
+                fee_bps: int | None = None) -> bool:
     """
     Both thresholds must clear: an absolute floor and a relative margin.
 
@@ -2789,8 +2789,8 @@ def clears_edge(model_prob: float, price: float, cfg: Config,
 
 def evaluate(rnd: Round, spot: float, sigma: float, bankroll: float,
              now_ms: int, cfg: Config,
-             ask_book: Optional[dict[Side, list[tuple[float, float]]]] = None,
-             tail_df: Optional[float] = None) -> Optional[Signal]:
+             ask_book: dict[Side, list[tuple[float, float]]] | None = None,
+             tail_df: float | None = None) -> Signal | None:
     """
     Decide whether this round is worth a trade. Pure: no I/O, no mutation.
 
@@ -2814,11 +2814,11 @@ def evaluate(rnd: Round, spot: float, sigma: float, bankroll: float,
         return None                  # not enough buffer for the time left
     p_up = digital_up_probability(spot, rnd.strike, sigma, secs, tail_df)
 
-    best: Optional[Signal] = None
+    best: Signal | None = None
     for side, model_prob in ((Side.UP, p_up), (Side.DOWN, 1.0 - p_up)):
         # With a buffer gate, only back the side the buffer actually favours;
         # betting against a large buffer is the opposite of the rule.
-        if cfg.min_buffer_sigmas > 0:
+        if cfg.min_buffer_sigmas > 0:  # noqa: SIM102
             if (side is Side.UP and z < 0) or (side is Side.DOWN and z > 0):
                 continue
         levels = (ask_book or {}).get(side)
@@ -2926,9 +2926,9 @@ class Trader:
     silently corrupts the calibration record on every redeploy.
     """
 
-    def __init__(self, cfg: Config | "ConfigStore") -> None:
-        self._store: Optional["ConfigStore"] = None
-        self._static_cfg: Optional[Config] = None
+    def __init__(self, cfg: Config | ConfigStore) -> None:
+        self._store: ConfigStore | None = None
+        self._static_cfg: Config | None = None
         if isinstance(cfg, Config):
             self._static_cfg = cfg
         else:
@@ -2945,7 +2945,7 @@ class Trader:
         # trading. The bankroll and the daily loss limit stay shared, because
         # there is only one account.
         self._risk: dict[str, RiskManager] = {}
-        self._account_risk: Optional[RiskManager] = None
+        self._account_risk: RiskManager | None = None
         self._seen: dict[int, int] = {}
         self._positions: dict[str, Position] = {}
         self._hydrated: dict[int, Round] = {}
@@ -2960,7 +2960,7 @@ class Trader:
         self._active_live = config.live
 
     @staticmethod
-    def _resolve(cfg: Config | "ConfigStore") -> Config:
+    def _resolve(cfg: Config | ConfigStore) -> Config:
         return cfg if isinstance(cfg, Config) else cfg.current
 
     @property
@@ -2968,14 +2968,14 @@ class Trader:
         return self._static_cfg if self._store is None else self._store.current
 
     @property
-    def _position(self) -> Optional[Position]:
+    def _position(self) -> Position | None:
         """The single open position, when exactly one market is configured."""
         if len(self._positions) == 1:
             return next(iter(self._positions.values()))
         return None
 
     @_position.setter
-    def _position(self, value: Optional[Position]) -> None:
+    def _position(self, value: Position | None) -> None:
         if value is None:
             self._positions.clear()
         else:
@@ -3378,7 +3378,7 @@ class Trader:
             self._maybe_scale_in(bankroll, symbol)
 
     def _maybe_scale_in(self, bankroll: float,
-                        symbol: Optional[str] = None) -> None:
+                        symbol: str | None = None) -> None:
         """
         Top up an open position as the round moves further into our favour.
 
@@ -3497,7 +3497,7 @@ class Trader:
             committed_usdt=pos.committed_usdt + topup,
             tranches=pos.tranches + 1)
 
-    def _live_bankroll(self, context: str) -> Optional[float]:
+    def _live_bankroll(self, context: str) -> float | None:
         """Freshly read tradable balance, or None if it cannot be read."""
         try:
             return self._bankroll()
@@ -3507,7 +3507,7 @@ class Trader:
             return None
 
     def _resize(self, sig: Signal, rnd: Round,
-                bankroll: float) -> Optional[Signal]:
+                bankroll: float) -> Signal | None:
         """Re-derive the stake against a balance that has since changed."""
         stake = kelly_stake(bankroll, sig.model_prob, sig.fill_price,
                             self._cfg, rnd.fee_bps)
@@ -3536,8 +3536,8 @@ class Trader:
         if now_ms < pos.rnd.end_ms + self._cfg.settle_grace_s * 1000:
             return
 
-        winner: Optional[Side] = None
-        pnl: Optional[float] = None
+        winner: Side | None = None
+        pnl: float | None = None
         source = "venue"
 
         settled = self._client.settled_outcome(pos.rnd)
@@ -3574,7 +3574,7 @@ class Trader:
 
         # Read the balance before claiming so the change can be reconciled
         # against what we expected, rather than inferred.
-        before: Optional[float] = None
+        before: float | None = None
         if self._live:
             before = self._live_bankroll("settlement")
 
@@ -3633,7 +3633,7 @@ class Trader:
             pos.rnd.slug, expected_pnl, actual, drift,
             pos.committed_usdt / max(pos.signal.fill_price, EPS))
 
-    def _drain(self, timeout_s: Optional[float] = None) -> None:
+    def _drain(self, timeout_s: float | None = None) -> None:
         deadline = time.time() + (timeout_s if timeout_s is not None
                                   else self._cfg.drain_timeout_s)
         while self._positions and time.time() < deadline:
@@ -3654,6 +3654,11 @@ def preflight(cfg: Config) -> int:
     client = PredictionClient(cfg)
     print("\n=== Preflight ===\n")
     failures = 0
+    
+    print(f"IP Address: {requests.get('https://api.ipify.org').text}")
+    
+    # Give me a chance to make sure the IP address is whitelisted
+    time.sleep(5)
 
     def check(label, fn):
         nonlocal failures
@@ -3720,7 +3725,7 @@ def preflight(cfg: Config) -> int:
         return "".join(notes)
 
     check("balance", balance_check)
-    check("funding plan", lambda: (
+    check("funding plan", lambda: (  # noqa: PLC3002
         lambda p: f"accountType={p[0]} fundingSource={p[1]} holder={p[2]}"
     )(client.funding_plan()))
     check("daily quota", lambda: f"{client.remaining_quota_usdt()}")
@@ -3879,8 +3884,8 @@ def discover_min(cfg: Config) -> int:
     for amount in sizes:
         try:
             q = client.get_quote(rnd, Side.UP, amount)
-            verdicts.append((amount, True, f"avg {q.average_price:.4f} "
-                                           f"impact {q.price_impact:.4f}"))
+            verdicts.append((amount, True, (f"avg {q.average_price:.4f} "
+                                           f"impact {q.price_impact:.4f}")))
         except ApiError as exc:
             verdicts.append((amount, False, str(exc)[:130]))
     for amount, ok, detail in verdicts:
@@ -3934,7 +3939,7 @@ def discover_min(cfg: Config) -> int:
 # --------------------------------------------------------------------------
 
 
-def main(argv: Optional[Iterable[str]] = None) -> int:
+def main(argv: Iterable[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description="BTC 5m prediction market trader")
     # Tri-state on purpose. Left unset, the config file governs and the mode
     # can be changed by editing it while the bot runs. Set either way, the
