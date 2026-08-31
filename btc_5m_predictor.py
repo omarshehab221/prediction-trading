@@ -885,7 +885,7 @@ PROFILES: dict[str, dict] = {
 # The default strategy, declared once. Previously six literals across four
 # files each carried their own copy of this, which is precisely how a default
 # drifts: change five and the sixth silently disagrees.
-DEFAULT_PROFILE = "buffer"
+DEFAULT_PROFILE = "straddle"
 
 # Fields that cannot change while the bot is running. Swapping any of these
 # mid-flight would leave the process in a state that does not match what it
