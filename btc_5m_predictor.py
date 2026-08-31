@@ -150,7 +150,7 @@ def from_wei(amount_wei: str | int) -> Decimal:
 class Config:
     api_key: str
     api_secret: str
-    live: bool = False
+    live: bool = True
 
     # --- Edge --------------------------------------------------------------
     # Two thresholds, both of which must clear. The absolute floor stops us

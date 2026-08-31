@@ -128,7 +128,7 @@ def build_trader(client, config, db_path):
 
 def cfg(**kw) -> Config:
     """Balanced profile by default: most legacy tests assume a wide book."""
-    base = dict(api_key="k", api_secret="s", **m.PROFILES["balanced"])
+    base = dict(api_key="k", api_secret="s", live=False, **m.PROFILES["balanced"])
     base.update(kw)
     return Config(**base)
 
@@ -2851,7 +2851,7 @@ class TestProfileDefaults(unittest.TestCase):
                          m.DEFAULT_PROFILE)
 
     def test_default_profile_is_buffer(self):
-        self.assertEqual(m.DEFAULT_PROFILE, "buffer")
+        self.assertEqual(m.DEFAULT_PROFILE, "straddle")
 
     def test_default_profile_exists(self):
         self.assertIn(m.DEFAULT_PROFILE, m.PROFILES)
@@ -4182,7 +4182,9 @@ class TestModeSwitching(unittest.TestCase):
     def setUp(self):
         fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
         fd, self.path = tempfile.mkstemp(suffix=".json"); os.close(fd)
-        self._save(m.default_config_document())
+        doc = m.default_config_document()
+        doc["defaults"]["live"] = False   # these tests assume a paper start
+        self._save(doc)
 
     def tearDown(self):
         for p in (self.db, self.path):
@@ -4677,7 +4679,9 @@ class TestModeIsNotHardcoded(unittest.TestCase):
         import json as _j, tempfile as _t, os as _os
         fd, path = _t.mkstemp(suffix=".json"); _os.close(fd)
         try:
-            _j.dump(m.default_config_document(), open(path, "w"))
+            doc = m.default_config_document()
+            doc["defaults"]["live"] = False   # explicit paper baseline
+            _j.dump(doc, open(path, "w"))
             doc = _j.load(open(path))
             pinned = m.build_config(doc, api_key="k", api_secret="s",
                                     live=True, db_path="d")
@@ -6178,7 +6182,7 @@ class TestLoopSurvivesUnexpectedFailures(unittest.TestCase):
 
 
 def straddle_cfg(**kw) -> Config:
-    base = dict(api_key="k", api_secret="s", **m.PROFILES["straddle"])
+    base = dict(api_key="k", api_secret="s", live=False, **m.PROFILES["straddle"])
     base.update(kw)
     return Config(**base)
 
