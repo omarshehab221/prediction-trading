@@ -15,6 +15,8 @@ import os
 import random
 import re
 import tempfile
+import threading
+import queue
 import types
 import math
 import sys
@@ -78,6 +80,9 @@ def build_trader(client, config, db_path):
     t._risk = {}
     t._account_risk = RiskManager(config, config.paper_start_bankroll)
     t._positions = {}
+    t._claim_lock = threading.Lock()
+    t._claim_queue = queue.Queue()
+    t._claim_thread = None
     # The mode actually in force. Derived from config, not reflected: the
     # reflection below cannot evaluate `config.live`, and defaulting it to
     # None made every live-mode test silently run as paper.
@@ -802,7 +807,8 @@ class TestSimulatedSession(unittest.TestCase):
         client.t = 1
         t._maybe_enter(100.0, "PAPER")
         self.assertEqual(len(t._positions), 2)
-        self.assertEqual(sorted(t._positions), ["BTCUSDT", "ETHUSDT"])
+        self.assertEqual(sorted(t._positions),
+                         [("BTCUSDT", Side.UP), ("ETHUSDT", Side.UP)])
 
         t._maybe_enter(100.0, "PAPER")      # cap reached; nothing more opens
         self.assertEqual(len(t._positions), 2)
@@ -1145,6 +1151,8 @@ class TestRedemption(unittest.TestCase):
         return build_trader(client, c, self.db)
 
     def _win_once(self, client, **over):
+        over.setdefault("claim_poll_interval_s", 0.01)
+        over.setdefault("claim_timeout_s", 0.5)
         t = self._live_trader(client, **over)
         client.t = 1
         t._maybe_enter(100.0, "LIVE")
@@ -1163,9 +1171,11 @@ class TestRedemption(unittest.TestCase):
 
     def test_a_win_triggers_redemption(self):
         client = self._client()
+        client.redeem_state = "SUCCESS"
         t = self._win_once(client)
+        t._claim_queue.join()          # wait for the background worker
         self.assertEqual(client.redeemed, ["1"])   # UP token
-        self.assertIn("1", t._unredeemed)
+        self.assertEqual(t._unredeemed, {})        # confirmed and cleared
 
     def test_unredeemed_winnings_are_not_double_counted(self):
         """
@@ -1183,6 +1193,9 @@ class TestRedemption(unittest.TestCase):
     def test_unredeemed_can_be_counted_when_explicitly_configured(self):
         client = self._client()
         client.balance = 95.0
+        # _claim() records the pending payout synchronously, before handing
+        # the actual redemption to the worker, so this is readable right
+        # away without waiting on the background thread.
         t = self._win_once(client, count_unredeemed_in_bankroll=True)
         payout = t._unredeemed["1"][0]
         self.assertAlmostEqual(t._bankroll(), 95.0 + payout, places=6)
@@ -1195,29 +1208,38 @@ class TestRedemption(unittest.TestCase):
 
     def test_confirmed_redemption_clears_the_pending_entry(self):
         client = self._client()
+        client.redeem_state = "PENDING"
         t = self._win_once(client)
-        client.redeem_state = "SUCCESS"
         client.balance = 105.0
-        t._poll_redemptions()
+        # Flip to confirmed and let the worker's next poll pick it up --
+        # this is the background equivalent of the old manual poll call.
+        client.redeem_state = "SUCCESS"
+        t._claim_queue.join()
         self.assertEqual(t._unredeemed, {})
         self.assertAlmostEqual(t._bankroll(), 105.0, places=6)
 
     def test_pending_redemption_is_not_cleared_early(self):
         client = self._client()
-        t = self._win_once(client)
         client.redeem_state = "PENDING"
-        t._poll_redemptions()
-        self.assertIn("1", t._unredeemed)
+        t = self._win_once(client, claim_timeout_s=0.05,
+                           claim_poll_interval_s=0.01)
+        t._claim_queue.join()          # worker gives up after claim_timeout_s
+        self.assertIn("1", t._unredeemed)   # still tracked, not silently dropped
 
     def test_failed_claim_is_still_tracked_and_retried(self):
         client = self._client()
         client.redeem_fails = True
-        t = self._win_once(client)
+        t = self._win_once(client, claim_timeout_s=0.5,
+                           claim_poll_interval_s=0.01)
         self.assertIn("1", t._unredeemed)          # value not lost
-        self.assertEqual(t._unredeemed["1"][1], [])
+        # The worker is retrying relentlessly in the background; let it
+        # fail a few times, then allow it through and wait for the tx hash.
+        time.sleep(0.05)
         client.redeem_fails = False
-        t._retry_failed_claims()
-        self.assertTrue(t._unredeemed["1"][1])     # tx hash now present
+        client.redeem_state = "SUCCESS"
+        t._claim_queue.join()
+        self.assertTrue(client.redeemed)           # the retry got through
+        self.assertEqual(t._unredeemed, {})        # and then confirmed
 
     def test_a_loss_never_redeems(self):
         client = self._client()
@@ -5165,7 +5187,7 @@ class TestReturnFloor(unittest.TestCase):
         A floor applied only to the screen is a floor the venue can step over.
         """
         import inspect
-        src = inspect.getsource(m.Trader._maybe_enter)
+        src = inspect.getsource(m.Trader._maybe_enter_model)
         self.assertIn("clears_return(quote.average_price", src)
 
     def test_top_ups_are_checked_too(self):
@@ -5549,7 +5571,7 @@ class TestTrendBoost(unittest.TestCase):
         precisely the rounds the trend exists to catch.
         """
         import inspect
-        src = inspect.getsource(m.Trader._maybe_enter)
+        src = inspect.getsource(m.Trader._maybe_enter_model)
         self.assertIn("entry_window_start_s(self._cfg", src)
 
 
@@ -5931,7 +5953,7 @@ class TestMissedRoundReporting(unittest.TestCase):
         how a return floor turns into a bot that never trades.
         """
         import inspect
-        src = inspect.getsource(m.Trader._maybe_enter)
+        src = inspect.getsource(m.Trader._maybe_enter_model)
         watch_at = src.index("self._watching[rnd.topic_id]")
         # The only _seen assignments must come after a trade is attempted.
         self.assertLess(watch_at, src.index("self._seen[rnd.topic_id]"))
@@ -6148,3 +6170,204 @@ class TestLoopSurvivesUnexpectedFailures(unittest.TestCase):
         t._maybe_enter = _enter
         t.run()
         self.assertEqual(t._errors, 0)
+
+
+# --------------------------------------------------------------------------
+# Straddle: buy both sides at round-open, every round
+# --------------------------------------------------------------------------
+
+
+def straddle_cfg(**kw) -> Config:
+    base = dict(api_key="k", api_secret="s", **m.PROFILES["straddle"])
+    base.update(kw)
+    return Config(**base)
+
+
+class TestStraddleConfig(unittest.TestCase):
+
+    def test_straddle_and_scale_in_cannot_both_be_on(self):
+        with self.assertRaises(ValueError):
+            straddle_cfg(scale_in=True)
+
+    def test_straddle_stake_pct_must_be_in_range(self):
+        with self.assertRaises(ValueError):
+            straddle_cfg(straddle_stake_pct=0.0)
+        with self.assertRaises(ValueError):
+            straddle_cfg(straddle_stake_pct=0.30)
+
+    def test_entry_window_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            straddle_cfg(straddle_entry_window_s=0.0)
+
+    def test_max_leg_price_must_be_in_zero_one(self):
+        with self.assertRaises(ValueError):
+            straddle_cfg(straddle_max_leg_price=0.0)
+        with self.assertRaises(ValueError):
+            straddle_cfg(straddle_max_leg_price=1.5)
+
+    def test_max_leg_price_of_one_is_a_legal_no_op_ceiling(self):
+        straddle_cfg(straddle_max_leg_price=1.0)   # must not raise
+
+    def test_the_default_profile_set_is_internally_valid(self):
+        # Every profile, including "straddle", must build without error --
+        # a profile that fails validation is a bot that refuses to start.
+        for name in m.PROFILES:
+            Config(api_key="k", api_secret="s", **m.PROFILES[name])
+
+    def test_straddle_is_off_by_default_everywhere_else(self):
+        for name, values in m.PROFILES.items():
+            if name == "straddle":
+                continue
+            self.assertNotIn("straddle", values,
+                             f"{name} should not touch the straddle switch")
+
+    def test_the_straddle_profile_does_not_enable_scale_in(self):
+        # Scale-in is opt-in, never a default -- this profile has no model
+        # probability for it to top up toward.
+        c = straddle_cfg()
+        self.assertFalse(c.scale_in)
+
+    def test_the_straddle_profile_does_not_gate_on_worst_case_by_default(self):
+        c = straddle_cfg()
+        self.assertFalse(c.straddle_require_positive_worst_case)
+
+
+class TestStraddleEntry(unittest.TestCase):
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _trader(self, client, **kw):
+        c = straddle_cfg(db_path=self.db, **kw)
+        return build_trader(client, c, self.db)
+
+    def test_dispatch_uses_the_straddle_path_when_enabled(self):
+        c = straddle_cfg(db_path=self.db)
+        t = build_trader(FakeClient([], [(0, 100_000.0)], {}, {}), c, self.db)
+        called = {"straddle": False, "model": False}
+        t._maybe_enter_straddle = lambda *a: called.__setitem__("straddle", True)
+        t._maybe_enter_model = lambda *a: called.__setitem__("model", True)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertTrue(called["straddle"])
+        self.assertFalse(called["model"])
+
+    def test_dispatch_uses_the_model_path_when_disabled(self):
+        c = cfg(db_path=self.db, **m.PROFILES["balanced"])
+        t = build_trader(FakeClient([], [(0, 100_000.0)], {}, {}), c, self.db)
+        called = {"straddle": False, "model": False}
+        t._maybe_enter_straddle = lambda *a: called.__setitem__("straddle", True)
+        t._maybe_enter_model = lambda *a: called.__setitem__("model", True)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertFalse(called["straddle"])
+        self.assertTrue(called["model"])
+
+    def test_both_legs_are_bought_regardless_of_price(self):
+        """
+        No price judgement by default: even a round priced as a guaranteed
+        loss either way is entered, because second-guessing rounds on a
+        formula is a different, more timid strategy than this profile is.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=200)
+        books = {(1, Side.UP): [(0.70, 10_000)],
+                 (1, Side.DOWN): [(0.70, 10_000)]}
+        client = FakeClient([rnd], [(start, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(sorted(t._positions),
+                         [("BTCUSDT", Side.DOWN), ("BTCUSDT", Side.UP)])
+        for key, pos in t._positions.items():
+            self.assertAlmostEqual(pos.signal.fill_price, 0.70, places=9)
+            self.assertAlmostEqual(pos.signal.stake_usdt, 2.5, places=9)
+
+    def test_both_legs_settle_independently_and_correctly(self):
+        start = 1_700_000_000_000
+        end = start + (m.DEFAULT_ROUND_SECONDS * 1000)
+        rnd = make_round(strike=100_000.0, start_ms=start, end_ms=end,
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.10, 10_000)],
+                 (1, Side.DOWN): [(0.10, 10_000)]}
+        path = [(start, 100_000.0), (end + 3_000, 100_400.0)]
+        client = FakeClient([rnd], path, books, {})
+        t = self._trader(client)
+
+        client.t = 0
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(len(t._positions), 2)
+
+        client.t = 1
+        client._winners[1] = Side.UP
+        t._settle_open()
+
+        self.assertEqual(t._positions, {})
+        # UP staked 2.5 at 0.10 wins 2.5*9=22.5; DOWN staked 2.5 loses it.
+        # Net vs the 100.0 start: +22.5 - 2.5 = +20.0.
+        self.assertAlmostEqual(t._paper_bankroll, 120.0, places=9)
+
+    def test_a_round_past_the_entry_window_is_left_alone(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        books = {(1, Side.UP): [(0.10, 10_000)],
+                 (1, Side.DOWN): [(0.10, 10_000)]}
+        # 30s after open; the "straddle" profile's window is 15s.
+        client = FakeClient([rnd], [(start + 30_000, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(t._positions, {})
+        self.assertIn(1, t._seen)   # late is a different, unvalidated bet
+
+    def test_optional_ceiling_can_still_block_a_leg_when_opted_in(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        books = {(1, Side.UP): [(0.10, 10_000)],
+                 (1, Side.DOWN): [(0.90, 10_000)]}
+        client = FakeClient([rnd], [(start, 100_000.0)], books, {})
+        t = self._trader(client, straddle_max_leg_price=0.55)
+
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(t._positions, {})
+        self.assertEqual(t._watching[1][1],
+                         "straddle leg priced above ceiling")
+
+    def test_optional_worst_case_floor_can_still_block_when_opted_in(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=200)
+        books = {(1, Side.UP): [(0.70, 10_000)],
+                 (1, Side.DOWN): [(0.70, 10_000)]}
+        client = FakeClient([rnd], [(start, 100_000.0)], books, {})
+        t = self._trader(client, straddle_require_positive_worst_case=True)
+
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(t._positions, {})
+        self.assertEqual(t._watching[1][1], "straddle worst case below floor")
+
+    def test_scale_in_never_runs_for_a_straddle_position(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        books = {(1, Side.UP): [(0.10, 10_000)],
+                 (1, Side.DOWN): [(0.10, 10_000)]}
+        client = FakeClient([rnd], [(start, 100_000.0)], books, {})
+        t = self._trader(client)
+        t._maybe_enter(100.0, "PAPER")
+        before = dict(t._positions)
+
+        t._maybe_scale_in_all(100.0)   # must be a no-op: nothing to top up to
+
+        self.assertEqual(t._positions, before)

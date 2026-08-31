@@ -47,7 +47,8 @@ ENV CONFIG_PATH=/var/data/config.json
 ENV DB_PATH=/var/data/btc5m_journal.db
 # Only used when the config is first created; the file governs after that.
 # Must match DEFAULT_PROFILE in btc_5m_predictor.py -- coherence.py asserts it.
-ENV PROFILE=buffer
+# ENV PROFILE=buffer
+ENV PROFILE=straddle
 # paper | live. Pins the mode; unset it to let config.json govern, which makes
 # the mode hot-reloadable.
 # ENV TRADING_MODE=paper

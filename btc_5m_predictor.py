@@ -64,8 +64,10 @@ import signal
 import sqlite3
 import statistics
 import sys
+import threading
 import time
 import urllib.parse
+import queue
 from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from decimal import ROUND_DOWN, Decimal
@@ -380,6 +382,52 @@ class Config:
     # genuinely larger move rather than a more lenient test.
     trend_early_entry_s: int = 90
 
+    # --- Straddle (buy both sides at round-open) ----------------------------
+    # A different strategy entirely: no probability model, no picking a
+    # side. The edge here is that the venue's own pricing sometimes has not
+    # converged to a fair ~50/50 in the first seconds of a round, so buying
+    # BOTH outcomes locks in a profit whichever way it resolves -- PROVIDED
+    # the prices actually paid support that. Every live round is entered
+    # (subject only to the worst-case check below): skipping a round on a
+    # directional hunch is exactly the judgement this mode does not make.
+    straddle: bool = False
+    # Stake on EACH side, as a fraction of bankroll. Total committed to one
+    # round is roughly double this number, not this number itself.
+    straddle_stake_pct: float = 0.05
+    # How long after a round opens the bot is still willing to enter it. The
+    # whole strategy lives in this window -- the mispricing it exists to
+    # catch is a round-open phenomenon, not something that persists, so a
+    # late entry is not "less good", it is a different, unvalidated bet this
+    # profile was not built to make.
+    straddle_entry_window_s: float = 20.0
+    # Optional per-leg sanity ceiling. 1.0 means no ceiling: every round in
+    # the window is taken at whatever price is on offer, deliberately,
+    # because this strategy's premise is that direction does not matter and
+    # skipping rounds on a price judgement is a different strategy. Set
+    # below 1.0 only if you want to opt into refusing a leg priced above a
+    # level you have decided is too rich.
+    straddle_max_leg_price: float = 1.0
+    # Off by default. When enabled, a round is only taken if the WORSE of
+    # the two possible outcomes still returns at least this fraction of the
+    # total staked -- i.e. a hard requirement that the round be a mechanical
+    # arbitrage before it is touched. Left off by default because that
+    # requirement is what would make the bot refuse most rounds; whether
+    # round-open mispricing is real enough to trade without it is exactly
+    # what --calibration-report against real results answers, not a formula
+    # decided in advance.
+    straddle_require_positive_worst_case: bool = False
+    straddle_min_worst_case_return: float = 0.0
+
+    # --- Claiming (background, non-blocking) --------------------------
+    # A win must be claimed (on-chain redemption) before its proceeds are
+    # real, spendable balance, and that can take anywhere from about a
+    # second to roughly a minute. The trading loop must not sit still for
+    # that: it keeps scanning for the next round's open immediately, while
+    # a dedicated background worker retries the claim and polls its status
+    # on this cadence, independent of poll_interval_s, until it lands.
+    claim_poll_interval_s: float = 1.0
+    claim_timeout_s: float = 90.0
+
     # --- Plumbing ----------------------------------------------------------
     # --- Timing (previously hardcoded inside the loop) ------------------
     clock_resync_s: float = 300.0        # re-sync the server clock this often
@@ -553,6 +601,25 @@ class Config:
             raise ValueError("account_type must be AUTO, SPOT or FUNDING")
         if self.funding_source not in ("AUTO", "MPC", "CEX"):
             raise ValueError("funding_source must be AUTO, MPC or CEX")
+        if not 0 < self.straddle_stake_pct <= 0.25:
+            raise ValueError("straddle_stake_pct must be in (0, 0.25]")
+        if self.straddle_entry_window_s <= 0:
+            raise ValueError("straddle_entry_window_s must be positive")
+        if not 0 < self.straddle_max_leg_price <= 1.0:
+            raise ValueError("straddle_max_leg_price must be in (0, 1]")
+        if self.straddle_min_worst_case_return < 0:
+            raise ValueError(
+                "straddle_min_worst_case_return must be non-negative")
+        if self.straddle and self.scale_in:
+            # Scale-in tops a position up toward the Kelly stake for a
+            # rising model probability. The straddle strategy has no model
+            # probability -- there is nothing for scale-in to top up toward.
+            raise ValueError(
+                "straddle and scale_in cannot both be enabled")
+        if self.claim_poll_interval_s <= 0:
+            raise ValueError("claim_poll_interval_s must be positive")
+        if self.claim_timeout_s <= 0:
+            raise ValueError("claim_timeout_s must be positive")
 
     @property
     def symbol(self) -> str:
@@ -704,14 +771,23 @@ PROFILES: dict[str, dict] = {
                    # days at an 85% win rate. The limit has to match the
                    # profile's own loss shape or it stops a healthy bot.
                    "daily_loss_limit_pct": 0.35,
-                   # Near-certainties late in a round sit in thin books;
-                   # a wide fill destroys an edge measured in single points.
-                   "max_price_impact": 0.02,
+                   # Thin books still destroy an edge measured in single
+                   # points, but 0.02 was tuned for near-certainty fills at
+                   # 0.90+. Inside the return floor's band the stakes are
+                   # smaller relative to the book, so this was rejecting
+                   # rounds whose price was fine. Loosened deliberately: it
+                   # is a fill-quality gate, not a return gate, and bundling
+                   # the two is what made the floor look like it was cutting
+                   # trade count.
+                   "max_price_impact": 0.05,
                    "assumed_spread_pct": 0.03,
                    "kelly_fraction": 0.25,
-                   # Near-certainties late in a round sit in thin books, and
-                   # this is the one profile where an empty book is common.
-                   "min_liquidity": 1000.0, "max_rounds_per_day": 250,
+                   # 1000 USDT of resting depth is more than a 5-minute
+                   # market typically shows, so this gate alone was capable
+                   # of rejecting every round -- silently, and for a reason
+                   # that has nothing to do with the price being good. It
+                   # exists to avoid unfillable books, and 150 does that.
+                   "min_liquidity": 150.0, "max_rounds_per_day": 250,
                    # A smaller first tranche leaves more room to add once the
                    # round has proven itself, so the top-up genuinely is the
                    # larger bet -- roughly 4x the opener rather than 1.5x.
@@ -772,6 +848,33 @@ PROFILES: dict[str, dict] = {
                   # Inert here unless scale_in is enabled; sized to this
                   # profile's own band (0.35-0.75), not buffer's.
                   "max_blended_price": 0.65},
+    # Buy BOTH sides in the first seconds of a round, every round, no price
+    # judgement -- see the straddle_* fields on Config for what governs
+    # entry. Sized conservatively (2.5% of bankroll per leg, 5% total per
+    # round) because this is unproven relative to the model-based profiles
+    # above: --calibration-report after a few hundred rounds is what tells
+    # you whether the round-open mispricing this profile bets on is real.
+    "straddle": {"straddle": True, "straddle_stake_pct": 0.025,
+                 "straddle_entry_window_s": 15.0,
+                 # No side is ever picked by price here, so these bands are
+                 # left at their widest legal setting rather than inherited
+                 # from another profile -- nothing below should silently
+                 # reject a leg the straddle logic already screened.
+                 "min_entry_price": 0.01, "max_entry_price": 0.99,
+                 "max_stake_pct": 0.05, "min_edge": 0.02,
+                 "min_edge_ratio": 0.0, "daily_loss_limit_pct": 0.20,
+                 "assumed_spread_pct": 0.10, "kelly_fraction": 0.25,
+                 "min_liquidity": 0.0, "max_rounds_per_day": 400,
+                 "paper_start_bankroll": 100.0, "min_win_return": 0.0,
+                 "max_blended_price": 0.5,
+                 # Never on by default for this profile: scale-in tops up
+                 # toward a model probability this strategy does not have.
+                 # Opt in explicitly (and only after reading why it is off)
+                 # by overriding it back to True in your own config.
+                 "scale_in": False,
+                 # Two legs per round occupy two slots; four lets a second
+                 # round's straddle open while the first is still settling.
+                 "max_concurrent_positions": 4},
 }
 
 
@@ -3602,6 +3705,27 @@ def settle_pnl(stake: float, fill_price: float, won: bool,
     return stake * win_return(fill_price, fee_bps)
 
 
+def straddle_worst_case_pnl(stake_up: float, stake_down: float,
+                            price_up: float, price_down: float,
+                            fee_bps: int) -> float:
+    """
+    Worst-case P&L across the two possible outcomes of buying both sides
+    of one round: `stake_up` at `price_up`, `stake_down` at `price_down`.
+
+    Whichever side wins pays back stake/price minus the venue fee; the
+    other stake is lost outright. This is the number the straddle profile
+    lives or dies on -- if it is negative, the round is a guaranteed loss
+    no matter which way it settles, and no amount of hoping fixes that.
+    """
+    if not (0.0 < price_up < 1.0 and 0.0 < price_down < 1.0):
+        raise ValueError("prices must be in (0, 1)")
+    if stake_up < 0 or stake_down < 0:
+        raise ValueError("stakes must be non-negative")
+    pnl_if_up = settle_pnl(stake_up, price_up, True, fee_bps) - stake_down
+    pnl_if_down = settle_pnl(stake_down, price_down, True, fee_bps) - stake_up
+    return min(pnl_if_up, pnl_if_down)
+
+
 # --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
@@ -3645,12 +3769,24 @@ class Trader:
         self._watching: dict[int, tuple[int, str]] = {}
         self._missed: dict[str, int] = {}
         self._missed_total = 0
-        self._positions: dict[str, Position] = {}
+        # Keyed by (symbol, side) rather than just symbol: every model-based
+        # profile only ever opens one side per symbol, so this changes
+        # nothing for them, but it lets the straddle profile hold BOTH
+        # sides of the same symbol/round as two independent entries.
+        self._positions: dict[tuple[str, Side], Position] = {}
         self._hydrated: dict[int, Round] = {}
         self._errors = 0
         # token_id -> (expected payout USDT, tx hashes). Counted toward the
         # bankroll so an unclaimed win is not misread as a drawdown.
         self._unredeemed: dict[str, tuple[float, list[str], str]] = {}
+        # A claim is handed to a background worker (see _claim) so that
+        # settling a win never makes the trading loop wait on a chain
+        # confirmation before it looks at the next round. The lock guards
+        # every mutation of _unredeemed, since it is now written from two
+        # threads; the worker itself is started lazily, on the first win.
+        self._claim_lock = threading.Lock()
+        self._claim_queue: "queue.Queue[Position]" = queue.Queue()
+        self._claim_thread: threading.Thread | None = None
         self._stopping = False
         self._settled_count = 0
         # The mode actually in force. Diverges from the config only while a
@@ -3677,7 +3813,7 @@ class Trader:
         if value is None:
             self._positions.clear()
         else:
-            self._positions[value.rnd.symbol] = value
+            self._positions[(value.rnd.symbol, value.signal.side)] = value
 
     def _risk_for(self, symbol: str) -> RiskManager:
         """Streak and calibration state for one market, created on demand."""
@@ -3753,49 +3889,107 @@ class Trader:
         balance = self._client.balance_usdt()
         if not self._cfg.count_unredeemed_in_bankroll:
             return balance
-        pending = sum(v for v, _, _ in self._unredeemed.values())
+        # Snapshot under the lock: this dict is now written from the claim
+        # worker thread too, and iterating it live could race a mutation.
+        with self._claim_lock:
+            pending = sum(v for v, _, _ in self._unredeemed.values())
         return balance + pending
 
-    def _poll_redemptions(self) -> None:
-        """Drop entries once the chain confirms the payout has landed."""
-        for token_id, (value, hashes, _chain) in list(self._unredeemed.items()):
-            if not hashes:
-                continue
-            done = [self._client.redeem_status(h) in ("SUCCESS", "CONFIRMED",
-                                                      "COMPLETED")
-                    for h in hashes]
-            if done and all(done):
-                self._unredeemed.pop(token_id, None)
-                LOG.info("Redemption confirmed: %.2f USDT credited", value)
+    def _start_claim_worker(self) -> None:
+        """Start the background redemption worker, once, on first use."""
+        if self._claim_thread is not None and self._claim_thread.is_alive():
+            return
+        self._claim_thread = threading.Thread(
+            target=self._claim_worker_loop, name="claim-worker", daemon=True)
+        self._claim_thread.start()
 
-    def _claim(self, pos: Position) -> None:
-        """Redeem a winning position and track it until it is credited."""
+    def _claim_worker_loop(self) -> None:
+        """Consume winning positions and chase each redemption to landing."""
+        while True:
+            pos = self._claim_queue.get()
+            try:
+                self._claim_relentlessly(pos)
+            except Exception:                # noqa: BLE001 - see below
+                # A bug in the claim path must not silently strand a real
+                # win: log it loudly and keep the worker alive for the next
+                # one rather than letting an uncaught exception kill the
+                # thread out from under the trading loop.
+                LOG.exception("Claim worker error settling %s", pos.rnd.slug)
+            finally:
+                self._claim_queue.task_done()
+
+    def _claim_relentlessly(self, pos: Position) -> None:
+        """
+        Redeem one winning position and keep trying until it is confirmed.
+
+        This runs off the main thread specifically so the trading loop never
+        waits on it: it can take anywhere from about a second to roughly a
+        minute for a claim to land on chain, and every one of those seconds
+        is a second the next round's open is unwatched. Retrying on a short,
+        dedicated interval -- rather than once per poll_interval_s tick --
+        is what gets the balance freed up for re-entry as early as possible.
+        """
         token_id = pos.rnd.token_for(pos.signal.side)
         payout = pos.signal.stake_usdt / pos.signal.fill_price
-        try:
-            hashes = self._client.batch_redeem([token_id], pos.rnd.chain_id)
-            self._unredeemed[token_id] = (payout, hashes, pos.rnd.chain_id)
-            LOG.info("Redeeming %.2f USDT (tx %s)", payout,
-                     ", ".join(hashes) or "pending")
-        except (ApiError, requests.RequestException) as exc:
-            # Keep it tracked anyway: the win is real even if the claim failed,
-            # and retry happens on the next sweep.
-            self._unredeemed[token_id] = (payout, [], pos.rnd.chain_id)
-            LOG.warning("Redemption failed for %s (will retry): %s",
-                        token_id, exc)
+        chain_id = pos.rnd.chain_id
+        deadline = time.time() + self._cfg.claim_timeout_s
+        hashes: list[str] = []
 
-    def _retry_failed_claims(self) -> None:
-        for token_id, (value, hashes, chain_id) in list(self._unredeemed.items()):
+        while time.time() < deadline:
+            if not hashes:
+                try:
+                    hashes = self._client.batch_redeem([token_id], chain_id)
+                    with self._claim_lock:
+                        self._unredeemed[token_id] = (payout, hashes,
+                                                      chain_id)
+                    LOG.info("Redeeming %.2f USDT (tx %s)", payout,
+                             ", ".join(hashes) or "pending")
+                except (ApiError, requests.RequestException) as exc:
+                    LOG.debug("Redeem attempt for %s failed, retrying: %s",
+                              token_id, exc)
+                    time.sleep(self._cfg.claim_poll_interval_s)
+                    continue
+
             if hashes:
-                continue
-            try:
-                new = self._client.batch_redeem([token_id], chain_id)
-                if new:
-                    self._unredeemed[token_id] = (value, new, chain_id)
-                    LOG.info("Redemption retry accepted for %s", token_id)
-            except (ApiError, requests.RequestException) as exc:
-                LOG.debug("Redemption retry for %s still failing: %s",
-                          token_id, exc)
+                try:
+                    statuses = [self._client.redeem_status(h)
+                               for h in hashes]
+                except (ApiError, requests.RequestException) as exc:
+                    LOG.debug("Status check for %s failed, retrying: %s",
+                              token_id, exc)
+                    time.sleep(self._cfg.claim_poll_interval_s)
+                    continue
+                if statuses and all(
+                        s in ("SUCCESS", "CONFIRMED", "COMPLETED")
+                        for s in statuses):
+                    with self._claim_lock:
+                        self._unredeemed.pop(token_id, None)
+                    LOG.info("Redemption confirmed: %.2f USDT credited (%s)",
+                             payout, pos.rnd.slug)
+                    return
+
+            time.sleep(self._cfg.claim_poll_interval_s)
+
+        LOG.warning("Redemption for %s not confirmed within %.0fs; still "
+                    "tracked as unredeemed and will keep being retried the "
+                    "next time this token is claimed", pos.rnd.slug,
+                    self._cfg.claim_timeout_s)
+
+    def _claim(self, pos: Position) -> None:
+        """
+        Hand a winning position to the background claim worker.
+
+        Returns immediately -- not waiting for the chain -- which is the
+        entire point: the trading loop keeps scanning for the next round's
+        open the instant this one settles, while the worker chases the
+        actual redemption on its own schedule in the background.
+        """
+        token_id = pos.rnd.token_for(pos.signal.side)
+        payout = pos.signal.stake_usdt / pos.signal.fill_price
+        with self._claim_lock:
+            self._unredeemed[token_id] = (payout, [], pos.rnd.chain_id)
+        self._start_claim_worker()
+        self._claim_queue.put(pos)
 
     def _prune(self, now_ms: int) -> None:
         for tid in [t for t, end in self._seen.items()
@@ -3895,9 +4089,11 @@ class Trader:
                         self._client.sync_clock()
                         last_sync = time.time()
 
-                    if self._live and self._unredeemed:
-                        self._poll_redemptions()
-                        self._retry_failed_claims()
+                    # Redemption is no longer polled from here: a background
+                    # worker (started in _claim, on the first win) chases
+                    # every claim to confirmation on its own tight schedule,
+                    # specifically so this loop never pauses on a chain
+                    # confirmation before looking at the next round.
                     self._settle_open()
                     # Driven from the loop, not from _maybe_enter: that
                     # returns early while a position is open, and the rounds
@@ -3973,6 +4169,172 @@ class Trader:
             raise
 
     def _maybe_enter(self, bankroll: float, mode: str) -> None:
+        """Dispatch to whichever entry strategy the config selects."""
+        if self._cfg.straddle:
+            self._maybe_enter_straddle(bankroll, mode)
+        else:
+            self._maybe_enter_model(bankroll, mode)
+
+    def _maybe_enter_straddle(self, bankroll: float, mode: str) -> None:
+        """
+        Buy BOTH sides in the first seconds of a round -- every round.
+
+        No model probability, no side is picked, and by default no price
+        judgement either: the strategy is that direction does not matter at
+        round-open, so second-guessing individual rounds on a formula is a
+        different, more timid strategy than the one this profile is for.
+        The two legs are two separate MARKET FOK orders -- this venue has no
+        limit order type -- fired back-to-back as close to round-open as
+        the poll loop notices the round, which is why speed matters more
+        here than anywhere else in the bot.
+        """
+        if len(self._positions) >= self._cfg.max_concurrent_positions:
+            return
+
+        now_ms = self._client.now_ms()
+        self._prune(now_ms)
+
+        available = self._available(bankroll)
+        per_side = bankroll * self._cfg.straddle_stake_pct
+        if per_side < self._cfg.min_stake_usdt or available < per_side * 2:
+            LOG.debug("No uncommitted bankroll for a straddle (%.2f needed, "
+                      "%.2f available)", per_side * 2, available)
+            return
+
+        for raw in self._client.list_rounds():
+            if raw.topic_id in self._seen:
+                continue
+            # Both legs are opened together or not at all, so "already
+            # holding this market" means either key is present.
+            if any(k[0] == raw.symbol for k in self._positions):
+                continue
+
+            since_open = (now_ms - raw.start_ms) / 1000.0
+            if not (0.0 <= since_open <= self._cfg.straddle_entry_window_s):
+                if since_open > self._cfg.straddle_entry_window_s:
+                    self._seen[raw.topic_id] = raw.end_ms
+                continue
+
+            legs: dict[Side, float] = {}
+            for side in (Side.UP, Side.DOWN):
+                levels = self._client.asks_for(raw, side)
+                price = (levels[0][0] if levels
+                        else min(raw.quote_for(side)
+                                 * (1.0 + self._cfg.assumed_spread_pct),
+                                 0.999))
+                legs[side] = raw.round_price(price)
+
+            if not all(0.0 < p <= self._cfg.straddle_max_leg_price
+                      for p in legs.values()):
+                LOG.debug("%s: leg price(s) UP %.4f / DOWN %.4f above the "
+                          "%.2f straddle ceiling; skipping", raw.slug,
+                          legs[Side.UP], legs[Side.DOWN],
+                          self._cfg.straddle_max_leg_price)
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "straddle leg priced above ceiling")
+                continue
+
+            stake_up = stake_down = min(per_side, available / 2.0)
+            total = stake_up + stake_down
+            # Computed either way -- it is useful in the log and in the
+            # journal-adjacent picture of the round -- but only used to
+            # BLOCK entry when straddle_require_positive_worst_case is
+            # explicitly turned on. Off by default: every round in the
+            # window is taken regardless of what this number says, because
+            # requiring a guaranteed win up front is what would make the bot
+            # sit out most rounds, and whether the underlying edge is real
+            # is a question for --calibration-report, not a formula applied
+            # before a single trade has been observed.
+            worst = straddle_worst_case_pnl(
+                stake_up, stake_down, legs[Side.UP], legs[Side.DOWN],
+                raw.fee_bps)
+            if (self._cfg.straddle_require_positive_worst_case
+                    and worst < total * self._cfg.straddle_min_worst_case_return):
+                LOG.debug("%s: worst case %+.2f on %.2f staked (UP %.4f / "
+                          "DOWN %.4f) does not clear the floor; skipping",
+                          raw.slug, worst, total, legs[Side.UP],
+                          legs[Side.DOWN])
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "straddle worst case below floor")
+                continue
+
+            self._watching.pop(raw.topic_id, None)
+            self._seen[raw.topic_id] = raw.end_ms
+
+            filled: dict[Side, tuple[float, float, str | None]] = {}
+            aborted = False
+            for side in (Side.UP, Side.DOWN):
+                price = legs[side]
+                stake = stake_up if side is Side.UP else stake_down
+                order_id = None
+                if self._live:
+                    fresh = self._live_bankroll("straddle entry")
+                    if fresh is None or stake > fresh:
+                        LOG.warning(
+                            "Straddle %s: cannot fund the %s leg; not "
+                            "entering either side", raw.slug, side.value)
+                        aborted = True
+                        break
+                    quote = self._client.get_quote(raw, side, stake)
+                    if quote.average_price > self._cfg.straddle_max_leg_price:
+                        LOG.info("Straddle %s: %s quote %.4f above ceiling; "
+                                 "not entering either side", raw.slug,
+                                 side.value, quote.average_price)
+                        aborted = True
+                        break
+                    order_id = self._client.place_order(raw, quote, stake)
+                    if self._cfg.confirm_fills:
+                        try:
+                            got = self._client.confirm_fill(order_id, stake)
+                        except (ApiError, requests.RequestException) as exc:
+                            LOG.error(
+                                "Straddle %s: %s leg order placed but NOT "
+                                "confirmed (%s). %s already committed if "
+                                "the first leg -- this round is now a "
+                                "one-sided bet, not a hedge.", raw.slug,
+                                side.value, exc,
+                                "Nothing" if not filled
+                                else "The other leg is")
+                            continue
+                        price = quote.average_price
+                        stake = got
+                    if quote.fee_usdt > 0:
+                        LOG.debug("Straddle %s %s fee %.4f USDT", raw.slug,
+                                  side.value, quote.fee_usdt)
+                filled[side] = (price, stake, order_id)
+
+            if aborted:
+                continue
+
+            for side, (price, stake, order_id) in filled.items():
+                # model_prob/edge are meaningless for a strategy with no
+                # probability model; a neutral 0.5 keeps the journal schema
+                # and calibration_report's bucketing arithmetic valid
+                # without implying a directional forecast that was never
+                # made. edge is left as a simple descriptive read of how
+                # far the fill sat from a coin-flip breakeven -- not a
+                # signal this profile acted on.
+                sig = Signal(side, model_prob=0.5, fill_price=price,
+                            edge=0.5 - breakeven_probability(price,
+                                                             raw.fee_bps),
+                            stake_usdt=stake,
+                            seconds_left=raw.seconds_remaining(now_ms))
+                tid = self._journal.record(mode, raw, sig, spot=math.nan,
+                                           sigma=math.nan, bankroll=bankroll,
+                                           order_id=order_id)
+                self._positions[(raw.symbol, side)] = Position(
+                    tid, raw, sig, stake, 1)
+
+            LOG.info("STRADDLE %s | UP %.4f (%.2f) / DOWN %.4f (%.2f) | "
+                     "worst-case %+.2f on %.2f staked (%.0fs since open)",
+                     raw.slug, legs[Side.UP], filled[Side.UP][1],
+                     legs[Side.DOWN], filled[Side.DOWN][1], worst, total,
+                     since_open)
+
+            if len(self._positions) >= self._cfg.max_concurrent_positions:
+                return
+
+    def _maybe_enter_model(self, bankroll: float, mode: str) -> None:
         # The cap the config actually declares. An earlier version returned
         # whenever ANY position was open, which made
         # max_concurrent_positions dead: its default of 2 could never be
@@ -4001,7 +4363,7 @@ class Trader:
                 continue
             # One position per market: a second on the same symbol would be
             # the same bet twice, not diversification.
-            if raw.symbol in self._positions:
+            if any(k[0] == raw.symbol for k in self._positions):
                 continue
             try:
                 self._risk_for(raw.symbol).check(bankroll)
@@ -4172,19 +4534,26 @@ class Trader:
             tid = self._journal.record(mode, rnd, sig, spot, sigma, bankroll,
                                        order_id)
             self._seen[rnd.topic_id] = rnd.end_ms
-            self._positions[rnd.symbol] = Position(tid, rnd, sig,
-                                                   sig.stake_usdt, 1)
+            self._positions[(rnd.symbol, sig.side)] = Position(
+                tid, rnd, sig, sig.stake_usdt, 1)
             available -= sig.stake_usdt
             if (len(self._positions) >= self._cfg.max_concurrent_positions
                     or available < self._cfg.min_stake_usdt):
                 return
 
     def _maybe_scale_in_all(self, bankroll: float) -> None:
-        for symbol in list(self._positions):
-            self._maybe_scale_in(bankroll, symbol)
+        if self._cfg.straddle:
+            # Both legs are bought once, at round-open, and left alone until
+            # settlement -- no top-up, no exit, nothing sold mid-round. This
+            # profile has no model probability for scale-in to top up
+            # toward, which is also why straddle+scale_in cannot both be
+            # enabled (see Config.__post_init__).
+            return
+        for key in list(self._positions):
+            self._maybe_scale_in(bankroll, key)
 
     def _maybe_scale_in(self, bankroll: float,
-                        symbol: str | None = None) -> None:
+                        key: tuple[str, Side] | None = None) -> None:
         """
         Top up an open position as the round moves further into our favour.
 
@@ -4198,11 +4567,11 @@ class Trader:
         exposure to one round stays bounded by Kelly no matter how many
         tranches are added.
         """
-        pos = (self._positions.get(symbol) if symbol is not None
+        pos = (self._positions.get(key) if key is not None
                else self._position)
         if pos is None or not self._cfg.scale_in:
             return
-        symbol = pos.rnd.symbol
+        key = (pos.rnd.symbol, pos.signal.side)
         secs = pos.rnd.seconds_remaining(self._client.now_ms())
         if secs <= self._cfg.entry_window_end_s:
             return                       # too late to fill
@@ -4315,7 +4684,7 @@ class Trader:
                  pos.rnd.slug, topup, avg, prob, secs,
                  pos.committed_usdt + topup, blended, wins_per_loss(blended))
 
-        self._positions[symbol] = replace(
+        self._positions[key] = replace(
             pos,
             signal=replace(pos.signal, model_prob=prob, fill_price=blended,
                            stake_usdt=pos.committed_usdt + topup),
@@ -4353,11 +4722,11 @@ class Trader:
         return replace(sig, stake_usdt=stake)
 
     def _settle_open(self) -> None:
-        for symbol in list(self._positions):
-            self._settle_one(symbol)
+        for key in list(self._positions):
+            self._settle_one(key)
 
-    def _settle_one(self, symbol: str) -> None:
-        pos = self._positions.get(symbol)
+    def _settle_one(self, key: tuple[str, Side]) -> None:
+        pos = self._positions.get(key)
         if pos is None:
             return
         now_ms = self._client.now_ms()
@@ -4390,7 +4759,11 @@ class Trader:
             if now_ms > pos.rnd.end_ms + self._cfg.settle_timeout_s * 1000:
                 LOG.error("Cannot settle %s; left unresolved in journal",
                           pos.rnd.slug)
-                self._position = None
+                # Only THIS leg, not every open position -- a straddle round
+                # can have one leg settle cleanly while the other's outcome
+                # lookup is still stuck, and clearing both would abandon a
+                # leg that was never actually resolved.
+                self._positions.pop(key, None)
             return
 
         won = winner is pos.signal.side
@@ -4410,10 +4783,10 @@ class Trader:
             self._claim(pos)
 
         self._journal.resolve(pos.trade_id, won, pnl, source)
-        self._risk_for(symbol).record_result(won, pos.signal.model_prob, pnl)
+        self._risk_for(key[0]).record_result(won, pos.signal.model_prob, pnl)
         if self._account_risk is not None:
             self._account_risk.record_result(won, pos.signal.model_prob, pnl)
-        self._positions.pop(symbol, None)
+        self._positions.pop(key, None)
         after = self._bankroll()
         LOG.info("SETTLED %s -> %s  P&L %+.2f  bankroll %.2f  [%s]",
                  pos.rnd.slug, "WIN" if won else "LOSS", pnl, after, source)
