@@ -5068,7 +5068,7 @@ class TestBalanceReconciliation(unittest.TestCase):
             handler = Cap(); prev = m.LOG.level
             m.LOG.setLevel(_log.WARNING); m.LOG.addHandler(handler)
             try:
-                t._reconcile(pos, 0.65, 100.0, 101.67)
+                t._reconcile(pos, True, 0.65, 100.0, 100.20)
             finally:
                 m.LOG.removeHandler(handler); m.LOG.setLevel(prev)
             self.assertTrue(any("RECONCILE MISMATCH" in r for r in records))
@@ -5093,7 +5093,7 @@ class TestBalanceReconciliation(unittest.TestCase):
             handler = Cap(); prev = m.LOG.level
             m.LOG.setLevel(_log.WARNING); m.LOG.addHandler(handler)
             try:
-                t._reconcile(pos, 0.65, 100.0, 100.65)
+                t._reconcile(pos, True, 0.65, 100.0, 101.67)
             finally:
                 m.LOG.removeHandler(handler); m.LOG.setLevel(prev)
             self.assertFalse(any("MISMATCH" in r for r in records))
@@ -6846,20 +6846,60 @@ class TestStraddleEntry(unittest.TestCase):
         # Net vs the 100.0 start: +180 - 20 = +160.0.
         self.assertAlmostEqual(t._paper_bankroll, 260.0, places=9)
 
-    def test_a_round_past_the_entry_window_is_left_alone(self):
+    def test_a_first_leg_can_be_opened_well_into_a_round(self):
+        """
+        Regression on the reported dead bot. At round open spot IS the
+        strike, so both sides price near 0.50 and neither can reach the 0.25
+        a first leg needs. A 15s opening window therefore pointed the opener
+        at the only stretch of the round where its entry price cannot occur,
+        and marked every round _seen the moment it elapsed. Live, that bought
+        one leg in an hour.
+        """
         start = 1_700_000_000_000
         rnd = make_round(strike=100_000.0, start_ms=start,
                          end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        books = {(1, Side.UP): [(0.15, 10_000)],
+                 (1, Side.DOWN): [(0.88, 10_000)]}
+        # Two minutes in: spot has moved, and UP is finally cheap.
+        client = FakeClient([rnd], [(start + 120_000, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+
+    def test_a_round_with_no_runway_left_to_hedge_is_left_alone(self):
+        """
+        Opening a leg that cannot be completed is just a directional bet.
+        Completion stops at straddle_hedge_deadline_s, so anything inside
+        twice that has no realistic chance of finding its other side.
+        """
+        start = 1_700_000_000_000
+        end = start + (m.DEFAULT_ROUND_SECONDS * 1000)
+        rnd = make_round(strike=100_000.0, start_ms=start, end_ms=end)
         books = {(1, Side.UP): [(0.10, 10_000)],
                  (1, Side.DOWN): [(0.10, 10_000)]}
-        # 30s after open; the "straddle" profile's window is 15s.
-        client = FakeClient([rnd], [(start + 30_000, 100_000.0)], books, {})
+        client = FakeClient([rnd], [(end - 20_000, 100_000.0)], books, {})
         t = self._trader(client)
 
         t._maybe_enter(100.0, "PAPER")
 
         self.assertEqual(t._positions, {})
-        self.assertIn(1, t._seen)   # late is a different, unvalidated bet
+        self.assertIn(1, t._seen)
+
+    def test_a_round_past_the_opening_window_is_left_alone(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        books = {(1, Side.UP): [(0.10, 10_000)],
+                 (1, Side.DOWN): [(0.10, 10_000)]}
+        client = FakeClient([rnd], [(start + 90_000, 100_000.0)], books, {})
+        t = self._trader(client, straddle_entry_window_s=60.0)
+
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(t._positions, {})
+        self.assertIn(1, t._seen)
 
     def test_the_ceiling_blocks_a_round_whose_cheap_side_is_dear(self):
         """Nothing opens when even the cheaper side is above the ceiling."""

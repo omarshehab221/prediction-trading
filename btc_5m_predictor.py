@@ -394,12 +394,26 @@ class Config:
     # Stake on EACH side, as a fraction of bankroll. Total committed to one
     # round is roughly double this number, not this number itself.
     straddle_stake_pct: float = 0.05
-    # How long after a round opens the bot is still willing to enter it. The
-    # whole strategy lives in this window -- the mispricing it exists to
-    # catch is a round-open phenomenon, not something that persists, so a
-    # late entry is not "less good", it is a different, unvalidated bet this
-    # profile was not built to make.
-    straddle_entry_window_s: float = 20.0
+    # How long after a round opens a FIRST leg may still be started.
+    #
+    # This used to be 15-20 seconds, on the theory that the mispricing worth
+    # catching was a round-open phenomenon. That was true of the original
+    # strategy, which bought both sides immediately at whatever price was
+    # showing. It is exactly wrong for this one, which waits for ONE side to
+    # get cheap: at round open spot IS the strike, so both sides sit near
+    # 0.50 by construction and neither can be near
+    # straddle_first_leg_max_price. A side only reaches 0.25 once spot has
+    # moved well away from the strike, which takes minutes.
+    #
+    # So a 15s window pointed the opener at precisely the part of the round
+    # where its entry price cannot occur, and marked every round _seen the
+    # moment it elapsed. Live, that bought one leg in an hour -- and only
+    # because BTC happened to move hard inside fourteen seconds.
+    #
+    # 240 of a 300s round leaves 60s of runway after the latest possible
+    # open. The runway floor below that is what actually protects a late
+    # entry from being unhedgeable.
+    straddle_entry_window_s: float = 240.0
     # Optional per-leg sanity ceiling. 1.0 means no ceiling: every round in
     # the window is taken at whatever price is on offer, deliberately,
     # because this strategy's premise is that direction does not matter and
@@ -904,7 +918,10 @@ PROFILES: dict[str, dict] = {
     # bankroll produced a per-leg stake under min_stake_usdt and the profile
     # silently never traded.
     "straddle": {"straddle": True, "straddle_stake_pct": 0.20,
-                 "straddle_entry_window_s": 15.0,
+                 # Most of the round, not the first few seconds. The cheap
+                 # side this profile waits for does not exist at round open,
+                 # when spot is the strike and both sides price near 0.50.
+                 "straddle_entry_window_s": 240.0,
                  # No side is ever picked by price here, so these bands are
                  # left at their widest legal setting rather than inherited
                  # from another profile -- nothing below should silently
@@ -4791,9 +4808,18 @@ class Trader:
                 continue
 
             since_open = (now_ms - raw.start_ms) / 1000.0
-            if not (0.0 <= since_open <= self._cfg.straddle_entry_window_s):
-                if since_open > self._cfg.straddle_entry_window_s:
-                    self._seen[raw.topic_id] = raw.end_ms
+            if since_open < 0.0:
+                continue                      # has not opened yet
+            # Two bounds, and once either binds the round is finished for
+            # opening purposes. The window caps how late a first leg may be
+            # started; the runway floor refuses one that could never be
+            # hedged -- completion stops at straddle_hedge_deadline_s and
+            # needs time to work before then, so it is derived from that
+            # rather than being another number to keep in sync.
+            runway = self._cfg.straddle_hedge_deadline_s * 2.0
+            if (since_open > self._cfg.straddle_entry_window_s
+                    or raw.seconds_remaining(now_ms) <= runway):
+                self._seen[raw.topic_id] = raw.end_ms
                 continue
 
             legs: dict[Side, float] = {}
@@ -5379,7 +5405,7 @@ class Trader:
         LOG.info("SETTLED %s -> %s  P&L %+.2f  bankroll %.2f  [%s]",
                  pos.rnd.slug, "WIN" if won else "LOSS", pnl, after, source)
         if before is not None:
-            self._reconcile(pos, pnl, before, after)
+            self._reconcile(pos, won, pnl, before, after)
 
         self._settled_count += 1
         if (self._cfg.report_every
@@ -5388,39 +5414,53 @@ class Trader:
                     self._cfg.profile_name).split("\n"):
                 LOG.info("| %s", line)
 
-    def _reconcile(self, pos: Position, expected_pnl: float,
+    def _reconcile(self, pos: Position, won: bool, expected_pnl: float,
                    before: float, after: float) -> None:
         """
-        Compare the actual balance change against the P&L we computed.
+        Compare the actual balance change against what settling should move.
 
         The bot's own arithmetic and the venue's accounting should agree. When
         they do not, the venue is right and something here is wrong -- a fee we
         did not model, a partial fill, or a figure counted twice. Reporting the
         gap turns a silent drift into a visible one.
 
-        A winning position is normally still unredeemed at this moment, so the
-        balance may legitimately not have moved yet; that case is noted rather
-        than flagged.
+        WHAT SETTLING IS ACTUALLY EXPECTED TO MOVE
+        -----------------------------------------
+        Not the P&L. The stake left the balance at ENTRY, so a losing round
+        moves the balance by nothing at all when it settles -- there is
+        nothing left to lose. Comparing the balance delta against a P&L of
+        -stake made every single loss report a mismatch the size of the whole
+        stake, complete with a hint that something was double-counting it.
+        Nothing was; the two numbers were simply measuring different events.
+
+        A win moves the balance by the GROSS payout, and only once the claim
+        has been credited on chain -- which is normally after this runs, so
+        that case is noted rather than flagged.
         """
         actual = after - before
-        reference = max(abs(expected_pnl), self._cfg.min_stake_usdt)
-        drift = abs(actual - expected_pnl)
+        # A loss should move nothing: the money went out when the order did.
+        expected_move = (pos.committed_usdt / max(pos.signal.fill_price, EPS)
+                         if won else 0.0)
+        reference = max(abs(expected_move), self._cfg.min_stake_usdt)
+        drift = abs(actual - expected_move)
 
-        if self._unredeemed and abs(actual) < EPS:
+        if won and self._unredeemed and abs(actual) < EPS:
             LOG.debug("Balance unchanged; winnings still unredeemed")
             return
         if drift <= reference * self._cfg.reconcile_tolerance:
-            LOG.debug("Reconciled: expected %+.4f, actual %+.4f",
-                      expected_pnl, actual)
+            LOG.debug("Reconciled %s: expected the balance to move %+.4f, "
+                      "it moved %+.4f (P&L %+.4f)",
+                      "a win" if won else "a loss", expected_move, actual,
+                      expected_pnl)
             return
 
         LOG.warning(
-            "RECONCILE MISMATCH on %s: expected %+.4f, balance moved %+.4f "
-            "(gap %.4f). The venue is authoritative -- if the gap is close to "
-            "the gross payout (%.4f) rather than the profit, something is "
-            "counting the stake twice.",
-            pos.rnd.slug, expected_pnl, actual, drift,
-            pos.committed_usdt / max(pos.signal.fill_price, EPS))
+            "RECONCILE MISMATCH on %s: settling %s should have moved the "
+            "balance %+.4f, it moved %+.4f (gap %.4f, P&L %+.4f). The venue "
+            "is authoritative -- something here is counting a stake or a fee "
+            "the venue does not.",
+            pos.rnd.slug, "a win" if won else "a loss", expected_move, actual,
+            drift, expected_pnl)
 
     def _drain(self, timeout_s: float | None = None) -> None:
         deadline = time.time() + (timeout_s if timeout_s is not None
