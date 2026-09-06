@@ -860,8 +860,27 @@ PROFILES: dict[str, dict] = {
                  # from another profile -- nothing below should silently
                  # reject a leg the straddle logic already screened.
                  "min_entry_price": 0.01, "max_entry_price": 0.99,
-                 "max_stake_pct": 0.05, "min_edge": 0.02,
-                 "min_edge_ratio": 0.0, "daily_loss_limit_pct": 0.20,
+                 # Matched to straddle_stake_pct, not inherited. The straddle
+                 # path never consults max_stake_pct -- it sizes off
+                 # straddle_stake_pct directly -- so leaving this at 5% while
+                 # each leg staked 20% made the config declare a cap the bot
+                 # did not honour, and made --check-config and --preflight
+                 # both report a limit that was never in force.
+                 "max_stake_pct": 0.20, "min_edge": 0.02,
+                 # 30% held back leaves 70% spendable, and one round needs
+                 # 40% (two 20% legs). That capped the profile at a single
+                 # live round no matter what max_concurrent_positions said.
+                 # 10% leaves room for the second round the slot count is
+                 # there for; a third is still refused for want of funds.
+                 "reserve_pct": 0.10,
+                 "min_edge_ratio": 0.0,
+                 # A straddle's worst case per round is roughly one leg's
+                 # stake (the other leg always pays something back), so 20%
+                 # per leg means a bad round costs about 20% of bankroll. At
+                 # the old 20% daily limit that halted the bot for the day
+                 # after a SINGLE bad round; 50% leaves the 2.5-loss headroom
+                 # every other profile has.
+                 "daily_loss_limit_pct": 0.50,
                  "assumed_spread_pct": 0.10, "kelly_fraction": 0.25,
                  "min_liquidity": 0.0, "max_rounds_per_day": 400,
                  "paper_start_bankroll": 100.0, "min_win_return": 0.0,
@@ -4198,23 +4217,29 @@ class Trader:
 
         available = self._available(bankroll)
         per_side = bankroll * self._cfg.straddle_stake_pct
-        if per_side < self._cfg.min_stake_usdt or available < per_side * 2:
-            # Loud, not debug: this is the one condition that makes the
-            # profile sit there doing nothing forever, and at DEBUG it was
-            # indistinguishable from a bot that was simply between rounds.
-            # Deduplicated so a stuck bankroll does not spam every poll.
-            msg = ("Straddle cannot enter: %.2f USDT per leg (%.1f%% of a "
-                   "%.2f bankroll) against a %.2f per-leg minimum, and "
-                   "%.2f USDT uncommitted after the %.0f%% reserve. "
-                   "Raise straddle_stake_pct or fund the wallet."
+        # Two different conditions, and conflating them is what hid the
+        # original bug. Sizing below the venue minimum is a configuration
+        # fault that will never clear on its own, so it is loud. Capital
+        # already committed to another round is the ordinary state of a
+        # profile holding positions, so it stays at debug.
+        if per_side < self._cfg.min_stake_usdt:
+            msg = ("Straddle cannot enter any round: %.2f USDT per leg "
+                   "(%.1f%% of a %.2f bankroll) is below the %.2f venue "
+                   "minimum. Raise straddle_stake_pct or fund the wallet -- "
+                   "nothing will be traded until one of those changes."
                    % (per_side, self._cfg.straddle_stake_pct * 100, bankroll,
-                      self._cfg.min_stake_usdt, available,
-                      self._cfg.reserve_pct * 100))
+                      self._cfg.min_stake_usdt))
             if msg != self._idle_reason:
                 self._idle_reason = msg
                 LOG.warning("%s", msg)
             return
         self._idle_reason = ""
+        if available < per_side * 2:
+            LOG.debug("No uncommitted bankroll for a straddle (%.2f needed, "
+                      "%.2f available after the %.0f%% reserve and %.2f "
+                      "already committed)", per_side * 2, available,
+                      self._cfg.reserve_pct * 100, self._committed())
+            return
 
         for raw in self._client.list_rounds():
             if raw.topic_id in self._seen:
@@ -5016,6 +5041,29 @@ def preflight(cfg: Config) -> int:
         if bal < cfg.min_stake_usdt:
             notes.append(f"  <-- below the {cfg.min_stake_usdt:.2f} minimum "
                          f"order size; no order can be placed")
+        elif cfg.straddle:
+            # The straddle path never calls kelly_stake, so probing it here
+            # would answer a question about a strategy this profile does not
+            # run. Report the sizing that IS in force -- and the two limits
+            # that can silently zero it out, which is precisely what went
+            # unnoticed until the bot sat idle in live mode.
+            per_side = bal * cfg.straddle_stake_pct
+            spendable = bal * (1.0 - cfg.reserve_pct)
+            notes.append(f"  -> straddle stakes {per_side:.2f} per leg, "
+                         f"{per_side * 2:.2f} per round; {spendable:.2f} "
+                         f"spendable after the {cfg.reserve_pct:.0%} reserve")
+            if per_side < cfg.min_stake_usdt:
+                notes.append(
+                    f"  <-- UNTRADEABLE: {per_side:.2f} per leg is under the "
+                    f"{cfg.min_stake_usdt:.2f} venue minimum, so no round "
+                    f"will ever be entered. Raise straddle_stake_pct "
+                    f"(now {cfg.straddle_stake_pct:.0%}) or add funds.")
+            elif spendable < per_side * 2:
+                notes.append(
+                    f"  <-- UNTRADEABLE: one round needs {per_side * 2:.2f} "
+                    f"but only {spendable:.2f} is spendable. Lower "
+                    f"reserve_pct (now {cfg.reserve_pct:.0%}) or "
+                    f"straddle_stake_pct.")
         else:
             # Ask the real sizing function, not a percentage rule of thumb:
             # on a small balance the Kelly fraction binds long before the cap.
@@ -5429,7 +5477,12 @@ def main(argv: Iterable[str] | None = None) -> int:
         print(f"  profile        {checked.profile_name}")
         print(f"  entry band     {checked.min_entry_price:.2f}"
               f"-{checked.max_entry_price:.2f}")
-        print(f"  max stake      {checked.max_stake_pct:.0%} of bankroll")
+        if checked.straddle:
+            print(f"  max stake      "
+                  f"{checked.straddle_stake_pct:.0%} of bankroll per leg, "
+                  f"{checked.straddle_stake_pct * 2:.0%} per round")
+        else:
+            print(f"  max stake      {checked.max_stake_pct:.0%} of bankroll")
         print(f"  min buffer     {checked.min_buffer_sigmas} sigma")
         print(f"  daily limit    {checked.daily_loss_limit_pct:.0%}")
         return 0

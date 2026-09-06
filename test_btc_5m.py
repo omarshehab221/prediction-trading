@@ -6231,6 +6231,28 @@ class TestStraddleConfig(unittest.TestCase):
         c = straddle_cfg()
         self.assertFalse(c.scale_in)
 
+    def test_the_declared_stake_cap_does_not_contradict_the_straddle_stake(self):
+        """
+        max_stake_pct is inert on the straddle path, which is exactly why it
+        must not disagree with straddle_stake_pct: --check-config and
+        --preflight both read it, and a config that advertises a 5% cap
+        while every leg stakes 20% is lying to whoever reads it.
+        """
+        c = straddle_cfg()
+        self.assertGreaterEqual(c.max_stake_pct, c.straddle_stake_pct)
+
+    def test_the_reserve_leaves_room_for_the_concurrent_rounds_allowed(self):
+        """
+        reserve_pct is the one limit that CAN throttle the straddle path, via
+        _available. At 30% reserve and 20% per leg only one round could ever
+        be funded, which made max_concurrent_positions: 4 a dead setting.
+        """
+        c = straddle_cfg()
+        spendable = 1.0 - c.reserve_pct
+        per_round = c.straddle_stake_pct * 2
+        rounds = c.max_concurrent_positions // 2
+        self.assertGreaterEqual(spendable, per_round * min(rounds, 2))
+
     def test_the_straddle_profile_does_not_gate_on_worst_case_by_default(self):
         c = straddle_cfg()
         self.assertFalse(c.straddle_require_positive_worst_case)
@@ -6312,6 +6334,32 @@ class TestStraddleEntry(unittest.TestCase):
         for pos in t._positions.values():
             self.assertGreaterEqual(pos.signal.stake_usdt,
                                     t._cfg.min_stake_usdt)
+
+    def test_a_second_round_can_be_funded_while_the_first_is_open(self):
+        """
+        Regression on the reserve: with two legs already open, the profile's
+        four slots are only usable if the reserve leaves room for the second
+        round's 40%.
+        """
+        start = 1_700_000_000_000
+        end = start + (m.DEFAULT_ROUND_SECONDS * 1000)
+        first = make_round(strike=100_000.0, start_ms=start, end_ms=end,
+                           fee_bps=0)
+        second = make_round(topic_id=2, market_id=10, slug="eth-5m",
+                            symbol="ETHUSDT", strike=3_000.0,
+                            up_token_id="3", down_token_id="4",
+                            feed_symbol="ETHUSDT",
+                            start_ms=start, end_ms=end, fee_bps=0)
+        books = {(1, Side.UP): [(0.50, 10_000)],
+                 (1, Side.DOWN): [(0.50, 10_000)],
+                 (2, Side.UP): [(0.50, 10_000)],
+                 (2, Side.DOWN): [(0.50, 10_000)]}
+        client = FakeClient([first, second], [(start, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(len(t._positions), 4)
 
     def test_both_legs_settle_independently_and_correctly(self):
         start = 1_700_000_000_000
