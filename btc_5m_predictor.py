@@ -418,6 +418,45 @@ class Config:
     straddle_require_positive_worst_case: bool = False
     straddle_min_worst_case_return: float = 0.0
 
+    # --- Legging in: the two sides are bought at DIFFERENT times ----------
+    # The prices of the two sides sum to about 1.00 at any given instant, so
+    # a pair bought simultaneously is almost never profitable both ways.
+    # Bought at different moments it can be: UP at 0.25 while spot is falling
+    # and DOWN at 0.25 twenty seconds later once it has bounced never coexist
+    # in the book, but the two fills together still return 4x on each side of
+    # a round that cost 2 stakes. Prices summing to 1.00 constrains one
+    # instant, not one round.
+    #
+    # The price a leg has to reach to be worth buying at all -- 0.25, a 4x
+    # payout. It governs BOTH legs, and which side it happens to be is never
+    # considered: whichever of UP and DOWN is showing this price is the one
+    # that gets bought, first or second.
+    #
+    # The number matters more than it looks. After filling at p, the other
+    # side stays worth buying all the way up to (1 - p), so an opener at
+    # 0.25 leaves an enormous 0.75 of room to complete in, while one at 0.49
+    # leaves almost none and stands a real chance of being stranded.
+    #
+    # For the SECOND leg this is the price to hold out for, not a hard
+    # ceiling: once ANY price would lock the round in, refusing one this
+    # side of 0.25 only makes sense while there is still time to find
+    # better, so the bar slides from here toward the break-even limit as the
+    # round runs out (_completion_is_worth_waiting_out).
+    straddle_first_leg_max_price: float = 0.25
+    # Opening a round is limited to straddle_entry_window_s. COMPLETING one
+    # is not: a hedge that locks the profit in at t=120s is worth exactly
+    # what one at t=9s is worth, and refusing it would leave a naked
+    # directional bet on the book for no reason. The second leg is hunted
+    # until this many seconds remain, at which point the search stops and
+    # straddle_force_hedge decides what happens to the open leg.
+    straddle_hedge_deadline_s: float = 30.0
+    # At that deadline, buy the other side at whatever it costs. The round is
+    # then usually a small loss instead of a coin flip on the whole stake --
+    # the guarantee is already gone by this point, and the only question left
+    # is whether the position stays all-or-nothing. Turn off only to hold the
+    # open leg to settlement as an outright directional bet.
+    straddle_force_hedge: bool = True
+
     # --- Claiming (background, non-blocking) --------------------------
     # A win must be claimed (on-chain redemption) before its proceeds are
     # real, spendable balance, and that can take anywhere from about a
@@ -607,6 +646,16 @@ class Config:
             raise ValueError("straddle_entry_window_s must be positive")
         if not 0 < self.straddle_max_leg_price <= 1.0:
             raise ValueError("straddle_max_leg_price must be in (0, 1]")
+        if not 0 < self.straddle_first_leg_max_price < 0.5:
+            # At 0.5 the first leg's payout only just covers an equal-sized
+            # pair, leaving no room at all for the second leg to be worth
+            # buying -- the strategy needs the first fill to be genuinely
+            # cheap, not merely the better half of a coin flip.
+            raise ValueError(
+                "straddle_first_leg_max_price must be in (0, 0.5)")
+        if self.straddle_hedge_deadline_s < 0:
+            raise ValueError("straddle_hedge_deadline_s must be "
+                             "non-negative")
         if self.straddle_min_worst_case_return < 0:
             raise ValueError(
                 "straddle_min_worst_case_return must be non-negative")
@@ -848,11 +897,12 @@ PROFILES: dict[str, dict] = {
                   # Inert here unless scale_in is enabled; sized to this
                   # profile's own band (0.35-0.75), not buffer's.
                   "max_blended_price": 0.65},
-    # Buy BOTH sides in the first seconds of a round, every round, no price
-    # judgement -- see the straddle_* fields on Config for what governs
-    # entry. 20% of bankroll per leg, so ~40% of bankroll committed per
-    # round. Deliberately large: at 2.5% a small bankroll produced a per-leg
-    # stake under min_stake_usdt and the profile silently never traded.
+    # Buy BOTH sides in the first seconds of a round, but only when the two
+    # payouts both beat what the pair costs -- see straddle_* on Config, and
+    # _straddle_payouts_clear for the gate itself. 20% of bankroll per leg,
+    # so ~40% committed per round. Deliberately large: at 2.5% a small
+    # bankroll produced a per-leg stake under min_stake_usdt and the profile
+    # silently never traded.
     "straddle": {"straddle": True, "straddle_stake_pct": 0.20,
                  "straddle_entry_window_s": 15.0,
                  # No side is ever picked by price here, so these bands are
@@ -892,7 +942,23 @@ PROFILES: dict[str, dict] = {
                  "scale_in": False,
                  # Two legs per round occupy two slots; four lets a second
                  # round's straddle open while the first is still settling.
-                 "max_concurrent_positions": 4},
+                 "max_concurrent_positions": 4,
+                 # THE gate. A round is entered only when both legs would pay
+                 # back more than the pair cost together -- UP wins and the
+                 # payout beats the whole stake, DOWN wins and it beats the
+                 # whole stake -- so the round's direction stops mattering.
+                 # That is a real condition, not a formality: it holds only
+                 # while the two fee-adjusted prices sum to under 1.00, so
+                 # most rounds are refused and the bot re-tests each one
+                 # every poll until its window closes. Expect long stretches
+                 # of no trades; --calibration-report and the periodic
+                 # "no trade in N rounds" summary are how you tell that
+                 # apart from a broken feed.
+                 "straddle_require_positive_worst_case": True,
+                 # 0.0 means "strictly more than the stake, by any margin".
+                 # Raise it to demand a minimum locked-in return -- 0.01 for
+                 # 1% of the pair, and correspondingly fewer rounds.
+                 "straddle_min_worst_case_return": 0.0},
 }
 
 
@@ -1164,6 +1230,10 @@ CEX_ACCOUNT_TYPES = ("SPOT", "FUNDING")
 class Side(str, Enum):
     UP = "UP"
     DOWN = "DOWN"
+
+    @property
+    def other(self) -> "Side":
+        return Side.DOWN if self is Side.UP else Side.UP
 
 
 @dataclass(frozen=True)
@@ -3744,6 +3814,92 @@ def straddle_worst_case_pnl(stake_up: float, stake_down: float,
     return min(pnl_if_up, pnl_if_down)
 
 
+def straddle_split(total: float, price_up: float, price_down: float,
+                   fee_bps: int) -> tuple[float, float]:
+    """
+    Divide `total` between the two legs so BOTH payouts come out equal.
+
+    Splitting a straddle 50/50 is the intuitive thing and it is wrong. What
+    matters is the PAYOUT each leg returns if it wins -- stake/price, net of
+    fee -- not the price paid, and an equal split ties the two payouts to
+    the two prices. Buy UP at 0.20 and DOWN at 0.70 with 5 USDT each and the
+    UP leg returns 25 while the DOWN leg returns 7.14 against 10 staked: one
+    outcome pays handsomely, the other is a guaranteed loss, so the pair is
+    a coin flip rather than the hedge it was supposed to be.
+
+    Weighting each leg by the OTHER leg's payout multiple equalises them.
+    Because 1/R(p) is exactly breakeven_probability(p, fee), the weights are
+    the two breakeven probabilities, and both legs then pay
+
+        total / (be_up + be_down)
+
+    whatever the outcome. That single expression is also the gate: the pair
+    returns more than it cost precisely when be_up + be_down < 1, which is
+    the fee-adjusted form of "the two prices sum to less than one". Sizing
+    this way is what makes an asymmetric pair like 0.20/0.70 tradable at
+    all -- 2.22 on UP and 7.78 on DOWN both return 11.11 against 10 staked,
+    an 11% locked-in return that the 50/50 split threw away.
+
+    Preconditions: total >= 0, both prices in (0, 1).
+    Postcondition: the two stakes sum to `total`.
+    """
+    if total < 0:
+        raise ValueError("total must be non-negative")
+    be_up = breakeven_probability(price_up, fee_bps)
+    be_down = breakeven_probability(price_down, fee_bps)
+    weight = be_up + be_down
+    return total * be_up / weight, total * be_down / weight
+
+
+def straddle_completion_stake(stake_open: float, price_open: float,
+                              price_other: float, fee_bps: int,
+                              budget: float) -> tuple[float, bool]:
+    """
+    What to stake on the second leg, and whether it locks the round in.
+
+    One leg is already filled: `stake_open` at `price_open`. Buying `b` of
+    the other side at `price_other` makes the round cost stake_open + b, and
+    the round is won either way only if BOTH payouts clear that total:
+
+        stake_open / be_open  >  stake_open + b        (the open leg wins)
+        b / be_other          >  stake_open + b        (the other leg wins)
+
+    writing be = breakeven_probability(price, fee), which is exactly the
+    reciprocal of the gross payout multiple. Those two inequalities bound b
+    from above and below, and a b satisfying both exists precisely when
+
+        be_open + be_other < 1
+
+    -- the fee-adjusted "the two prices sum to under one". Crucially the two
+    prices are from DIFFERENT moments, so this is a real condition rather
+    than the near-impossibility it is within a single order book.
+
+    Setting b = stake_open * be_other / be_open equalises the two payouts,
+    which both maximises the guaranteed profit and sits strictly inside the
+    feasible band whenever that band exists.
+
+    Returns (stake, guaranteed). `guaranteed` is False when the budget
+    cannot reach the band, or when the prices never allowed one -- the stake
+    is still returned, because part-hedging an open leg caps a loss that
+    would otherwise be the whole position.
+    """
+    if stake_open <= 0:
+        raise ValueError("stake_open must be positive")
+    if budget < 0:
+        raise ValueError("budget must be non-negative")
+    be_open = breakeven_probability(price_open, fee_bps)
+    be_other = breakeven_probability(price_other, fee_bps)
+
+    ideal = stake_open * be_other / be_open
+    stake = min(ideal, budget)
+    # Strict bounds: at either edge a payout merely equals what the round
+    # cost, which is capital at risk for nothing.
+    floor = (math.inf if be_other >= 1.0
+             else stake_open * be_other / (1.0 - be_other))
+    ceiling = stake_open * (1.0 - be_open) / be_open
+    return stake, floor < stake < ceiling
+
+
 # --------------------------------------------------------------------------
 # Runner
 # --------------------------------------------------------------------------
@@ -4049,6 +4205,16 @@ class Trader:
         elif top == "buffer too small for the time left":
             LOG.info("  Spot is not moving far enough from the strike. "
                      "Lower min_buffer_sigmas, or accept fewer setups.")
+        elif top == "both straddle payouts do not beat the stake":
+            LOG.info("  The two sides are priced to sum to 1.00 or more, so "
+                     "buying both is a guaranteed loss. This is the normal "
+                     "resting state of the straddle profile -- it is "
+                     "refusing rounds, not failing to see them. Nothing to "
+                     "fix unless it never clears.")
+        elif top == "straddle leg below the venue minimum":
+            LOG.info("  Sizing the pair by payout put one leg under the "
+                     "venue minimum. Raise straddle_stake_pct, or fund the "
+                     "wallet, so the cheap side still clears it.")
         elif top == "edge below the floor":
             LOG.info("  The venue is pricing these rounds close to the "
                      "model. That is a market with no edge in it, not a "
@@ -4196,24 +4362,349 @@ class Trader:
         else:
             self._maybe_enter_model(bankroll, mode)
 
+    def _straddle_payouts_clear(
+            self, raw: Round, prices: dict[Side, float],
+            stakes: dict[Side, float],
+            total: float) -> tuple[bool, float, str]:
+        """
+        Would this pair pay back more than it cost, whichever way it lands?
+
+        Returns (ok, worst_case_pnl, reason). `reason` is empty when ok, and
+        otherwise names the gate that bound, in the vocabulary _tally_missed
+        reports.
+
+        The question is about PAYOUTS, not prices. A leg staking `s` at
+        price `p` returns s/p net of fee if it wins, and the pair is only
+        worth holding when BOTH of those returns exceed the `total` staked
+        across the two -- that is what makes the round's outcome irrelevant,
+        which is the entire point of a straddle. straddle_worst_case_pnl
+        already computes min(payout_up, payout_down) - total, so the test is
+        simply that it come out positive.
+
+        The comparison is strict. "Pays back what it cost" is not the same
+        as "pays more than it cost", and at exactly break-even the round is
+        capital at risk for nothing.
+        """
+        for side, price in prices.items():
+            if not 0.0 < price <= self._cfg.straddle_max_leg_price:
+                return False, 0.0, "straddle leg priced above ceiling"
+            if stakes[side] < self._cfg.min_stake_usdt:
+                # Reachable through the split, not just through a small
+                # bankroll: weighting an asymmetric pair by payout can put
+                # the cheap leg under the venue minimum even when the pair
+                # as a whole is well funded.
+                return False, 0.0, "straddle leg below the venue minimum"
+
+        worst = straddle_worst_case_pnl(
+            stakes[Side.UP], stakes[Side.DOWN], prices[Side.UP],
+            prices[Side.DOWN], raw.fee_bps)
+        if (self._cfg.straddle_require_positive_worst_case
+                and worst <= total * self._cfg.straddle_min_worst_case_return):
+            return False, worst, "both straddle payouts do not beat the stake"
+        return True, worst, ""
+
+    def _book_price(self, raw: Round, side: Side) -> float:
+        """Best ask for one side, or a spread-widened mark if the book is bare."""
+        levels = self._client.asks_for(raw, side)
+        price = (levels[0][0] if levels
+                 else min(raw.quote_for(side)
+                          * (1.0 + self._cfg.assumed_spread_pct), 0.999))
+        return raw.round_price(price)
+
+    def _place_leg(self, raw: Round, side: Side, price: float, stake: float,
+                   quote: "Quote | None" = None
+                   ) -> tuple[float, float, str | None]:
+        """
+        Buy one side. Returns (fill price, stake filled, order id).
+
+        Paper mode fills at the passed price and places nothing.
+        """
+        order_id = None
+        if self._live:
+            if quote is None:
+                quote = self._client.get_quote(raw, side, stake)
+            order_id = self._client.place_order(raw, quote, stake)
+            price = quote.average_price
+            if self._cfg.confirm_fills:
+                try:
+                    stake = self._client.confirm_fill(order_id, stake)
+                except (ApiError, requests.RequestException) as exc:
+                    # Recorded at the requested size rather than dropped: the
+                    # order is placed, so the only question left is whether
+                    # the bot knows about it.
+                    LOG.error("Straddle %s: %s leg placed but the fill could "
+                              "not be confirmed (%s); recording it at the "
+                              "requested %.2f USDT",
+                              raw.slug, side.value, exc, stake)
+            if quote.fee_usdt > 0:
+                LOG.debug("Straddle %s %s fee %.4f USDT", raw.slug,
+                          side.value, quote.fee_usdt)
+        return price, stake, order_id
+
+    def _completion_is_worth_waiting_out(self, raw: Round, be_open: float,
+                                         be_other: float,
+                                         seconds_left: float) -> bool:
+        """
+        Is a price that already locks the round in still worth refusing?
+
+        Any second leg with be_other < 1 - be_open guarantees the round, but
+        they are not equally good: cheaper is more profit. Early in a round
+        there is time to hold out for the same 4x the first leg had to clear;
+        as the hedge deadline approaches there is not, and a smaller locked-in
+        profit beats an open directional bet. The bar slides between the two
+        rather than sitting at either extreme, because a fixed high bar
+        strands positions and a fixed low one takes the first crumb offered.
+        """
+        preferred = breakeven_probability(
+            self._cfg.straddle_first_leg_max_price, raw.fee_bps)
+        limit = 1.0 - be_open
+        if preferred >= limit:
+            # The open leg was not cheap enough to be choosy about the other.
+            return False
+        span = raw.duration_ms / 1000.0 - self._cfg.straddle_hedge_deadline_s
+        slack = seconds_left - self._cfg.straddle_hedge_deadline_s
+        urgency = (1.0 if span <= 0
+                   else 1.0 - max(0.0, min(1.0, slack / span)))
+        return be_other > preferred + urgency * (limit - preferred)
+
+    def _open_first_leg(self, raw: Round, legs: dict[Side, float],
+                        per_side: float, bankroll: float, mode: str,
+                        now_ms: int, since_open: float) -> bool:
+        """
+        Open whichever side is cheap enough to stand on its own.
+
+        UP and DOWN are interchangeable here and nothing prefers one to the
+        other: the side that meets the price is the side that gets bought,
+        and the round is completed later from the other end. A round whose
+        DOWN goes cheap first is the same trade as one whose UP does.
+
+        Cheap enough means straddle_first_leg_max_price -- 0.25 by default,
+        a 4x payout. That is not a preference dressed up as a rule: after
+        filling at p, the other side stays worth buying all the way up to
+        (1 - p), so a first leg at 0.25 leaves 0.75 of room to complete in,
+        while one at 0.45 leaves 0.55 and one at 0.49 leaves almost nothing.
+        The cheaper the entry, the likelier the round ever gets hedged.
+
+        Returns True if a leg was opened.
+        """
+        # Whichever is cheaper, with no tie to UP or DOWN.
+        side = min(legs, key=legs.get)
+        price = legs[side]
+        # Both ceilings bind. straddle_max_leg_price is the blunt "never pay
+        # more than this for anything" limit; the first-leg ceiling is the
+        # strategy's own, and is normally the tighter of the two.
+        ceiling = min(self._cfg.straddle_first_leg_max_price,
+                      self._cfg.straddle_max_leg_price)
+        if not 0.0 < price <= ceiling:
+            return False
+        stake = min(per_side, self._available(bankroll))
+        if stake < self._cfg.min_stake_usdt:
+            return False
+
+        quote = None
+        if self._live:
+            fresh = self._live_bankroll("straddle first leg")
+            if fresh is None or fresh < stake:
+                LOG.warning("Straddle %s: %.2f USDT needed to open the %s "
+                            "leg but the wallet holds %s", raw.slug, stake,
+                            side.value,
+                            "an unreadable balance" if fresh is None
+                            else "%.2f" % fresh)
+                return False
+            quote = self._client.get_quote(raw, side, stake)
+            if quote.average_price > ceiling:
+                LOG.info("Straddle %s: the %s quote at %.4f is dearer than "
+                         "the %.2f first-leg ceiling the book suggested; "
+                         "not opening", raw.slug, side.value,
+                         quote.average_price, ceiling)
+                return False
+            price = quote.average_price
+
+        self._watching.pop(raw.topic_id, None)
+        self._seen[raw.topic_id] = raw.end_ms
+        price, stake, order_id = self._place_leg(raw, side, price, stake,
+                                                 quote)
+        self._record_straddle_legs(raw, {side: (price, stake, order_id)},
+                                   bankroll, mode, now_ms)
+        LOG.info("STRADDLE LEG 1 %s | %s %.4f (%.2f) pays %.2f | now hunting "
+                 "%s under %.4f to lock the round in (%.0fs since open)",
+                 raw.slug, side.value, price, stake,
+                 stake / breakeven_probability(price, raw.fee_bps),
+                 side.other.value,
+                 1.0 - breakeven_probability(price, raw.fee_bps),
+                 since_open)
+        return True
+
+    def _complete_half_straddles(self, bankroll: float, mode: str,
+                                 now_ms: int) -> None:
+        """
+        Buy the missing side of any round holding only one leg.
+
+        This is the half of the strategy that makes it a strategy. The two
+        sides of a live book sum to about 1.00, so a pair bought in one
+        instant is nearly never profitable both ways -- but the sides move
+        independently over the five minutes of a round, and a leg bought at
+        0.25 early can be joined by the other side at 0.25 a minute later.
+        Neither price was ever available alongside the other.
+
+        Runs before any new round is opened, and is not subject to
+        max_concurrent_positions: completing a hedge REMOVES exposure, and
+        starving it of a slot in favour of opening fresh directional legs is
+        exactly backwards.
+        """
+        for (symbol, side), pos in list(self._positions.items()):
+            other = side.other
+            if (symbol, other) in self._positions:
+                continue
+            raw = pos.rnd
+            seconds_left = raw.seconds_remaining(now_ms)
+            if seconds_left <= 0:
+                continue
+
+            price = self._book_price(raw, other)
+            budget = self._available(bankroll)
+            stake, guaranteed = straddle_completion_stake(
+                pos.committed_usdt, pos.signal.fill_price, price,
+                raw.fee_bps, budget)
+            past_deadline = seconds_left <= self._cfg.straddle_hedge_deadline_s
+
+            if guaranteed:
+                if self._completion_is_worth_waiting_out(
+                        raw, breakeven_probability(pos.signal.fill_price,
+                                                   raw.fee_bps),
+                        breakeven_probability(price, raw.fee_bps),
+                        seconds_left):
+                    LOG.debug("%s: %s at %.4f would lock the round in, but "
+                              "there is still time to want it cheaper",
+                              raw.slug, other.value, price)
+                    continue
+            elif not past_deadline:
+                LOG.debug("%s: %s at %.4f cannot cover the %.2f already on "
+                          "%s (%.0fs left to find a price that can)",
+                          raw.slug, other.value, price, pos.committed_usdt,
+                          side.value, seconds_left)
+                continue
+            elif not self._cfg.straddle_force_hedge:
+                continue
+            else:
+                LOG.warning(
+                    "Straddle %s: no price for %s ever covered the %.2f on "
+                    "%s, and the round closes in %.0fs. Hedging at %.4f "
+                    "anyway -- the guaranteed profit is gone, but this is a "
+                    "bounded loss instead of an all-or-nothing bet.",
+                    raw.slug, other.value, pos.committed_usdt, side.value,
+                    seconds_left, price)
+
+            if stake < self._cfg.min_stake_usdt:
+                LOG.debug("%s: completing %s needs %.2f, under the %.2f "
+                          "venue minimum", raw.slug, other.value, stake,
+                          self._cfg.min_stake_usdt)
+                continue
+
+            quote = None
+            if self._live:
+                fresh = self._live_bankroll("straddle completion")
+                if fresh is None or fresh < stake:
+                    LOG.warning("Straddle %s: %.2f USDT needed to complete "
+                                "the %s side but the wallet holds %s",
+                                raw.slug, stake, other.value,
+                                "an unreadable balance" if fresh is None
+                                else "%.2f" % fresh)
+                    continue
+                quote = self._client.get_quote(raw, other, stake)
+                # Re-tested, NOT re-sized. place_order executes this quote's
+                # id, which is bound to the size it was asked for, so the
+                # only honest question is whether THIS trade still locks the
+                # round in at the price it will actually fill at.
+                if (straddle_worst_case_pnl(
+                        pos.committed_usdt, stake, pos.signal.fill_price,
+                        quote.average_price, raw.fee_bps) <= 0
+                        and not (past_deadline
+                                 and self._cfg.straddle_force_hedge)):
+                    LOG.info("Straddle %s: the %s quote at %.4f no longer "
+                             "covers the %.2f open on %s; still hunting",
+                             raw.slug, other.value, quote.average_price,
+                             pos.committed_usdt, side.value)
+                    continue
+
+            price, stake, order_id = self._place_leg(raw, other, price, stake,
+                                                     quote)
+            self._record_straddle_legs(raw, {other: (price, stake, order_id)},
+                                       bankroll, mode, now_ms)
+            total = pos.committed_usdt + stake
+            worst = straddle_worst_case_pnl(
+                pos.committed_usdt, stake, pos.signal.fill_price, price,
+                raw.fee_bps)
+            LOG.info("STRADDLE COMPLETE %s | %s %.4f (%.2f) then %s %.4f "
+                     "(%.2f) | either outcome pays %.2f on %.2f staked, "
+                     "worst case %+.2f (%.0fs before close)",
+                     raw.slug, side.value, pos.signal.fill_price,
+                     pos.committed_usdt, other.value, price, stake,
+                     total + worst, total, worst, seconds_left)
+
+    def _record_straddle_legs(
+            self, raw: Round,
+            filled: dict[Side, tuple[float, float, str | None]],
+            bankroll: float, mode: str, now_ms: int) -> None:
+        """Journal every leg that actually reached the venue."""
+        for side, (price, stake, order_id) in filled.items():
+            # model_prob/edge are meaningless for a strategy with no
+            # probability model; a neutral 0.5 keeps the journal schema and
+            # calibration_report's bucketing arithmetic valid without
+            # implying a directional forecast that was never made. edge is
+            # left as a simple descriptive read of how far the fill sat from
+            # a coin-flip breakeven -- not a signal this profile acted on.
+            sig = Signal(side, model_prob=0.5, fill_price=price,
+                         edge=0.5 - breakeven_probability(price, raw.fee_bps),
+                         stake_usdt=stake,
+                         seconds_left=raw.seconds_remaining(now_ms))
+            tid = self._journal.record(mode, raw, sig, spot=math.nan,
+                                       sigma=math.nan, bankroll=bankroll,
+                                       order_id=order_id)
+            self._positions[(raw.symbol, side)] = Position(
+                tid, raw, sig, stake, 1)
+
     def _maybe_enter_straddle(self, bankroll: float, mode: str) -> None:
         """
-        Buy BOTH sides in the first seconds of a round -- every round.
+        Buy both sides of a round -- usually at two different moments.
 
-        No model probability, no side is picked, and by default no price
-        judgement either: the strategy is that direction does not matter at
-        round-open, so second-guessing individual rounds on a formula is a
-        different, more timid strategy than the one this profile is for.
-        The two legs are two separate MARKET FOK orders -- this venue has no
-        limit order type -- fired back-to-back as close to round-open as
-        the poll loop notices the round, which is why speed matters more
-        here than anywhere else in the bot.
+        No model probability and no side is picked. The one thing asked of a
+        round is the payout test: whichever way it settles, the winning leg
+        must return more than the pair cost together. That makes direction
+        genuinely irrelevant, which is the only footing on which buying both
+        sides makes sense.
+
+        The catch is that a live book prices the two sides to sum to about
+        1.00, so a pair bought in ONE instant almost never passes that test.
+        Bought at two instants it can: the sides move independently over the
+        five minutes of a round, so UP at 0.25 while spot slides and DOWN at
+        0.25 after it bounces are both real prices that were simply never on
+        offer at the same time. So there are two ways in:
+
+          * both sides clear together right now -- taken immediately, sized
+            by straddle_split, with no legging risk at all. Rare.
+          * one side is cheap enough on its own (straddle_first_leg_max_price,
+            a 4x payout by default) -- opened alone, and completed later by
+            _complete_half_straddles once the other side becomes worth
+            buying. That is the path this profile actually trades.
+
+        Opening is confined to straddle_entry_window_s; completing is not,
+        and runs until straddle_hedge_deadline_s before settlement.
+
+        Legs are separate MARKET FOK orders -- this venue has no limit order
+        type -- so in live mode every leg is quoted and re-tested against the
+        price that will actually execute before the order goes out.
         """
-        if len(self._positions) >= self._cfg.max_concurrent_positions:
-            return
-
         now_ms = self._client.now_ms()
         self._prune(now_ms)
+        # Before anything else, and deliberately outside the concurrency cap:
+        # an open leg with no partner is the only directional exposure this
+        # profile ever carries, and closing that gap beats opening new rounds
+        # every time.
+        self._complete_half_straddles(bankroll, mode, now_ms)
+
+        if len(self._positions) >= self._cfg.max_concurrent_positions:
+            return
 
         available = self._available(bankroll)
         per_side = bankroll * self._cfg.straddle_stake_pct
@@ -4244,8 +4735,8 @@ class Trader:
         for raw in self._client.list_rounds():
             if raw.topic_id in self._seen:
                 continue
-            # Both legs are opened together or not at all, so "already
-            # holding this market" means either key is present.
+            # A market already holding a leg belongs to
+            # _complete_half_straddles, which ran above.
             if any(k[0] == raw.symbol for k in self._positions):
                 continue
 
@@ -4264,112 +4755,119 @@ class Trader:
                                  0.999))
                 legs[side] = raw.round_price(price)
 
-            if not all(0.0 < p <= self._cfg.straddle_max_leg_price
-                      for p in legs.values()):
-                LOG.debug("%s: leg price(s) UP %.4f / DOWN %.4f above the "
-                          "%.2f straddle ceiling; skipping", raw.slug,
-                          legs[Side.UP], legs[Side.DOWN],
-                          self._cfg.straddle_max_leg_price)
-                self._watching[raw.topic_id] = (
-                    raw.end_ms, "straddle leg priced above ceiling")
+            # Recomputed per round, not once per pass: entering one round
+            # commits capital that the next round in the same pass must not
+            # be sized against as though it were still free.
+            free = self._available(bankroll)
+            total = min(per_side * 2.0, free)
+            stakes = dict(zip((Side.UP, Side.DOWN),
+                              straddle_split(total, legs[Side.UP],
+                                             legs[Side.DOWN], raw.fee_bps)))
+            ok, worst, reason = self._straddle_payouts_clear(
+                raw, legs, stakes, total)
+            if not ok:
+                LOG.debug("%s: %s (UP %.4f / DOWN %.4f, %.2f + %.2f staked)",
+                          raw.slug, reason, legs[Side.UP], legs[Side.DOWN],
+                          stakes[Side.UP], stakes[Side.DOWN])
+                # The normal case, not a failure: the two sides of one book
+                # sum to about 1.00. Take whichever side is cheap enough to
+                # stand on its own and let the completion pass find the
+                # other one at a price that never coexisted with this one.
+                if self._open_first_leg(raw, legs, per_side, bankroll, mode,
+                                        now_ms, since_open):
+                    continue
+                self._watching[raw.topic_id] = (raw.end_ms, reason)
                 continue
 
-            stake_up = stake_down = min(per_side, available / 2.0)
-            total = stake_up + stake_down
-            # Computed either way -- it is useful in the log and in the
-            # journal-adjacent picture of the round -- but only used to
-            # BLOCK entry when straddle_require_positive_worst_case is
-            # explicitly turned on. Off by default: every round in the
-            # window is taken regardless of what this number says, because
-            # requiring a guaranteed win up front is what would make the bot
-            # sit out most rounds, and whether the underlying edge is real
-            # is a question for --calibration-report, not a formula applied
-            # before a single trade has been observed.
-            worst = straddle_worst_case_pnl(
-                stake_up, stake_down, legs[Side.UP], legs[Side.DOWN],
-                raw.fee_bps)
-            if (self._cfg.straddle_require_positive_worst_case
-                    and worst < total * self._cfg.straddle_min_worst_case_return):
-                LOG.debug("%s: worst case %+.2f on %.2f staked (UP %.4f / "
-                          "DOWN %.4f) does not clear the floor; skipping",
-                          raw.slug, worst, total, legs[Side.UP],
-                          legs[Side.DOWN])
-                self._watching[raw.topic_id] = (
-                    raw.end_ms, "straddle worst case below floor")
-                continue
+            # Live pricing is a second opinion that can disagree with the
+            # book: a quote average price carries the impact of THIS size,
+            # which the top-of-book level does not. Both quotes are taken
+            # BEFORE either order is placed -- quotes are non-binding and
+            # place nothing -- and the gate is then re-tested against the
+            # prices that will actually execute. Testing the book but
+            # executing the quote is how a pair that cleared on paper turns
+            # into a guaranteed loss in the account.
+            quotes: dict[Side, Quote] = {}
+            if self._live:
+                fresh = self._live_bankroll("straddle entry")
+                if fresh is None or fresh < total:
+                    LOG.warning("Straddle %s: %.2f USDT needed for the pair "
+                                "but the wallet holds %s; entering neither "
+                                "side", raw.slug, total,
+                                "an unreadable balance" if fresh is None
+                                else "%.2f" % fresh)
+                    continue
+                for side in (Side.UP, Side.DOWN):
+                    quotes[side] = self._client.get_quote(raw, side,
+                                                          stakes[side])
+                quoted = {side: q.average_price for side, q in quotes.items()}
+                ok, worst, reason = self._straddle_payouts_clear(
+                    raw, quoted, stakes, total)
+                if not ok:
+                    LOG.info("Straddle %s: %s once quoted (UP %.4f / DOWN "
+                             "%.4f against a book of %.4f / %.4f); entering "
+                             "neither side", raw.slug, reason,
+                             quoted[Side.UP], quoted[Side.DOWN],
+                             legs[Side.UP], legs[Side.DOWN])
+                    self._watching[raw.topic_id] = (raw.end_ms, reason)
+                    continue
+                legs = quoted
 
             self._watching.pop(raw.topic_id, None)
             self._seen[raw.topic_id] = raw.end_ms
 
+            # try/finally, not a plain loop: once the first order is placed
+            # that money is committed whatever happens to the second, and an
+            # earlier version discarded the whole filled map on any abort --
+            # leaving a real, unhedged live position that was never
+            # journalled, never settled and never claimed. Anything that
+            # filled gets recorded before the failure is allowed to surface.
             filled: dict[Side, tuple[float, float, str | None]] = {}
-            aborted = False
-            for side in (Side.UP, Side.DOWN):
-                price = legs[side]
-                stake = stake_up if side is Side.UP else stake_down
-                order_id = None
-                if self._live:
-                    fresh = self._live_bankroll("straddle entry")
-                    if fresh is None or stake > fresh:
-                        LOG.warning(
-                            "Straddle %s: cannot fund the %s leg; not "
-                            "entering either side", raw.slug, side.value)
-                        aborted = True
-                        break
-                    quote = self._client.get_quote(raw, side, stake)
-                    if quote.average_price > self._cfg.straddle_max_leg_price:
-                        LOG.info("Straddle %s: %s quote %.4f above ceiling; "
-                                 "not entering either side", raw.slug,
-                                 side.value, quote.average_price)
-                        aborted = True
-                        break
-                    order_id = self._client.place_order(raw, quote, stake)
-                    if self._cfg.confirm_fills:
-                        try:
-                            got = self._client.confirm_fill(order_id, stake)
-                        except (ApiError, requests.RequestException) as exc:
-                            LOG.error(
-                                "Straddle %s: %s leg order placed but NOT "
-                                "confirmed (%s). %s already committed if "
-                                "the first leg -- this round is now a "
-                                "one-sided bet, not a hedge.", raw.slug,
-                                side.value, exc,
-                                "Nothing" if not filled
-                                else "The other leg is")
-                            continue
+            try:
+                for side in (Side.UP, Side.DOWN):
+                    price, stake, order_id = legs[side], stakes[side], None
+                    if self._live:
+                        quote = quotes[side]
+                        order_id = self._client.place_order(raw, quote, stake)
                         price = quote.average_price
-                        stake = got
-                    if quote.fee_usdt > 0:
-                        LOG.debug("Straddle %s %s fee %.4f USDT", raw.slug,
-                                  side.value, quote.fee_usdt)
-                filled[side] = (price, stake, order_id)
+                        if self._cfg.confirm_fills:
+                            try:
+                                stake = self._client.confirm_fill(order_id,
+                                                                  stake)
+                            except (ApiError,
+                                    requests.RequestException) as exc:
+                                # Recorded at the requested size rather than
+                                # dropped: the order is placed, so the only
+                                # question is whether the bot knows about it.
+                                LOG.error(
+                                    "Straddle %s: %s leg placed but the fill "
+                                    "could not be confirmed (%s); recording "
+                                    "it at the requested %.2f USDT",
+                                    raw.slug, side.value, exc, stake)
+                        if quote.fee_usdt > 0:
+                            LOG.debug("Straddle %s %s fee %.4f USDT",
+                                      raw.slug, side.value, quote.fee_usdt)
+                    filled[side] = (price, stake, order_id)
+            finally:
+                # Inside the finally, so a leg that reached the venue is
+                # journalled even when the exception from the other one is
+                # about to unwind this whole call.
+                self._record_straddle_legs(raw, filled, bankroll, mode,
+                                           now_ms)
+                if len(filled) == 1:
+                    only = next(iter(filled))
+                    LOG.error("Straddle %s: only the %s leg opened. This "
+                              "round is now a one-sided directional bet, "
+                              "not a hedge, and the payout gate no longer "
+                              "holds.", raw.slug, only.value)
 
-            if aborted:
-                continue
-
-            for side, (price, stake, order_id) in filled.items():
-                # model_prob/edge are meaningless for a strategy with no
-                # probability model; a neutral 0.5 keeps the journal schema
-                # and calibration_report's bucketing arithmetic valid
-                # without implying a directional forecast that was never
-                # made. edge is left as a simple descriptive read of how
-                # far the fill sat from a coin-flip breakeven -- not a
-                # signal this profile acted on.
-                sig = Signal(side, model_prob=0.5, fill_price=price,
-                            edge=0.5 - breakeven_probability(price,
-                                                             raw.fee_bps),
-                            stake_usdt=stake,
-                            seconds_left=raw.seconds_remaining(now_ms))
-                tid = self._journal.record(mode, raw, sig, spot=math.nan,
-                                           sigma=math.nan, bankroll=bankroll,
-                                           order_id=order_id)
-                self._positions[(raw.symbol, side)] = Position(
-                    tid, raw, sig, stake, 1)
-
-            LOG.info("STRADDLE %s | UP %.4f (%.2f) / DOWN %.4f (%.2f) | "
-                     "worst-case %+.2f on %.2f staked (%.0fs since open)",
-                     raw.slug, legs[Side.UP], filled[Side.UP][1],
-                     legs[Side.DOWN], filled[Side.DOWN][1], worst, total,
-                     since_open)
+            if len(filled) == 2:
+                LOG.info("STRADDLE %s | UP %.4f (%.2f) / DOWN %.4f (%.2f) | "
+                         "either outcome pays %.2f on %.2f staked, worst "
+                         "case %+.2f (%.0fs since open)",
+                         raw.slug, legs[Side.UP], filled[Side.UP][1],
+                         legs[Side.DOWN], filled[Side.DOWN][1],
+                         total + worst, total, worst, since_open)
 
             if len(self._positions) >= self._cfg.max_concurrent_positions:
                 return

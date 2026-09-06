@@ -6187,6 +6187,98 @@ def straddle_cfg(**kw) -> Config:
     return Config(**base)
 
 
+class TestStraddleSplit(unittest.TestCase):
+
+    def test_the_split_spends_the_whole_budget(self):
+        up, down = m.straddle_split(10.0, 0.20, 0.70, 0)
+        self.assertAlmostEqual(up + down, 10.0, places=9)
+
+    def test_both_legs_are_sized_to_the_same_payout(self):
+        """
+        The property the whole gate rests on: after the split the round's
+        direction stops mattering, because either outcome pays the same.
+        """
+        for price_up, price_down, fee in [(0.20, 0.70, 0), (0.45, 0.52, 0),
+                                          (0.30, 0.60, 200), (0.49, 0.49, 50)]:
+            up, down = m.straddle_split(10.0, price_up, price_down, fee)
+            pay_up = up + m.settle_pnl(up, price_up, True, fee)
+            pay_down = down + m.settle_pnl(down, price_down, True, fee)
+            self.assertAlmostEqual(pay_up, pay_down, places=9)
+
+    def test_an_equal_split_would_have_missed_this_pair(self):
+        """
+        0.20/0.70 sums under 1.00, so it is genuinely profitable -- but only
+        weighted. This is the money the old 50/50 sizing left on the table.
+        """
+        up, down = m.straddle_split(10.0, 0.20, 0.70, 0)
+        self.assertGreater(m.straddle_worst_case_pnl(up, down, 0.20, 0.70, 0),
+                           0.0)
+        self.assertLess(m.straddle_worst_case_pnl(5.0, 5.0, 0.20, 0.70, 0),
+                        0.0)
+
+    def test_prices_summing_over_one_cannot_be_saved_by_any_split(self):
+        self.assertLess(
+            m.straddle_worst_case_pnl(
+                *m.straddle_split(10.0, 0.55, 0.55, 0), 0.55, 0.55, 0),
+            0.0)
+
+    def test_the_fee_is_taken_out_of_the_payout(self):
+        args = (10.0, 0.48, 0.48)
+        free = m.straddle_worst_case_pnl(*m.straddle_split(*args, 0),
+                                         0.48, 0.48, 0)
+        charged = m.straddle_worst_case_pnl(*m.straddle_split(*args, 300),
+                                            0.48, 0.48, 300)
+        self.assertLess(charged, free)
+
+
+class TestStraddleCompletion(unittest.TestCase):
+
+    def test_both_payouts_come_out_equal_and_beat_the_pair(self):
+        for open_price, other_price, fee in [(0.25, 0.35, 0), (0.30, 0.15, 0),
+                                             (0.25, 0.60, 200),
+                                             (0.10, 0.85, 50)]:
+            stake, ok = m.straddle_completion_stake(4.0, open_price,
+                                                    other_price, fee, 1e9)
+            self.assertTrue(ok, f"{open_price}/{other_price} should clear")
+            pay_open = 4.0 / m.breakeven_probability(open_price, fee)
+            pay_other = stake / m.breakeven_probability(other_price, fee)
+            self.assertAlmostEqual(pay_open, pay_other, places=9)
+            self.assertGreater(pay_open, 4.0 + stake)
+
+    def test_a_price_that_cannot_cover_the_open_leg_is_flagged(self):
+        _, ok = m.straddle_completion_stake(4.0, 0.25, 0.80, 0, 1e9)
+        self.assertFalse(ok)
+
+    def test_a_budget_short_of_the_band_is_flagged_but_still_sized(self):
+        """
+        The hedge that caps a loss without locking a profit: worth placing
+        at the deadline, but never mistaken for a guarantee.
+        """
+        stake, ok = m.straddle_completion_stake(4.0, 0.25, 0.60, 0,
+                                                budget=1.0)
+        self.assertFalse(ok)
+        self.assertEqual(stake, 1.0)
+
+    def test_a_cheaper_second_leg_needs_less_money(self):
+        cheap, _ = m.straddle_completion_stake(4.0, 0.25, 0.20, 0, 1e9)
+        dear, _ = m.straddle_completion_stake(4.0, 0.25, 0.60, 0, 1e9)
+        self.assertLess(cheap, dear)
+
+    def test_the_order_the_two_sides_arrive_in_does_not_matter(self):
+        """
+        0.30 then 0.15 and 0.15 then 0.30 are the same trade. Only the leg
+        sizes differ, and both lock the same profit in.
+        """
+        a, ok_a = m.straddle_completion_stake(4.0, 0.30, 0.15, 0, 1e9)
+        b, ok_b = m.straddle_completion_stake(4.0, 0.15, 0.30, 0, 1e9)
+        self.assertTrue(ok_a and ok_b)
+        for stake_open, price_open, stake_other, price_other in [
+                (4.0, 0.30, a, 0.15), (4.0, 0.15, b, 0.30)]:
+            worst = m.straddle_worst_case_pnl(stake_open, stake_other,
+                                              price_open, price_other, 0)
+            self.assertGreater(worst, 0.0)
+
+
 class TestStraddleConfig(unittest.TestCase):
 
     def test_straddle_and_scale_in_cannot_both_be_on(self):
@@ -6253,9 +6345,33 @@ class TestStraddleConfig(unittest.TestCase):
         rounds = c.max_concurrent_positions // 2
         self.assertGreaterEqual(spendable, per_round * min(rounds, 2))
 
-    def test_the_straddle_profile_does_not_gate_on_worst_case_by_default(self):
+    def test_the_straddle_profile_gates_on_the_payout_test(self):
+        """
+        The gate is the profile. Without it the bot buys both sides of any
+        round at any price, which is a coin flip paying a fee, not a hedge.
+        """
         c = straddle_cfg()
-        self.assertFalse(c.straddle_require_positive_worst_case)
+        self.assertTrue(c.straddle_require_positive_worst_case)
+        self.assertEqual(c.straddle_min_worst_case_return, 0.0)
+
+
+class QuotingClient(FakeClient):
+    """FakeClient whose quotes can differ per side, and can fail to place."""
+
+    def __init__(self, *a, quotes=None, fail_order_after=None, **kw):
+        super().__init__(*a, **kw)
+        self._quotes = quotes or {}
+        self._fail_after = fail_order_after
+
+    def get_quote(self, rnd, side, stake):
+        price = self._quotes.get(side, 0.51)
+        return m.Quote("q-" + side.value, price, stake / price, 0.001, 0.0)
+
+    def place_order(self, rnd, quote, stake_usdt=None):
+        if (self._fail_after is not None
+                and len(self.orders) >= self._fail_after):
+            raise m.ApiError("venue rejected the order")
+        return super().place_order(rnd, quote, stake_usdt)
 
 
 class TestStraddleEntry(unittest.TestCase):
@@ -6291,11 +6407,12 @@ class TestStraddleEntry(unittest.TestCase):
         self.assertFalse(called["straddle"])
         self.assertTrue(called["model"])
 
-    def test_both_legs_are_bought_regardless_of_price(self):
+    def test_a_pair_that_cannot_pay_back_the_stake_is_refused(self):
         """
-        No price judgement by default: even a round priced as a guaranteed
-        loss either way is entered, because second-guessing rounds on a
-        formula is a different, more timid strategy than this profile is.
+        Two legs at 0.70 cost more together than either can return: 20 on
+        each pays 28.57 back against 40 staked, whichever way it lands. That
+        is a guaranteed loss dressed up as a hedge, and it is the whole
+        reason the gate exists.
         """
         start = 1_700_000_000_000
         rnd = make_round(strike=100_000.0, start_ms=start,
@@ -6308,11 +6425,60 @@ class TestStraddleEntry(unittest.TestCase):
 
         t._maybe_enter(100.0, "PAPER")
 
+        self.assertEqual(t._positions, {})
+        self.assertEqual(t._watching[1][1],
+                         "both straddle payouts do not beat the stake")
+        # Refused, not written off: the round stays out of _seen so every
+        # later poll inside the window re-prices it.
+        self.assertNotIn(1, t._seen)
+
+    def test_a_break_even_pair_is_refused(self):
+        """
+        0.50/0.50 with no fee returns exactly what it cost. "More than the
+        stake" is the gate, so break-even is capital at risk for nothing.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.50, 10_000)],
+                 (1, Side.DOWN): [(0.50, 10_000)]}
+        client = FakeClient([rnd], [(start, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(t._positions, {})
+
+    def test_an_asymmetric_pair_is_sized_so_both_payouts_clear(self):
+        """
+        The case an equal split throws away. UP at 0.20 and DOWN at 0.70 sum
+        to 0.90, so the pair IS profitable -- but only if the stakes are
+        weighted. Split 20/20 the DOWN leg returns 28.57 against 40 staked
+        and the round is a coin flip; weighted, both sides pay the same and
+        both beat the stake.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.20, 10_000)],
+                 (1, Side.DOWN): [(0.70, 10_000)]}
+        client = FakeClient([rnd], [(start, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+
         self.assertEqual(sorted(t._positions),
                          [("BTCUSDT", Side.DOWN), ("BTCUSDT", Side.UP)])
-        for key, pos in t._positions.items():
-            self.assertAlmostEqual(pos.signal.fill_price, 0.70, places=9)
-            self.assertAlmostEqual(pos.signal.stake_usdt, 20.0, places=9)
+        up = t._positions[("BTCUSDT", Side.UP)].signal
+        down = t._positions[("BTCUSDT", Side.DOWN)].signal
+        self.assertLess(up.stake_usdt, down.stake_usdt)
+        total = up.stake_usdt + down.stake_usdt
+        self.assertAlmostEqual(total, 40.0, places=9)
+        for sig in (up, down):
+            payout = sig.stake_usdt / sig.fill_price
+            self.assertGreater(payout, total)
 
     def test_a_small_live_bankroll_still_clears_the_per_leg_minimum(self):
         """
@@ -6324,8 +6490,8 @@ class TestStraddleEntry(unittest.TestCase):
         rnd = make_round(strike=100_000.0, start_ms=start,
                          end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
                          fee_bps=0)
-        books = {(1, Side.UP): [(0.50, 10_000)],
-                 (1, Side.DOWN): [(0.50, 10_000)]}
+        books = {(1, Side.UP): [(0.45, 10_000)],
+                 (1, Side.DOWN): [(0.45, 10_000)]}
         t = self._trader(FakeClient([rnd], [(start, 100_000.0)], books, {}))
 
         t._maybe_enter(20.0, "PAPER")
@@ -6350,16 +6516,244 @@ class TestStraddleEntry(unittest.TestCase):
                             up_token_id="3", down_token_id="4",
                             feed_symbol="ETHUSDT",
                             start_ms=start, end_ms=end, fee_bps=0)
-        books = {(1, Side.UP): [(0.50, 10_000)],
-                 (1, Side.DOWN): [(0.50, 10_000)],
-                 (2, Side.UP): [(0.50, 10_000)],
-                 (2, Side.DOWN): [(0.50, 10_000)]}
+        books = {(1, Side.UP): [(0.45, 10_000)],
+                 (1, Side.DOWN): [(0.45, 10_000)],
+                 (2, Side.UP): [(0.45, 10_000)],
+                 (2, Side.DOWN): [(0.45, 10_000)]}
         client = FakeClient([first, second], [(start, 100_000.0)], books, {})
         t = self._trader(client)
 
         t._maybe_enter(100.0, "PAPER")
 
         self.assertEqual(len(t._positions), 4)
+
+    def test_a_round_is_repriced_every_poll_until_its_window_shuts(self):
+        """
+        The waiting the profile depends on. At 0.55/0.55 the pair is a
+        guaranteed loss and is refused -- but not written off. Seconds later
+        the book has moved to 0.45/0.45 and the same round is taken.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.55, 10_000)],
+                 (1, Side.DOWN): [(0.55, 10_000)]}
+        # Two polls, five seconds apart, both inside the 15s window.
+        client = FakeClient([rnd], [(start + 2_000, 100_000.0),
+                                    (start + 7_000, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        self.assertNotIn(1, t._seen)
+
+        books[(1, Side.UP)] = [(0.45, 10_000)]
+        books[(1, Side.DOWN)] = [(0.45, 10_000)]
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(len(t._positions), 2)
+
+    def test_the_two_legs_are_bought_at_two_different_moments(self):
+        """
+        The whole strategy, start to finish. UP is cheap early and DOWN is
+        not; a minute later DOWN is cheap and UP is not. Neither price was
+        ever on offer beside the other, and the pair still wins either way.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.25, 10_000)],
+                 (1, Side.DOWN): [(0.80, 10_000)]}
+        client = FakeClient([rnd], [(start + 3_000, 100_000.0),
+                                    (start + 90_000, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+        up = t._positions[("BTCUSDT", Side.UP)]
+
+        # The book turns over: DOWN is now the cheap side. UP at 0.25 and
+        # DOWN at 0.25 were never on offer at the same moment.
+        books[(1, Side.UP)] = [(0.82, 10_000)]
+        books[(1, Side.DOWN)] = [(0.25, 10_000)]
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(sorted(t._positions),
+                         [("BTCUSDT", Side.DOWN), ("BTCUSDT", Side.UP)])
+        down = t._positions[("BTCUSDT", Side.DOWN)]
+        total = up.committed_usdt + down.committed_usdt
+        for pos in (up, down):
+            payout = pos.committed_usdt / pos.signal.fill_price
+            self.assertGreater(payout, total)
+
+    def test_a_second_leg_that_cannot_cover_the_first_is_refused(self):
+        """
+        0.25 then 0.80 sums past 1.00: no stake on the second leg makes both
+        payouts clear, so the open leg is left alone to keep waiting.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.25, 10_000)],
+                 (1, Side.DOWN): [(0.80, 10_000)]}
+        client = FakeClient([rnd], [(start + 3_000, 100_000.0),
+                                    (start + 90_000, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+
+    def test_the_second_leg_holds_out_early_and_settles_for_less_late(self):
+        """
+        A price that merely locks the round in is refused while there is
+        still time to want the same 4x the first leg had to clear, and taken
+        once there is not.
+        """
+        start = 1_700_000_000_000
+        end = start + (m.DEFAULT_ROUND_SECONDS * 1000)
+        rnd = make_round(strike=100_000.0, start_ms=start, end_ms=end,
+                         fee_bps=0)
+        # 0.80 does not clear beside 0.25, so UP opens on its own.
+        books = {(1, Side.UP): [(0.25, 10_000)],
+                 (1, Side.DOWN): [(0.80, 10_000)]}
+        client = FakeClient([rnd], [(start + 3_000, 100_000.0),
+                                    (start + 15_000, 100_000.0),
+                                    (end - 40_000, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+
+        # 0.70 clears the guarantee (0.25 + 0.70 < 1.00) but is nowhere near
+        # 0.25, and there are still four minutes to find something better.
+        books[(1, Side.DOWN)] = [(0.70, 10_000)]
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+
+        # Same price, almost no time left: take the locked-in profit.
+        client.t = 2
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(len(t._positions), 2)
+
+    def test_an_unhedgeable_leg_is_hedged_at_market_at_the_deadline(self):
+        """
+        No price ever covered the open leg. Rather than ride a one-sided bet
+        to settlement, buy the other side and take a bounded loss.
+        """
+        start = 1_700_000_000_000
+        end = start + (m.DEFAULT_ROUND_SECONDS * 1000)
+        rnd = make_round(strike=100_000.0, start_ms=start, end_ms=end,
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.25, 10_000)],
+                 (1, Side.DOWN): [(0.90, 10_000)]}
+        client = FakeClient([rnd], [(start + 3_000, 100_000.0),
+                                    (end - 10_000, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+
+        client.t = 1                     # inside straddle_hedge_deadline_s
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(len(t._positions), 2)
+
+    def test_a_naked_leg_can_be_left_to_ride_when_that_is_configured(self):
+        start = 1_700_000_000_000
+        end = start + (m.DEFAULT_ROUND_SECONDS * 1000)
+        rnd = make_round(strike=100_000.0, start_ms=start, end_ms=end,
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.25, 10_000)],
+                 (1, Side.DOWN): [(0.90, 10_000)]}
+        client = FakeClient([rnd], [(start + 3_000, 100_000.0),
+                                    (end - 10_000, 100_000.0)], books, {})
+        t = self._trader(client, straddle_force_hedge=False)
+
+        t._maybe_enter(100.0, "PAPER")
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+
+    def test_completing_a_hedge_is_not_blocked_by_the_position_cap(self):
+        """
+        Slots exist to limit exposure. A completing leg REDUCES it, so it
+        must not queue behind the cap that new rounds respect.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.25, 10_000)],
+                 (1, Side.DOWN): [(0.80, 10_000)]}
+        client = FakeClient([rnd], [(start + 3_000, 100_000.0),
+                                    (start + 90_000, 100_000.0)], books, {})
+        t = self._trader(client, max_concurrent_positions=1)
+
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(len(t._positions), 1)
+
+        books[(1, Side.DOWN)] = [(0.25, 10_000)]
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(len(t._positions), 2)   # cap is 1, hedge still ran
+
+    def test_the_gate_is_retested_against_the_live_quotes(self):
+        """
+        The book says 0.45/0.45; the quotes come back at 0.55 each. Gating
+        on the book and executing on the quote is how a pair that cleared on
+        paper becomes a guaranteed loss in the account, so nothing is placed.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.45, 10_000)],
+                 (1, Side.DOWN): [(0.45, 10_000)]}
+        client = QuotingClient([rnd], [(start, 100_000.0)], books, {},
+                               quotes={Side.UP: 0.55, Side.DOWN: 0.55})
+        t = self._trader(client, live=True)
+        t._active_live = True
+
+        t._maybe_enter(100.0, "LIVE")
+
+        self.assertEqual(t._positions, {})
+        self.assertEqual(client.orders, [])   # quotes place nothing
+        self.assertEqual(t._watching[1][1],
+                         "both straddle payouts do not beat the stake")
+
+    def test_a_leg_that_opens_before_the_other_fails_is_still_recorded(self):
+        """
+        Regression: the second order failing used to discard the whole fill
+        map, leaving the FIRST leg live on the venue but absent from the
+        journal -- unhedged, unsettled and never claimed.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.45, 10_000)],
+                 (1, Side.DOWN): [(0.45, 10_000)]}
+        client = QuotingClient([rnd], [(start, 100_000.0)], books, {},
+                               quotes={Side.UP: 0.45, Side.DOWN: 0.45},
+                               fail_order_after=1)
+        t = self._trader(client, live=True)
+        t._active_live = True
+
+        with self.assertRaises(m.ApiError):
+            t._maybe_enter(100.0, "LIVE")
+
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
 
     def test_both_legs_settle_independently_and_correctly(self):
         start = 1_700_000_000_000
@@ -6400,11 +6794,12 @@ class TestStraddleEntry(unittest.TestCase):
         self.assertEqual(t._positions, {})
         self.assertIn(1, t._seen)   # late is a different, unvalidated bet
 
-    def test_optional_ceiling_can_still_block_a_leg_when_opted_in(self):
+    def test_the_ceiling_blocks_a_round_whose_cheap_side_is_dear(self):
+        """Nothing opens when even the cheaper side is above the ceiling."""
         start = 1_700_000_000_000
         rnd = make_round(strike=100_000.0, start_ms=start,
                          end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
-        books = {(1, Side.UP): [(0.10, 10_000)],
+        books = {(1, Side.UP): [(0.60, 10_000)],
                  (1, Side.DOWN): [(0.90, 10_000)]}
         client = FakeClient([rnd], [(start, 100_000.0)], books, {})
         t = self._trader(client, straddle_max_leg_price=0.55)
@@ -6414,6 +6809,41 @@ class TestStraddleEntry(unittest.TestCase):
         self.assertEqual(t._positions, {})
         self.assertEqual(t._watching[1][1],
                          "straddle leg priced above ceiling")
+
+    def test_a_cheap_side_is_opened_alone_even_when_the_other_is_dear(self):
+        """
+        The heart of the strategy. UP at 0.10 pays 10x; DOWN at 0.90 is
+        simply not bought yet. Waiting for both to be cheap AT ONCE is what
+        makes this profile do nothing, because a live book never offers it.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        books = {(1, Side.UP): [(0.10, 10_000)],
+                 (1, Side.DOWN): [(0.90, 10_000)]}
+        client = FakeClient([rnd], [(start, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+
+    def test_the_opener_is_whichever_side_is_cheap_never_a_fixed_one(self):
+        """
+        UP and DOWN are interchangeable. The same book mirrored has to open
+        the other side, or the strategy has a directional bias it never
+        claimed to have.
+        """
+        start = 1_700_000_000_000
+        for cheap in (Side.UP, Side.DOWN):
+            rnd = make_round(strike=100_000.0, start_ms=start,
+                             end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+            books = {(1, cheap): [(0.20, 10_000)],
+                     (1, cheap.other): [(0.85, 10_000)]}
+            t = self._trader(FakeClient([rnd], [(start, 100_000.0)],
+                                        books, {}))
+            t._maybe_enter(100.0, "PAPER")
+            self.assertEqual(list(t._positions), [("BTCUSDT", cheap)])
 
     def test_optional_worst_case_floor_can_still_block_when_opted_in(self):
         start = 1_700_000_000_000
@@ -6428,7 +6858,8 @@ class TestStraddleEntry(unittest.TestCase):
         t._maybe_enter(100.0, "PAPER")
 
         self.assertEqual(t._positions, {})
-        self.assertEqual(t._watching[1][1], "straddle worst case below floor")
+        self.assertEqual(t._watching[1][1],
+                         "both straddle payouts do not beat the stake")
 
     def test_scale_in_never_runs_for_a_straddle_position(self):
         start = 1_700_000_000_000
