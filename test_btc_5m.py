@@ -571,6 +571,70 @@ class TestRiskManager(unittest.TestCase):
         self.assertEqual(r.external_flow, 0.0)
         self.assertEqual(r.realised_pnl, 0.0)
 
+    def test_price_movement_on_an_open_position_is_not_an_external_flow(self):
+        """
+        The reported bug. A wallet-funded account reads its balance from the
+        portfolio's totalCurrentValue, which marks open positions to MARKET,
+        while reconciliation knows them at COST. Every tick of the underlying
+        was booked as a deposit or a withdrawal and rebased the day baseline,
+        with no trade taking place at all.
+        """
+        r = RiskManager(cfg(), 20.0)
+        # A 4.00 leg filled at 0.25 = 16 shares; 16.00 USDT cash left over.
+        for price in (0.25, 0.30, 0.22, 0.31):
+            r.check(16.00 + 16.0 * price, 4.00)
+        self.assertEqual(r.external_flow, 0.0)
+        self.assertAlmostEqual(r._day_start_bankroll, 20.0, places=9)
+
+    def test_an_open_stake_is_not_an_external_flow_in_paper_either(self):
+        """
+        Same symptom, different cause: _paper_bankroll is not debited when a
+        stake goes out, so an open position read as a deposit of its own size.
+        """
+        r = RiskManager(cfg(), 100.0)
+        r.check(100.0, 40.0)              # 40 stated open, paper cash untouched
+        self.assertEqual(r.external_flow, 0.0)
+        self.assertAlmostEqual(r._day_start_bankroll, 100.0, places=9)
+
+    def test_a_claim_in_flight_is_not_an_external_flow(self):
+        """
+        The second reported bug. A win is booked into realised PnL the moment
+        it settles, but the USDT lands on chain up to claim_timeout_s later.
+        The gap used to read as a withdrawal and the credit that closed it as
+        a deposit -- two phantom movements per won round.
+        """
+        r = RiskManager(cfg(), 20.0)
+        r.record_result(True, 0.5, pnl=12.0)
+        r.check(16.0, 16.0)               # payout not yet credited on chain
+        r.check(32.0, 0.0)                # redemption confirms
+        self.assertEqual(r.external_flow, 0.0)
+        self.assertAlmostEqual(r.realised_pnl, 12.0, places=9)
+        self.assertAlmostEqual(r._day_start_bankroll, 20.0, places=9)
+
+    def test_a_withdrawal_during_a_round_is_still_caught_once_flat(self):
+        """
+        Waiting for a flat book delays detection; it must not lose any of it.
+        """
+        r = RiskManager(cfg(), 100.0)
+        r.check(20.0, 40.0)               # 40 staked and 40 withdrawn: skipped
+        self.assertEqual(r.external_flow, 0.0)
+        r.record_result(False, 0.5, pnl=-5.0)
+        # Flat now: 100 opening, 5 lost trading, 40 taken out by hand.
+        r.check(55.0, 0.0)
+        self.assertAlmostEqual(r.realised_pnl, -5.0, places=9)
+        self.assertAlmostEqual(r.external_flow, -40.0, places=9)
+
+    def test_a_manager_that_does_not_own_the_balance_never_rebases(self):
+        """
+        Per-market managers share one account. Each one rebasing the shared
+        baseline off a balance it only partly explains is nonsense, so they
+        pass no outstanding figure and reconciliation sits out.
+        """
+        r = RiskManager(cfg(), 100.0)
+        r.check(40.0)                     # no outstanding figure supplied
+        self.assertEqual(r.external_flow, 0.0)
+        self.assertAlmostEqual(r._day_start_bankroll, 100.0, places=9)
+
     def test_settling_a_stake_leaves_no_phantom_external_flow(self):
         r = RiskManager(cfg(), 100.0)
         r.check(70.0, 30.0)
@@ -6090,6 +6154,9 @@ class TestLoopSurvivesUnexpectedFailures(unittest.TestCase):
         t._store = None
         t._positions = {}
         t._unredeemed = {}
+        # _unredeemed is written from the claim worker thread, so anything
+        # reading it -- _outstanding, _bankroll -- takes this lock.
+        t._claim_lock = threading.Lock()
         t._errors = 0
         t._stopping = False
         t._seen = {}

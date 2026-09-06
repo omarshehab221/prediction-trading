@@ -2100,28 +2100,63 @@ class RiskManager:
             self._external_flow = 0.0
             LOG.info("New trading day; baseline bankroll %.2f", bankroll)
 
-    def reconcile(self, bankroll: float, committed: float = 0.0) -> float:
+    def reconcile(self, bankroll: float,
+                  outstanding: float | None = None) -> float:
         """
         Separate what this bot did to the balance from what anything else did.
 
-        Given no interference, the balance is fully predictable: the day's
-        opening figure, plus everything the bot has settled, minus whatever it
-        currently has staked and not yet resolved. Whatever is left over came
-        from somewhere else -- a deposit, a withdrawal, a transfer between
-        wallets, or an order placed by hand -- and is none of the strategy's
-        doing.
+        With nothing in flight the balance is fully predictable: the day's
+        opening figure plus everything the bot has settled. Whatever is left
+        over came from somewhere else -- a deposit, a withdrawal, a transfer
+        between wallets, or an order placed by hand -- and is none of the
+        strategy's doing. That residue is folded into the day's baseline
+        instead of being counted as a result, and returned so the caller can
+        report it.
 
-        That residue is folded into the day's baseline instead of being
-        counted as a result, and returned so the caller can report it.
+        WHY THIS ONLY RUNS WHEN FLAT
+        ----------------------------
+        `bankroll` and the expectation above are measured on different bases
+        the moment anything is outstanding, and the difference is the bot's
+        OWN money -- which is exactly what this must not mistake for someone
+        else's:
 
-        The tolerance exists because settlement and on-chain credit do not
-        land in the same instant. It is derived from the venue minimum rather
-        than being a new tunable: anything smaller than a fraction of the
-        smallest order the venue accepts cannot be a trade.
+          * an open position. A wallet-funded account reads its balance from
+            the portfolio's totalCurrentValue, which marks open positions to
+            MARKET, while the arithmetic here knows them at COST. Every tick
+            of the underlying then looked like a deposit or a withdrawal: a
+            4.00 leg bought at 0.25 rebased the baseline by +4.00 on the spot
+            and by another fraction of a USDT on every poll afterwards, with
+            no trade taking place at all. Paper mode had the same symptom for
+            a different reason -- _paper_bankroll is not debited when a stake
+            goes out, so an open position read as a deposit of its own size.
+
+          * a claim in flight. A win is booked into realised PnL the instant
+            it settles, but the USDT lands on chain up to claim_timeout_s
+            later. In between, the balance is short by the payout and the
+            gap read as a withdrawal; when the redemption confirmed, the same
+            payout arrived and read as a deposit. Every won round logged two
+            phantom movements that cancelled out only by luck.
+
+        So reconciliation waits for a flat book. Nothing is lost by waiting:
+        drift is measured against the day's baseline plus cumulative realised
+        PnL, so a genuine deposit made mid-round is still caught in full the
+        first moment the bot is flat. `outstanding` is None for callers that
+        do not own the balance at all -- the per-market managers share one
+        account and must never rebase it.
+
+        The tolerance is derived from the venue minimum rather than being a
+        new tunable: anything smaller than a fraction of the smallest order
+        the venue accepts cannot be a trade.
         """
-        expected = self._day_start_bankroll + self._realised_pnl - committed
-        drift = bankroll - expected
+        if outstanding is None:
+            return 0.0
         tolerance = max(0.01, self._cfg.min_stake_usdt * 0.10)
+        if outstanding > tolerance:
+            LOG.debug("Not reconciling: %.2f USDT still in flight (staked, "
+                      "or won and not yet credited)", outstanding)
+            return 0.0
+        expected = self._day_start_bankroll + self._realised_pnl
+        drift = bankroll - expected
         if abs(drift) <= tolerance:
             return 0.0
         self._day_start_bankroll = max(self._day_start_bankroll + drift, EPS)
@@ -2132,9 +2167,10 @@ class RiskManager:
                  drift, self._day_start_bankroll)
         return drift
 
-    def check(self, bankroll: float, committed: float = 0.0) -> None:
+    def check(self, bankroll: float,
+              outstanding: float | None = None) -> None:
         self._roll_day(bankroll)
-        self.reconcile(bankroll, committed)
+        self.reconcile(bankroll, outstanding)
         if self.halted_reason:
             raise TradingHalted(self.halted_reason)
 
@@ -4002,6 +4038,20 @@ class Trader:
     def _committed(self) -> float:
         return sum(p.committed_usdt for p in self._positions.values())
 
+    def _outstanding(self) -> float:
+        """
+        The bot's own money in flight: staked, or won but not yet credited.
+
+        Both halves have to be counted. Reconciliation compares the balance
+        against cost-basis arithmetic, and either one of these makes those
+        two disagree by an amount that is the bot's doing -- see
+        RiskManager.reconcile for what mistaking it for an external flow
+        did to the daily baseline.
+        """
+        with self._claim_lock:
+            pending = sum(v for v, _, _ in self._unredeemed.values())
+        return self._committed() + pending
+
     def _available(self, bankroll: float) -> float:
         """
         Bankroll that may back a NEW position.
@@ -4290,7 +4340,7 @@ class Trader:
                     bankroll = self._bankroll()
                     # Account-level limits: one balance, one daily loss cap.
                     # Per-market streaks are checked inside _maybe_enter.
-                    self._account_risk.check(bankroll, self._committed())
+                    self._account_risk.check(bankroll, self._outstanding())
                     self._apply_pending_mode()
                     self._maybe_scale_in_all(bankroll)
                     self._maybe_enter(bankroll,
