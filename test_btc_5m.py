@@ -6290,7 +6290,28 @@ class TestStraddleEntry(unittest.TestCase):
                          [("BTCUSDT", Side.DOWN), ("BTCUSDT", Side.UP)])
         for key, pos in t._positions.items():
             self.assertAlmostEqual(pos.signal.fill_price, 0.70, places=9)
-            self.assertAlmostEqual(pos.signal.stake_usdt, 2.5, places=9)
+            self.assertAlmostEqual(pos.signal.stake_usdt, 20.0, places=9)
+
+    def test_a_small_live_bankroll_still_clears_the_per_leg_minimum(self):
+        """
+        Regression: at 2.5% per leg a 20 USDT bankroll sized each leg at
+        0.50, under min_stake_usdt, so _maybe_enter_straddle returned before
+        it ever looked at a round and the bot sat idle forever.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.50, 10_000)],
+                 (1, Side.DOWN): [(0.50, 10_000)]}
+        t = self._trader(FakeClient([rnd], [(start, 100_000.0)], books, {}))
+
+        t._maybe_enter(20.0, "PAPER")
+
+        self.assertEqual(len(t._positions), 2)
+        for pos in t._positions.values():
+            self.assertGreaterEqual(pos.signal.stake_usdt,
+                                    t._cfg.min_stake_usdt)
 
     def test_both_legs_settle_independently_and_correctly(self):
         start = 1_700_000_000_000
@@ -6312,9 +6333,9 @@ class TestStraddleEntry(unittest.TestCase):
         t._settle_open()
 
         self.assertEqual(t._positions, {})
-        # UP staked 2.5 at 0.10 wins 2.5*9=22.5; DOWN staked 2.5 loses it.
-        # Net vs the 100.0 start: +22.5 - 2.5 = +20.0.
-        self.assertAlmostEqual(t._paper_bankroll, 120.0, places=9)
+        # UP staked 20 at 0.10 wins 20*9=180; DOWN staked 20 loses it.
+        # Net vs the 100.0 start: +180 - 20 = +160.0.
+        self.assertAlmostEqual(t._paper_bankroll, 260.0, places=9)
 
     def test_a_round_past_the_entry_window_is_left_alone(self):
         start = 1_700_000_000_000

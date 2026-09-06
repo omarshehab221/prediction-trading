@@ -850,11 +850,10 @@ PROFILES: dict[str, dict] = {
                   "max_blended_price": 0.65},
     # Buy BOTH sides in the first seconds of a round, every round, no price
     # judgement -- see the straddle_* fields on Config for what governs
-    # entry. Sized conservatively (2.5% of bankroll per leg, 5% total per
-    # round) because this is unproven relative to the model-based profiles
-    # above: --calibration-report after a few hundred rounds is what tells
-    # you whether the round-open mispricing this profile bets on is real.
-    "straddle": {"straddle": True, "straddle_stake_pct": 0.025,
+    # entry. 20% of bankroll per leg, so ~40% of bankroll committed per
+    # round. Deliberately large: at 2.5% a small bankroll produced a per-leg
+    # stake under min_stake_usdt and the profile silently never traded.
+    "straddle": {"straddle": True, "straddle_stake_pct": 0.20,
                  "straddle_entry_window_s": 15.0,
                  # No side is ever picked by price here, so these bands are
                  # left at their widest legal setting rather than inherited
@@ -3769,6 +3768,9 @@ class Trader:
         self._watching: dict[int, tuple[int, str]] = {}
         self._missed: dict[str, int] = {}
         self._missed_total = 0
+        # Last "why am I not trading" message, so it is logged on change
+        # rather than on every poll.
+        self._idle_reason = ""
         # Keyed by (symbol, side) rather than just symbol: every model-based
         # profile only ever opens one side per symbol, so this changes
         # nothing for them, but it lets the straddle profile hold BOTH
@@ -4197,9 +4199,22 @@ class Trader:
         available = self._available(bankroll)
         per_side = bankroll * self._cfg.straddle_stake_pct
         if per_side < self._cfg.min_stake_usdt or available < per_side * 2:
-            LOG.debug("No uncommitted bankroll for a straddle (%.2f needed, "
-                      "%.2f available)", per_side * 2, available)
+            # Loud, not debug: this is the one condition that makes the
+            # profile sit there doing nothing forever, and at DEBUG it was
+            # indistinguishable from a bot that was simply between rounds.
+            # Deduplicated so a stuck bankroll does not spam every poll.
+            msg = ("Straddle cannot enter: %.2f USDT per leg (%.1f%% of a "
+                   "%.2f bankroll) against a %.2f per-leg minimum, and "
+                   "%.2f USDT uncommitted after the %.0f%% reserve. "
+                   "Raise straddle_stake_pct or fund the wallet."
+                   % (per_side, self._cfg.straddle_stake_pct * 100, bankroll,
+                      self._cfg.min_stake_usdt, available,
+                      self._cfg.reserve_pct * 100))
+            if msg != self._idle_reason:
+                self._idle_reason = msg
+                LOG.warning("%s", msg)
             return
+        self._idle_reason = ""
 
         for raw in self._client.list_rounds():
             if raw.topic_id in self._seen:
