@@ -1843,6 +1843,20 @@ def _projected_rounds(impulse: float, decay: float,
     return math.log(floor / impulse) / math.log(decay)
 
 
+class OrderNotFilled(ApiError):
+    """
+    The venue confirmed an order did NOT fill -- killed, cancelled, rejected.
+
+    Separate from ApiError because the two demand opposite responses. This
+    one is a fact: no position exists, and recording one invents a trade that
+    later "settles" and books a profit never made. A bare ApiError from the
+    same call is an absence of information -- a timeout, a dropped socket --
+    where a position may well exist, and dropping it strands real money that
+    is never settled and never claimed. Catching both together forces one
+    wrong answer or the other.
+    """
+
+
 class VolatilityEstimator:
     """Annualised sigma AND tail thickness from recent 1m returns."""
 
@@ -3086,7 +3100,9 @@ class PredictionClient:
                 if filled is None:
                     filled = _as_float_or_none(order.get("filledShareQty"))
                 if last_status in self.DEAD_ORDER_STATUSES:
-                    raise ApiError(
+                    # The venue has answered, and the answer is no. Callers
+                    # must not record a position on this.
+                    raise OrderNotFilled(
                         f"order {order_id} did not fill: status "
                         f"{last_status}, filled {filled}")
                 if last_status in self.FILLED_ORDER_STATUSES and filled:
@@ -4470,19 +4486,48 @@ class Trader:
             return False, worst, "both straddle payouts do not beat the stake"
         return True, worst, ""
 
-    def _book_price(self, raw: Round, side: Side) -> float:
-        """Best ask for one side, or a spread-widened mark if the book is bare."""
+    def _book_price(self, raw: Round, side: Side) -> float | None:
+        """
+        Best ask for one side, or None when there is no usable price.
+
+        None is not an error, it is the ordinary state of a market late in a
+        round: the side that is losing decays toward 0.00 and the side that
+        is winning toward 1.00, and rounding to the market's own precision
+        snaps both the rest of the way. Neither is a probability -- 1.00 can
+        never pay back more than it cost and 0.00 has no payout defined at
+        all -- so every price formula downstream rejects them, and the one
+        in _complete_half_straddles rejected them by raising ValueError out
+        of breakeven_probability and killing the process.
+
+        Returning None instead says the same thing without pretending the
+        number is tradable, and without clamping it into range, which would
+        quietly turn "this side is worthless" into "this side is a bargain".
+        """
         levels = self._client.asks_for(raw, side)
         price = (levels[0][0] if levels
                  else min(raw.quote_for(side)
                           * (1.0 + self._cfg.assumed_spread_pct), 0.999))
-        return raw.round_price(price)
+        price = raw.round_price(price)
+        return price if 0.0 < price < 1.0 else None
 
     def _place_leg(self, raw: Round, side: Side, price: float, stake: float,
                    quote: "Quote | None" = None
-                   ) -> tuple[float, float, str | None]:
+                   ) -> tuple[float, float, str | None] | None:
         """
-        Buy one side. Returns (fill price, stake filled, order id).
+        Buy one side. Returns (fill price, stake filled, order id), or None.
+
+        None means the venue said the order did not fill, so there is no
+        position and the caller must not record one. A MARKET FOK order that
+        cannot fill is killed while still returning an order id, so the id
+        alone proves nothing.
+
+        The two confirmation failures are deliberately NOT treated alike. A
+        dead status is knowledge: no position, nothing to record, and
+        recording one would invent a trade that later settles and books a
+        profit never made. A timeout or a dropped socket is the absence of
+        knowledge: the order may well be live, and dropping it strands real
+        money that is never settled and never claimed. So the first returns
+        None and the second records at the requested size, loudly.
 
         Paper mode fills at the passed price and places nothing.
         """
@@ -4495,13 +4540,16 @@ class Trader:
             if self._cfg.confirm_fills:
                 try:
                     stake = self._client.confirm_fill(order_id, stake)
+                except OrderNotFilled as exc:
+                    LOG.warning("Straddle %s: the %s leg did not fill (%s); "
+                                "no position recorded", raw.slug, side.value,
+                                exc)
+                    return None
                 except (ApiError, requests.RequestException) as exc:
-                    # Recorded at the requested size rather than dropped: the
-                    # order is placed, so the only question left is whether
-                    # the bot knows about it.
                     LOG.error("Straddle %s: %s leg placed but the fill could "
-                              "not be confirmed (%s); recording it at the "
-                              "requested %.2f USDT",
+                              "NOT be confirmed either way (%s); recording it "
+                              "at the requested %.2f USDT so it is settled "
+                              "and claimed rather than stranded",
                               raw.slug, side.value, exc, stake)
             if quote.fee_usdt > 0:
                 LOG.debug("Straddle %s %s fee %.4f USDT", raw.slug,
@@ -4589,8 +4637,10 @@ class Trader:
 
         self._watching.pop(raw.topic_id, None)
         self._seen[raw.topic_id] = raw.end_ms
-        price, stake, order_id = self._place_leg(raw, side, price, stake,
-                                                 quote)
+        placed = self._place_leg(raw, side, price, stake, quote)
+        if placed is None:
+            return False              # killed by the venue; nothing opened
+        price, stake, order_id = placed
         self._record_straddle_legs(raw, {side: (price, stake, order_id)},
                                    bankroll, mode, now_ms)
         LOG.info("STRADDLE LEG 1 %s | %s %.4f (%.2f) pays %.2f | now hunting "
@@ -4629,6 +4679,12 @@ class Trader:
                 continue
 
             price = self._book_price(raw, other)
+            if price is None:
+                # Late in a round the missing side is routinely quoted at
+                # 0.00 or 1.00. Neither is completable; wait for a real one.
+                LOG.debug("%s: no usable %s price to complete with yet",
+                          raw.slug, other.value)
+                continue
             budget = self._available(bankroll)
             stake, guaranteed = straddle_completion_stake(
                 pos.committed_usdt, pos.signal.fill_price, price,
@@ -4694,8 +4750,12 @@ class Trader:
                              pos.committed_usdt, side.value)
                     continue
 
-            price, stake, order_id = self._place_leg(raw, other, price, stake,
-                                                     quote)
+            placed = self._place_leg(raw, other, price, stake, quote)
+            if placed is None:
+                # The hedge was killed, so the open leg is still open. Left
+                # for the next poll rather than given up on.
+                continue
+            price, stake, order_id = placed
             self._record_straddle_legs(raw, {other: (price, stake, order_id)},
                                        bankroll, mode, now_ms)
             total = pos.committed_usdt + stake
@@ -4822,14 +4882,15 @@ class Trader:
                 self._seen[raw.topic_id] = raw.end_ms
                 continue
 
-            legs: dict[Side, float] = {}
-            for side in (Side.UP, Side.DOWN):
-                levels = self._client.asks_for(raw, side)
-                price = (levels[0][0] if levels
-                        else min(raw.quote_for(side)
-                                 * (1.0 + self._cfg.assumed_spread_pct),
-                                 0.999))
-                legs[side] = raw.round_price(price)
+            priced = {side: self._book_price(raw, side)
+                      for side in (Side.UP, Side.DOWN)}
+            if any(price is None for price in priced.values()):
+                LOG.debug("%s: no usable two-sided price (UP %s / DOWN %s)",
+                          raw.slug, priced[Side.UP], priced[Side.DOWN])
+                continue
+            legs: dict[Side, float] = {side: price
+                                       for side, price in priced.items()
+                                       if price is not None}
 
             # Recomputed per round, not once per pass: entering one round
             # commits capital that the next round in the same pass must not
@@ -4901,29 +4962,12 @@ class Trader:
             filled: dict[Side, tuple[float, float, str | None]] = {}
             try:
                 for side in (Side.UP, Side.DOWN):
-                    price, stake, order_id = legs[side], stakes[side], None
-                    if self._live:
-                        quote = quotes[side]
-                        order_id = self._client.place_order(raw, quote, stake)
-                        price = quote.average_price
-                        if self._cfg.confirm_fills:
-                            try:
-                                stake = self._client.confirm_fill(order_id,
-                                                                  stake)
-                            except (ApiError,
-                                    requests.RequestException) as exc:
-                                # Recorded at the requested size rather than
-                                # dropped: the order is placed, so the only
-                                # question is whether the bot knows about it.
-                                LOG.error(
-                                    "Straddle %s: %s leg placed but the fill "
-                                    "could not be confirmed (%s); recording "
-                                    "it at the requested %.2f USDT",
-                                    raw.slug, side.value, exc, stake)
-                        if quote.fee_usdt > 0:
-                            LOG.debug("Straddle %s %s fee %.4f USDT",
-                                      raw.slug, side.value, quote.fee_usdt)
-                    filled[side] = (price, stake, order_id)
+                    placed = self._place_leg(raw, side, legs[side],
+                                             stakes[side],
+                                             quotes.get(side))
+                    if placed is None:
+                        continue     # killed by the venue; no position
+                    filled[side] = placed
             finally:
                 # Inside the finally, so a leg that reached the venue is
                 # journalled even when the exception from the other one is

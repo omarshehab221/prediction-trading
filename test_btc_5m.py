@@ -6425,10 +6425,13 @@ class TestStraddleConfig(unittest.TestCase):
 class QuotingClient(FakeClient):
     """FakeClient whose quotes can differ per side, and can fail to place."""
 
-    def __init__(self, *a, quotes=None, fail_order_after=None, **kw):
+    def __init__(self, *a, quotes=None, fail_order_after=None,
+                 kill_fills=False, confirm_unreachable=False, **kw):
         super().__init__(*a, **kw)
         self._quotes = quotes or {}
         self._fail_after = fail_order_after
+        self.kill_fills = kill_fills
+        self.confirm_unreachable = confirm_unreachable
 
     def get_quote(self, rnd, side, stake):
         price = self._quotes.get(side, 0.51)
@@ -6439,6 +6442,14 @@ class QuotingClient(FakeClient):
                 and len(self.orders) >= self._fail_after):
             raise m.ApiError("venue rejected the order")
         return super().place_order(rnd, quote, stake_usdt)
+
+    def confirm_fill(self, order_id, requested_usdt):
+        if self.kill_fills:
+            raise m.OrderNotFilled(f"order {order_id} did not fill: status "
+                                   f"KILLED, filled 0.0")
+        if self.confirm_unreachable:
+            raise m.ApiError("read timed out")
+        return super().confirm_fill(order_id, requested_usdt)
 
 
 class TestStraddleEntry(unittest.TestCase):
@@ -6774,6 +6785,94 @@ class TestStraddleEntry(unittest.TestCase):
         t._maybe_enter(100.0, "PAPER")
 
         self.assertEqual(len(t._positions), 2)   # cap is 1, hedge still ran
+
+    def test_a_worthless_or_certain_side_does_not_crash_the_bot(self):
+        """
+        The reported crash. Late in a round the losing side decays to 0.00
+        and the winning side to 1.00, and rounding to the market's precision
+        snaps both the rest of the way. Neither is a probability, and
+        breakeven_probability raised ValueError straight out of
+        _complete_half_straddles and killed the process.
+        """
+        start = 1_700_000_000_000
+        end = start + (m.DEFAULT_ROUND_SECONDS * 1000)
+        rnd = make_round(strike=100_000.0, start_ms=start, end_ms=end,
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.20, 10_000)],
+                 (1, Side.DOWN): [(0.85, 10_000)]}
+        client = FakeClient([rnd], [(start + 60_000, 100_000.0),
+                                    (start + 200_000, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+
+        # The round resolves: UP is now a certainty, DOWN is worthless.
+        books[(1, Side.UP)] = [(1.00, 10_000)]
+        books[(1, Side.DOWN)] = [(0.00, 10_000)]
+        client.t = 1
+
+        t._maybe_enter(100.0, "PAPER")      # must not raise
+
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+
+    def test_an_unusable_two_sided_price_is_skipped_not_crashed(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        books = {(1, Side.UP): [(1.00, 10_000)],
+                 (1, Side.DOWN): [(0.00, 10_000)]}
+        client = FakeClient([rnd], [(start + 60_000, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")      # must not raise
+
+        self.assertEqual(t._positions, {})
+
+    def test_a_killed_order_does_not_become_a_position(self):
+        """
+        The venue answers MARKET FOK orders with an id whether or not they
+        fill. Recording a position on that id invents a trade which later
+        settles and books a profit that was never made.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.20, 10_000)],
+                 (1, Side.DOWN): [(0.85, 10_000)]}
+        client = QuotingClient([rnd], [(start + 60_000, 100_000.0)], books,
+                               {}, quotes={Side.UP: 0.20, Side.DOWN: 0.85},
+                               kill_fills=True)
+        t = self._trader(client, live=True)
+        t._active_live = True
+
+        t._maybe_enter(100.0, "LIVE")
+
+        self.assertEqual(client.orders and True, True)   # it did try
+        self.assertEqual(t._positions, {})
+
+    def test_an_unconfirmable_fill_is_still_recorded(self):
+        """
+        The opposite case, and the reason the two cannot share a branch. A
+        timeout says nothing about whether the order is live; dropping it
+        strands money that is never settled and never claimed.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.20, 10_000)],
+                 (1, Side.DOWN): [(0.85, 10_000)]}
+        client = QuotingClient([rnd], [(start + 60_000, 100_000.0)], books,
+                               {}, quotes={Side.UP: 0.20, Side.DOWN: 0.85},
+                               confirm_unreachable=True)
+        t = self._trader(client, live=True)
+        t._active_live = True
+
+        t._maybe_enter(100.0, "LIVE")
+
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
 
     def test_the_gate_is_retested_against_the_live_quotes(self):
         """
