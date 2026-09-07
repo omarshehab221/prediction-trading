@@ -710,6 +710,17 @@ class Config:
             raise ValueError(
                 "regime_swingy_straightness must be below "
                 "regime_biased_straightness for the same reason")
+        if self.regime_biased_max_crossings >= self.regime_swingy_min_crossings:
+            raise ValueError(
+                "regime_biased_max_crossings must be below "
+                "regime_swingy_min_crossings; a window crossing the strike "
+                "often enough to be SWINGY must not also be quiet enough to "
+                "be BIASED, or the label would depend on check order")
+        if self.regime_flat_terminal_ratio >= self.regime_biased_terminal_ratio:
+            raise ValueError(
+                "regime_flat_terminal_ratio must be below "
+                "regime_biased_terminal_ratio; a window finishing near the "
+                "strike must not also count as finishing far from it")
         if self.report_every < 0:
             raise ValueError("report_every must be non-negative")
         if self.use_fat_tails and self.tail_df_floor <= 2.0:

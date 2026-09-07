@@ -702,6 +702,22 @@ class TestConfigValidation(unittest.TestCase):
     def test_accepts_defaults(self):
         self.assertIsInstance(cfg(), Config)
 
+    def test_rejects_overlapping_crossings_bands(self):
+        # BIASED max_crossings must be below SWINGY min_crossings.
+        with self.assertRaises(ValueError) as ctx:
+            Config(api_key="k", api_secret="s",
+                   regime_biased_max_crossings=3.0,
+                   regime_swingy_min_crossings=2.8)
+        self.assertIn("regime_biased_max_crossings", str(ctx.exception))
+
+    def test_rejects_overlapping_terminal_ratio_bands(self):
+        # FLAT terminal_ratio must be below BIASED terminal_ratio.
+        with self.assertRaises(ValueError) as ctx:
+            Config(api_key="k", api_secret="s",
+                   regime_flat_terminal_ratio=1.2,
+                   regime_biased_terminal_ratio=1.05)
+        self.assertIn("regime_flat_terminal_ratio", str(ctx.exception))
+
 
 # --------------------------------------------------------------------------
 # Simulated session
@@ -7182,20 +7198,50 @@ class TestRegimeClassification(unittest.TestCase):
         label, _ = m.classify_regime(recent, [], self.cfg)
         self.assertEqual(label, "")
 
-    def test_labels_are_mutually_exclusive_over_a_sweep(self):
-        # No input may satisfy two rules at once; that is what makes the
-        # order of the checks irrelevant to the answer.
-        for travel in (0.5, 1.5, 3.0, 5.0):
-            for straight in (0.1, 0.35, 0.5, 0.6, 0.95):
-                for terminal in (0.2, 0.9, 1.5, 3.0):
-                    for crossings in (0, 1, 2, 4):
-                        recent = _shapes(24, travel=travel,
-                                         straightness=straight,
-                                         terminal=terminal,
+    def test_at_most_one_rule_matches_any_window(self):
+        """
+        Mutual exclusivity, tested against the rules rather than the return.
+
+        Asserting that classify_regime returns a member of the allowed set
+        proves nothing: its if/elif structure can only ever return one
+        label, whatever the thresholds are. The claim worth making is that
+        the three BANDS are disjoint, so the order they are checked in
+        cannot change an answer. That is checked here by evaluating the
+        three conditions independently from the reported measures.
+
+        The baseline is travel=2.0 and terminal=1.0, so the loop variables
+        below are the RATIOS the rules actually compare against, not raw
+        sizes. Values are chosen to sit either side of every threshold.
+        """
+        cfg = self.cfg
+        for travel_ratio in (0.3, 0.69, 0.70, 0.79, 0.80, 1.5, 3.0):
+            for straightness in (0.05, 0.13, 0.14, 0.19, 0.20, 0.5, 0.95):
+                for terminal_ratio in (0.2, 0.69, 0.70, 1.04, 1.05, 2.0):
+                    for crossings in (0, 1, 2, 3, 4, 6):
+                        recent = _shapes(24, travel=travel_ratio * 2.0,
+                                         straightness=straightness,
+                                         terminal=terminal_ratio * 1.0,
                                          crossings=crossings)
-                        label, _ = m.classify_regime(recent, self.baseline,
-                                                     self.cfg)
-                        self.assertIn(label, ("", "FLAT", "BIASED", "SWINGY"))
+                        label, mm = m.classify_regime(recent, self.baseline,
+                                                      cfg)
+                        tr, te = mm["travel_ratio"], mm["terminal_ratio"]
+                        sr, cr = mm["straightness"], mm["crossings"]
+                        matched = [
+                            tr < cfg.regime_flat_travel_ratio
+                            and te < cfg.regime_flat_terminal_ratio,
+                            sr >= cfg.regime_biased_straightness
+                            and te >= cfg.regime_biased_terminal_ratio
+                            and cr <= cfg.regime_biased_max_crossings,
+                            cr >= cfg.regime_swingy_min_crossings
+                            and sr < cfg.regime_swingy_straightness
+                            and tr >= cfg.regime_swingy_travel_ratio,
+                        ]
+                        self.assertLessEqual(
+                            sum(matched), 1,
+                            f"bands overlap at travel_ratio={tr:.3f} "
+                            f"terminal_ratio={te:.3f} "
+                            f"straightness={sr:.3f} crossings={cr:.3f}")
+                        self.assertEqual(any(matched), label != "")
 
     def test_thresholds_are_ratios_so_a_vol_shift_does_not_relabel(self):
         # Double every size in both windows: the label must not change.
