@@ -7156,7 +7156,7 @@ class TestRegimeClassification(unittest.TestCase):
         self.assertEqual(label, "BIASED")
 
     def test_wandering_rounds_that_end_nowhere_are_swingy(self):
-        recent = _shapes(24, travel=4.0, straightness=0.2, terminal=0.9,
+        recent = _shapes(24, travel=4.0, straightness=0.10, terminal=0.9,
                          crossings=3)
         label, _ = m.classify_regime(recent, self.baseline, self.cfg)
         self.assertEqual(label, "SWINGY")

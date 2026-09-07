@@ -436,12 +436,12 @@ class Config:
     #
     # Read at 1m these numbers mean something else entirely, which is why the
     # interval above is not a knob to turn casually.
-    regime_biased_straightness: float = 0.25
+    regime_biased_straightness: float = 0.20
     regime_biased_terminal_ratio: float = 1.05
     regime_biased_max_crossings: float = 2.2
     # SWINGY: covered ground and ended nowhere.
     regime_swingy_min_crossings: float = 2.8
-    regime_swingy_straightness: float = 0.24
+    regime_swingy_straightness: float = 0.14
     regime_swingy_travel_ratio: float = 0.80
 
     # --- Straddle (buy both sides at round-open) ----------------------------
