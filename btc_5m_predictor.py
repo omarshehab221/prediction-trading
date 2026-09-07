@@ -1665,8 +1665,15 @@ class RegimeTracker:
                 self._candidate = label
                 self._count = 1
             if self._count >= self._threshold:
-                self._previous = self._current
-                self._previous_at = now
+                # UNKNOWN is the uncommitted initial state, not a regime the
+                # market was ever in. Recording it as `previous` would claim
+                # the market left a state it never held, and the age would be
+                # a permanent 0m because the commit and the render happen at
+                # the same instant. Leave `previous` unset until a real
+                # regime has actually been exited.
+                if self._current != "UNKNOWN":
+                    self._previous = self._current
+                    self._previous_at = now
                 self._current = label
                 self._candidate = None
                 self._count = 0

@@ -7325,10 +7325,32 @@ class TestRegimeTracker(unittest.TestCase):
     def test_describe_says_steady_when_nothing_is_pending(self):
         tracker = m.RegimeTracker(1)
         reading = tracker.update("FLAT", 0.0, {})
-        self.assertIn("currently FLAT", reading.describe())
-        self.assertIn("steady", reading.describe())
+        self.assertEqual(reading.describe(), "MARKET currently FLAT | steady")
+
+    def test_the_first_commit_does_not_claim_to_have_exited_unknown(self):
+        """
+        UNKNOWN is where the tracker starts, not a state the market held.
+
+        The sentence is operator-facing and its shape is the requirement, so
+        this asserts the whole string rather than a substring -- the defect
+        this replaces was a stray prefix that every substring assertion in
+        the suite was blind to.
+        """
+        tracker = m.RegimeTracker(1)
+        reading = tracker.update("FLAT", 0.0, {})
+        self.assertIsNone(reading.previous)
+        self.assertEqual(reading.previous_age_min, 0.0)
+        self.assertNotIn("exited", reading.describe())
 
     def test_threshold_below_one_is_clamped(self):
         tracker = m.RegimeTracker(0)
         reading = tracker.update("FLAT", 0.0, {})
         self.assertEqual(reading.current, "FLAT")
+
+    def test_detail_renders_the_measurements_behind_the_label(self):
+        reading = m.RegimeReading(
+            current="SWINGY",
+            measures=(("crossings", 3.2), ("straightness", 0.11)))
+        self.assertEqual(reading.detail(),
+                         "crossings=3.20  straightness=0.11")
+        self.assertEqual(m.RegimeReading().detail(), "no measurements yet")
