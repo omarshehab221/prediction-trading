@@ -17,6 +17,14 @@
 #    A long-running loop with no HTTP port. Free web services also spin down
 #    when idle, which would stop the loop mid-round. Workers are paid only.
 #
+# 4. AUTODEPLOY IS ON, SO A PUSH CAN LAND MID-ROUND.
+#    Every push to the tracked branch restarts the worker. A restart during a
+#    live round drops whatever is in memory; open positions are recovered from
+#    the journal on the disk, but a half-straddle waiting for its second leg
+#    loses the seconds the restart costs, and the build gate runs first so
+#    that is a minute or more. Push between rounds if the bot is live and
+#    holding, or turn this back off before a session you care about.
+#
 # The config file is written ONCE, on first boot, by entrypoint.sh. Later
 # starts keep whatever is on the disk, so hot reload and your edits survive
 # every deploy. To reset it, delete the file from the Render shell.
@@ -35,7 +43,7 @@ services:
       chmod +x entrypoint.sh verify.sh &&
       BINANCE_API_KEY=build BINANCE_API_SECRET=build ./verify.sh
     startCommand: ./entrypoint.sh
-    autoDeploy: false          # a redeploy mid-round interrupts a position
+    autoDeploy: true           # see note 4
     disk:
       name: data
       mountPath: /var/data     # must match CONFIG_PATH and DB_PATH below
