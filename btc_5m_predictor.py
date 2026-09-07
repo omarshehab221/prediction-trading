@@ -1587,6 +1587,104 @@ def classify_regime(recent: Sequence[RoundShape],
 
 
 @dataclass(frozen=True)
+class RegimeReading:
+    """
+    What state the market is in, what it left, and what it may be entering.
+
+    `entering` is NOT a forecast. It is the candidate state that the recent
+    evidence matches but that has not yet held long enough to be committed,
+    reported with its progress so the gap is visible rather than hidden
+    inside the detector. Read it as "the evidence has moved and has not
+    settled", never as "this will happen".
+    """
+
+    current: str = "UNKNOWN"
+    previous: str | None = None
+    previous_age_min: float = 0.0
+    entering: str | None = None
+    entering_count: int = 0
+    commit_threshold: int = 1
+    # Tuple of pairs rather than a dict, so the reading stays hashable and
+    # frozen like every other dataclass in this file.
+    measures: tuple[tuple[str, float], ...] = ()
+
+    def describe(self) -> str:
+        parts = []
+        if self.previous is not None:
+            parts.append(f"exited {self.previous} "
+                         f"{self.previous_age_min:.0f}m ago")
+        parts.append(f"currently {self.current}")
+        if self.entering is not None:
+            parts.append(f"entering {self.entering} "
+                         f"({self.entering_count}/{self.commit_threshold})")
+        else:
+            parts.append("steady")
+        return "MARKET " + " | ".join(parts)
+
+    def detail(self) -> str:
+        if not self.measures:
+            return "no measurements yet"
+        return "  ".join(f"{k}={v:.2f}" for k, v in self.measures)
+
+
+class RegimeTracker:
+    """
+    Commits a state only once it has held, and reports the gap.
+
+    Without this the label would change on any single unusual round, and the
+    bot would swap strategy mid-hour on noise -- which is worse than never
+    switching at all, because it pays the cost of every transition and
+    collects the benefit of none.
+    """
+
+    def __init__(self, threshold: int) -> None:
+        self._threshold = max(1, threshold)
+        self._current = "UNKNOWN"
+        self._previous: str | None = None
+        self._previous_at: float | None = None
+        self._candidate: str | None = None
+        self._count = 0
+        self._reading = RegimeReading(commit_threshold=self._threshold)
+
+    @property
+    def reading(self) -> RegimeReading:
+        return self._reading
+
+    def update(self, label: str, now: float,
+               measures: dict[str, float]) -> RegimeReading:
+        if not label or label == self._current:
+            # Either nothing matched, or the market is still where it was.
+            # Both clear the candidate: progress toward a change is only
+            # meaningful while the evidence keeps pointing the same way.
+            self._candidate = None
+            self._count = 0
+        else:
+            if label == self._candidate:
+                self._count += 1
+            else:
+                self._candidate = label
+                self._count = 1
+            if self._count >= self._threshold:
+                self._previous = self._current
+                self._previous_at = now
+                self._current = label
+                self._candidate = None
+                self._count = 0
+
+        age_min = (0.0 if self._previous_at is None
+                   else max(0.0, (now - self._previous_at) / 60.0))
+        self._reading = RegimeReading(
+            current=self._current,
+            previous=self._previous,
+            previous_age_min=age_min,
+            entering=self._candidate,
+            entering_count=self._count,
+            commit_threshold=self._threshold,
+            measures=tuple(sorted(measures.items())))
+        return self._reading
+
+
+@dataclass(frozen=True)
 class Signal:
     side: Side
     model_prob: float

@@ -7254,3 +7254,81 @@ class TestRegimeClassification(unittest.TestCase):
         quiet, _ = m.classify_regime(recent, self.baseline, self.cfg)
         loud, _ = m.classify_regime(loud_recent, loud_baseline, self.cfg)
         self.assertEqual(quiet, loud)
+
+
+class TestRegimeTracker(unittest.TestCase):
+
+    def test_starts_unknown_and_steady(self):
+        tracker = m.RegimeTracker(3)
+        reading = tracker.reading
+        self.assertEqual(reading.current, "UNKNOWN")
+        self.assertIsNone(reading.previous)
+        self.assertIsNone(reading.entering)
+
+    def test_candidate_must_hold_before_it_commits(self):
+        tracker = m.RegimeTracker(3)
+        r1 = tracker.update("FLAT", 0.0, {})
+        self.assertEqual(r1.current, "UNKNOWN")
+        self.assertEqual(r1.entering, "FLAT")
+        self.assertEqual(r1.entering_count, 1)
+        r2 = tracker.update("FLAT", 300.0, {})
+        self.assertEqual(r2.current, "UNKNOWN")
+        self.assertEqual(r2.entering_count, 2)
+        r3 = tracker.update("FLAT", 600.0, {})
+        self.assertEqual(r3.current, "FLAT")
+        self.assertIsNone(r3.entering)
+
+    def test_a_single_odd_round_does_not_flip_the_state(self):
+        tracker = m.RegimeTracker(3)
+        for t in (0.0, 300.0, 600.0):
+            tracker.update("FLAT", t, {})
+        tracker.update("SWINGY", 900.0, {})
+        reading = tracker.update("FLAT", 1200.0, {})
+        self.assertEqual(reading.current, "FLAT")
+        self.assertIsNone(reading.entering)
+
+    def test_previous_state_and_its_age_are_reported(self):
+        tracker = m.RegimeTracker(2)
+        tracker.update("FLAT", 0.0, {})
+        tracker.update("FLAT", 300.0, {})          # commits FLAT at t=300
+        tracker.update("BIASED", 600.0, {})
+        reading = tracker.update("BIASED", 900.0, {})  # commits BIASED
+        self.assertEqual(reading.current, "BIASED")
+        self.assertEqual(reading.previous, "FLAT")
+        self.assertAlmostEqual(reading.previous_age_min, 0.0, places=6)
+        later = tracker.update("BIASED", 3300.0, {})
+        self.assertAlmostEqual(later.previous_age_min, 40.0, places=6)
+
+    def test_unclassifiable_reading_holds_and_clears_the_candidate(self):
+        tracker = m.RegimeTracker(3)
+        for t in (0.0, 300.0, 600.0):
+            tracker.update("FLAT", t, {})
+        tracker.update("SWINGY", 900.0, {})
+        reading = tracker.update("", 1200.0, {})
+        self.assertEqual(reading.current, "FLAT")
+        self.assertIsNone(reading.entering)
+        self.assertEqual(reading.entering_count, 0)
+
+    def test_describe_reads_as_the_required_sentence(self):
+        tracker = m.RegimeTracker(3)
+        for t in (0.0, 300.0, 600.0):
+            tracker.update("FLAT", t, {})
+        for t in (900.0, 1200.0, 1500.0):
+            tracker.update("BIASED", t, {})
+        reading = tracker.update("SWINGY", 3900.0, {})
+        text = reading.describe()
+        self.assertIn("exited FLAT", text)
+        self.assertIn("40m ago", text)
+        self.assertIn("currently BIASED", text)
+        self.assertIn("entering SWINGY (1/3)", text)
+
+    def test_describe_says_steady_when_nothing_is_pending(self):
+        tracker = m.RegimeTracker(1)
+        reading = tracker.update("FLAT", 0.0, {})
+        self.assertIn("currently FLAT", reading.describe())
+        self.assertIn("steady", reading.describe())
+
+    def test_threshold_below_one_is_clamped(self):
+        tracker = m.RegimeTracker(0)
+        reading = tracker.update("FLAT", 0.0, {})
+        self.assertEqual(reading.current, "FLAT")
