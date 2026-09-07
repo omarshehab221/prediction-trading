@@ -4402,10 +4402,9 @@ class Trader:
             finally:
                 self._claim_queue.task_done()
 
-    def _claimed_elsewhere(self, token_id: str, payout: float,
-                           pos: Position, reason: BaseException) -> None:
+    def _forget_claim(self, token_id: str) -> None:
         """
-        Stop chasing a win the venue says is no longer redeemable.
+        Stop tracking a win the venue says is no longer redeemable.
 
         Almost always the operator claimed it by hand. The bot's only proof
         of a landed claim is the status of a tx hash it submitted itself, so
@@ -4414,12 +4413,14 @@ class Trader:
         in _unredeemed for the life of the process, where it inflates
         _outstanding, blocks every reconciliation, and pins a pending mode
         switch on winnings that were credited long ago.
+
+        Callers log the reason themselves. Which of the two ways the venue
+        said "there is nothing here" is the only interesting part of this
+        event, and burying it one frame deeper hid it from the reader and
+        from the meta-test that insists a handler explain what it swallowed.
         """
         with self._claim_lock:
             self._unredeemed.pop(token_id, None)
-        LOG.warning("Nothing left to redeem for %s: treating %.2f USDT as "
-                    "already credited (claimed outside this bot?) -- %s",
-                    pos.rnd.slug, payout, reason)
 
     def _claim_relentlessly(self, pos: Position) -> None:
         """
@@ -4448,11 +4449,19 @@ class Trader:
                     LOG.info("Redeeming %.2f USDT (tx %s)", payout,
                              ", ".join(hashes) or "pending")
                 except NothingToRedeem as exc:
-                    self._claimed_elsewhere(token_id, payout, pos, exc)
+                    LOG.warning("Nothing left to redeem for %s: treating "
+                                "%.2f USDT as already credited (claimed "
+                                "outside this bot?) -- %s",
+                                pos.rnd.slug, payout, exc)
+                    self._forget_claim(token_id)
                     return
                 except (ApiError, requests.RequestException) as exc:
                     if _is_already_redeemed(exc):
-                        self._claimed_elsewhere(token_id, payout, pos, exc)
+                        LOG.warning("Venue refuses to redeem %s because it "
+                                    "is already claimed: treating %.2f USDT "
+                                    "as credited -- %s",
+                                    pos.rnd.slug, payout, exc)
+                        self._forget_claim(token_id)
                         return
                     LOG.debug("Redeem attempt for %s failed, retrying: %s",
                               token_id, exc)
