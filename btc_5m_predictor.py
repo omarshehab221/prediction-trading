@@ -1076,7 +1076,32 @@ PROFILES: dict[str, dict] = {
                  # 0.0 means "strictly more than the stake, by any margin".
                  # Raise it to demand a minimum locked-in return -- 0.01 for
                  # 1% of the pair, and correspondingly fewer rounds.
-                 "straddle_min_worst_case_return": 0.0},
+                 "straddle_min_worst_case_return": 0.0,
+                 # Hold an unhedged leg to settlement rather than paying up
+                 # for the other side at the deadline.
+                 #
+                 # The default is the opposite, and its reasoning is sound in
+                 # general: at the deadline the guarantee is already gone, so
+                 # the only question left is whether the position stays
+                 # all-or-nothing, and a bounded loss beats a coin flip on
+                 # the whole stake.
+                 #
+                 # It stops being sound at the price this profile now opens
+                 # at. A leg bought at 0.40 can only be hedged near the
+                 # deadline at something close to 0.60, which locks in a loss
+                 # on nearly the entire pair -- paying most of the stake to
+                 # convert a bet the book still prices near even money into a
+                 # certain loss. The cheap-opener case that force hedging was
+                 # written for (0.25 against a 0.75 hedge) is no longer the
+                 # case this profile is usually in.
+                 #
+                 # So the leg rides. Straddle rounds that fail to complete
+                 # become directional bets at roughly the odds they were
+                 # opened at, which is the exposure the opening ceiling is
+                 # chosen to bound. Watch the "only the UP leg opened"
+                 # warnings: if they are common, the entry window and the
+                 # ceiling are wrong, not this switch.
+                 "straddle_force_hedge": False},
     # ONE RULE. With a minute left, buy whichever side is dearer -- the one
     # the book has already picked -- provided it is quoted at 0.75 or better.
     # Inside the last 45 seconds, buy it whatever it costs. Nothing else is

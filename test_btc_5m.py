@@ -6696,6 +6696,20 @@ class TestStraddleConfig(unittest.TestCase):
         rounds = c.max_concurrent_positions // 2
         self.assertGreaterEqual(spendable, per_round * min(rounds, 2))
 
+    def test_the_straddle_profile_does_not_force_a_hedge(self):
+        """
+        An unhedged leg rides to settlement rather than being closed out at
+        the deadline. At the 0.40 this profile now opens at, the other side
+        near the deadline costs about 0.60 -- paying most of the pair to turn
+        a near-even bet into a certain loss. Force hedging was written for a
+        0.25 opener against a 0.75 hedge, which is no longer the usual case.
+        """
+        self.assertFalse(straddle_cfg().straddle_force_hedge)
+
+    def test_forcing_a_hedge_is_still_the_default_off_this_profile(self):
+        """The profile overrides it; the reasoning behind the default stands."""
+        self.assertTrue(m.Config.straddle_force_hedge)
+
     def test_the_straddle_profile_gates_on_the_payout_test(self):
         """
         The gate is the profile. Without it the bot buys both sides of any
@@ -7010,6 +7024,10 @@ class TestStraddleEntry(unittest.TestCase):
         """
         No price ever covered the open leg. Rather than ride a one-sided bet
         to settlement, buy the other side and take a bounded loss.
+
+        Switched on explicitly: the straddle profile ships it OFF, because at
+        the price that profile opens at the deadline hedge costs more than
+        the bet is worth. This covers the mechanism, not the default.
         """
         start = 1_700_000_000_000
         end = start + (m.DEFAULT_ROUND_SECONDS * 1000)
@@ -7019,7 +7037,7 @@ class TestStraddleEntry(unittest.TestCase):
                  (1, Side.DOWN): [(0.90, 10_000)]}
         client = FakeClient([rnd], [(start + 3_000, 100_000.0),
                                     (end - 10_000, 100_000.0)], books, {})
-        t = self._trader(client)
+        t = self._trader(client, straddle_force_hedge=True)
 
         t._maybe_enter(100.0, "PAPER")
         self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
