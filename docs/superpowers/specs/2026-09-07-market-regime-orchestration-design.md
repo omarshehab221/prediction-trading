@@ -103,19 +103,44 @@ startup, raising `ValueError`. A silent win here would defeat the whole split.
 
 ## Component 1 — the detector
 
-### Input
+### Input: one-second closes, not one-minute
 
-The 500 one-minute closes `VolatilityEstimator.sigma_annual` already fetches
-every 60 seconds (`vol_lookback_min: 500`). No new API call. The detector is
-fed from the same closes for the reason `_measure_trend` gives: *"a trend read
-off a different fetch than the sigma it is compared against is two snapshots
-of two moments pretending to be one."*
+The first version of this spec fed the detector from the 500 one-minute closes
+`sigma_annual` already fetches, on the grounds that it cost no extra request.
+That was measured and it is wrong. Over 120 consecutive real rounds of
+BTCUSDT, sampling the same rounds at 1m instead of 1s:
 
-500 minutes is ~100 rounds. The recent window is ~24 rounds (2 hours). The
-full history is the **baseline** the recent window is compared against — that
-comparison is what makes "diverging" a measurement rather than a threshold
-guess, and it is why thresholds are expressed as ratios rather than as
-hardcoded BTC numbers that rot when the volatility regime shifts.
+| measure | at 1s | at 1m | what 1m does to it |
+| --- | --- | --- | --- |
+| crossings per round | 2.52 | 0.78 | sees **31%** of them |
+| travel per round | 0.00331 | 0.00120 | sees **36%** of it |
+| straightness | 0.208 | 0.480 | **overstates by 2.3x** |
+
+Thirteen of forty rounds crossed the strike but showed **zero** crossings at
+1m. Both classification axes are therefore severely resolution-dependent, and
+in the same direction: coarse sampling makes every market look straighter and
+calmer than it is, which is precisely the error that would route straddle
+money into a market that had stopped swinging.
+
+So the detector reads **1-second klines**, on its own fetch, with its own
+cache. This deliberately breaks the "same closes as the sigma" discipline that
+`_measure_trend` follows, and the reason that discipline does not apply here
+is that it exists to stop a trend being compared against a sigma from a
+different moment. The regime is not compared against the sigma; it is an
+independent measurement at a different timescale, and internal coherence is
+all it needs.
+
+**Cost, kept small by a rolling buffer.** The window is 24 recent rounds
+compared against 96 baseline rounds — 120 rounds, 10 hours, 36000 one-second
+candles. Seeding that costs 36 requests at Binance's 1000-candle limit, paid
+once at startup. Afterwards the buffer is topped up with only the seconds
+since the last refresh: **one request per minute** in steady state, at weight
+2 against a 6000/minute IP budget.
+
+The recent-against-baseline comparison is what makes "diverging" a measurement
+rather than a threshold guess, and it is why the size thresholds below are
+ratios rather than hardcoded BTC numbers that rot when the volatility regime
+shifts.
 
 ### Per-round measures
 
@@ -147,9 +172,43 @@ already dimensionless:
 
 | state | condition |
 | --- | --- |
-| **FLAT** | `travel_ratio < 0.60` and `terminal_ratio < 0.60` |
-| **BIASED** | `straightness >= 0.55` and `terminal_ratio >= 1.20` and `crossings <= 0.5` |
-| **SWINGY** | `crossings >= 1.2` and `straightness < 0.40` and `travel_ratio >= 0.80` |
+| **FLAT** | `travel_ratio < 0.70` and `terminal_ratio < 0.70` |
+| **BIASED** | `straightness >= 0.20` and `terminal_ratio >= 1.05` and `crossings <= 2.2` |
+| **SWINGY** | `crossings >= 2.8` and `straightness < 0.14` and `travel_ratio >= 0.80` |
+
+These are calibrated against **4032 real rounds** — fourteen days of 1s
+BTCUSDT — and not chosen by intuition. Two earlier attempts were killed by
+that data and both failures are worth recording, because they are the same
+mistake at two removes.
+
+The first draft used `0.55 / 0.40 / 1.2`, reasoned from the code. Once the
+resolution measurement existed those numbers turned out to straddle the 1m
+median, so a market of any character would have matched no rule at all.
+
+The second draft used `0.35 / 0.12 / 3.0`, calibrated against the *per-round*
+1s distribution. That was still wrong, and more subtly: **the classifier reads
+medians over 24 rounds, not individual rounds**, and a median of 24 draws
+concentrates far more tightly than the draws themselves. Per-round crossings
+have p10 = 0, so `crossings <= 1.0` looked like a reasonable BIASED gate; the
+24-round rolling mean has p5 = 1.00, so the same gate excluded 95% of the
+fortnight and BIASED fired on **0.5%** of windows. The rule was effectively
+dead and no amount of reading it would have shown that.
+
+The shipped values come from a grid search over the rolling-window statistics
+the classifier actually sees, constrained to produce zero overlap between the
+three rules. What the market spent fourteen days doing, after hysteresis:
+
+| state | share of rounds |
+| --- | --- |
+| FLAT | 32.3% |
+| BIASED | 35.5% |
+| SWINGY | 32.2% |
+| UNKNOWN | 0.1% |
+
+54 state changes in 13.6 days — one every 6 hours, median run 4.2 hours,
+longest 31.3 hours. That is a market with three persistent states rather than
+one that flickers, which is the claim this whole design rests on, now
+measured rather than assumed.
 
 When no rule matches, the committed state is held — an unclassifiable window
 is not a fourth state, it is an absence of evidence to change.
@@ -158,13 +217,24 @@ These are starting values, tuned during the paper run. They are ratios so that
 they survive a shift in the underlying volatility regime, which absolute
 numbers would not.
 
-### Known limitation
+### Known limitations
 
-Five samples per round undercounts crossings. Any single round's count is
-low. The estimator is the same every round, so the *comparison* — recent 24
-against baseline 100 — remains valid. This is sound for classifying a regime
-and unsound for any round-level claim. Nothing in this design makes a
-round-level claim from `crossings`.
+**One second is still a sample, not the tape.** A round that crosses the
+strike twice inside one second is counted once. That is a far smaller error
+than 1m's 3.3x undercount and it is the same estimator every round, so the
+recent-against-baseline comparison stays valid either way.
+
+**The detector now costs a request.** One per minute in steady state, eight at
+startup. If that fetch fails the detector must hold its last committed reading
+rather than fall back to 1m closes, because a reading taken at a different
+resolution is not comparable to the baseline it would be scored against — it
+would look like the market had abruptly become straighter and calmer, which is
+exactly the false BIASED signal this whole change exists to prevent.
+
+**Backtest and live must sample identically.** Thresholds calibrated on 1s
+data are wrong on 1m data by the factors in the table above. The verification
+harness and the live detector therefore read the same interval, and that is a
+correctness requirement rather than a convenience.
 
 ### Hysteresis
 

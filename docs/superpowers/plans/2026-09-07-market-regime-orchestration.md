@@ -4,7 +4,7 @@
 
 **Goal:** Make the bot read which of three market states it is in and choose the strategy that fits, instead of running one strategy chosen at startup for the whole session.
 
-**Architecture:** A detector classifies the last ~24 five-minute rounds against the ~100 behind them, using the 1m closes already fetched for volatility. A `PLAYBOOKS` table maps each state to an ordered list of (profile, overlay) entries; the first that opens a position wins the round. Governance limits (`daily_loss_limit_pct`, `max_consecutive_losses`, `max_rounds_per_day`) are pinned for the session by `ADAPTIVE_ENVELOPE` so switching strategies cannot move a budget accounted against the day.
+**Architecture:** A detector classifies the last ~24 five-minute rounds against the ~100 behind them, from its own 1-second kline buffer (1m sampling was measured to see only 31% of strike crossings and to overstate straightness by 2.3x). A `PLAYBOOKS` table maps each state to an ordered list of (profile, overlay) entries; the first that opens a position wins the round. Governance limits (`daily_loss_limit_pct`, `max_consecutive_losses`, `max_rounds_per_day`) are pinned for the session by `ADAPTIVE_ENVELOPE` so switching strategies cannot move a budget accounted against the day.
 
 **Tech Stack:** Python 3, stdlib only (`math`, `statistics`, `itertools`, `dataclasses`), `requests` for HTTP, `unittest` for tests. No new dependencies.
 
@@ -17,7 +17,9 @@
 - Standard library only. No numpy, no pandas.
 - Tests run with `python -m unittest test_btc_5m -v`. Every task's tests must pass before commit.
 - `Config` is a frozen dataclass whose `__post_init__` validates. Any new field needs its validation written in the same task.
-- No new API calls in the trading loop. The detector is fed from the closes `VolatilityEstimator.sigma_annual` already fetches.
+- The detector reads **1-second** klines on its own fetch and its own rolling buffer — NOT the 1m closes `sigma_annual` fetches. Measured over 120 real rounds, 1m sampling sees 31% of strike crossings and 36% of travel, and overstates straightness by 2.3x. Both classifier axes are resolution-dependent in the same direction, so a 1m detector reads every market as straighter and calmer than it is.
+- Steady-state cost is one request per minute (top up the buffer with the seconds since the last refresh); startup costs eight (seed two hours). Binance weight 2 per request against a 6000/minute IP budget.
+- The backtest and the live detector MUST sample at the same interval. Thresholds calibrated at 1s are wrong at 1m by the factors above. This is a correctness requirement, not a convenience.
 - Regime names are the exact strings `"FLAT"`, `"BIASED"`, `"SWINGY"`, plus `"UNKNOWN"` for the uncommitted initial state. No other spellings.
 - Governance fields, pinned and never overridable by a playbook overlay: `daily_loss_limit_pct`, `max_consecutive_losses`, `max_rounds_per_day`.
 - Commit after every task with the message given in that task's final step.
@@ -298,16 +300,48 @@ In `btc_5m_predictor.py`, immediately after `trend_lookback_min: int = 30` (line
     # to catch a real shift inside a 1-2 hour state, long enough that a
     # single odd round cannot swap the strategy.
     regime_commit_readings: int = 3
+    # The kline interval the detector samples at, and how much it keeps.
+    #
+    # 1s, NOT the 1m the volatility uses, and that is not a preference. Over
+    # 120 real rounds, sampling the same rounds at 1m sees 31% of the strike
+    # crossings and 36% of the travel, and overstates straightness by 2.3x --
+    # 13 of 40 rounds crossed the strike and showed ZERO crossings at 1m.
+    # Coarse sampling makes every market look straighter and calmer than it
+    # is, which is exactly the false BIASED reading that would route straddle
+    # money into a market that had stopped swinging.
+    regime_interval: str = "1s"
+    # 24 recent rounds + 96 baseline = 120 rounds = 10 hours. Seeding that
+    # costs 36 requests once at startup; steady state is one per minute.
+    regime_buffer_s: int = 36000
+    regime_cache_s: float = 60.0
     # FLAT: barely moved, and died near the strike.
-    regime_flat_travel_ratio: float = 0.60
-    regime_flat_terminal_ratio: float = 0.60
+    regime_flat_travel_ratio: float = 0.70
+    regime_flat_terminal_ratio: float = 0.70
     # BIASED: picked a side, went, stayed.
-    regime_biased_straightness: float = 0.55
-    regime_biased_terminal_ratio: float = 1.20
-    regime_biased_max_crossings: float = 0.5
+    #
+    # CALIBRATED ON 4032 REAL ROUNDS -- fourteen days of 1s BTCUSDT -- by
+    # grid search over the ROLLING-WINDOW statistics, constrained to leave
+    # the three rules non-overlapping. Over that fortnight they produce
+    # FLAT 32.3%, BIASED 35.5%, SWINGY 32.2%, with 54 state changes: one
+    # every six hours, median run 4.2 hours.
+    #
+    # The distinction that matters, and that cost two drafts to learn: the
+    # classifier reads MEDIANS OVER 24 ROUNDS, not individual rounds, and a
+    # median of 24 draws concentrates far more tightly than the draws do.
+    # Per-round crossings have p10 = 0, which made "crossings <= 1.0" look
+    # like a reasonable BIASED gate; the 24-round rolling mean has p5 = 1.00,
+    # so that same gate excluded 95% of the fortnight and BIASED fired on
+    # 0.5% of windows. Calibrate against the rolling statistics or the rule
+    # will be dead in a way reading it cannot reveal.
+    #
+    # Read at 1m these numbers mean something else entirely, which is why the
+    # interval above is not a knob to turn casually.
+    regime_biased_straightness: float = 0.20
+    regime_biased_terminal_ratio: float = 1.05
+    regime_biased_max_crossings: float = 2.2
     # SWINGY: covered ground and ended nowhere.
-    regime_swingy_min_crossings: float = 1.2
-    regime_swingy_straightness: float = 0.40
+    regime_swingy_min_crossings: float = 2.8
+    regime_swingy_straightness: float = 0.14
     regime_swingy_travel_ratio: float = 0.80
 ```
 
@@ -641,159 +675,316 @@ git commit -m "Refuse to call a single odd round a change of market state"
 
 ---
 
-### Task 4: Feed the detector from the closes already fetched
+### Task 4: The detector and its one-second rolling buffer
 
 **Files:**
-- Modify: `btc_5m_predictor.py` — `VolatilityEstimator.__init__` (line 1864), `sigma_annual` (line 1878), plus two new methods
-- Test: `test_btc_5m.py` — append `TestRegimeFromKlines`
+- Modify: `btc_5m_predictor.py` — new `RegimeDetector` class placed immediately after `VolatilityEstimator`
+- Test: `test_btc_5m.py` — append `TestRegimeDetector`
 
 **Interfaces:**
-- Consumes: `measure_round_shape`, `classify_regime`, `RegimeTracker`, `RegimeReading`
-- Produces: `VolatilityEstimator.regime(symbol: str | None = None) -> RegimeReading`, and `VolatilityEstimator._measure_regime(closes: list[float], symbol: str) -> None`
+- Consumes: `measure_round_shape`, `classify_regime`, `RegimeTracker`, `RegimeReading`, `Config`
+- Produces: `RegimeDetector(cfg: Config | ConfigStore, session: requests.Session)` with methods `refresh(symbol: str, now_ms: int) -> None` and `reading(symbol: str | None = None) -> RegimeReading`
+
+**Why this is its own class and its own fetch.** `VolatilityEstimator` measures at 1m because volatility over 500 minutes is what the pricing model needs. The regime measures at 1s because, over 120 real rounds, 1m sampling sees 31% of strike crossings and 36% of travel and overstates straightness by 2.3x. Two different questions at two different timescales; sharing a fetch would force one of them to be wrong. The "same closes" discipline `_measure_trend` follows exists to stop a trend being compared against a sigma from a different moment — the regime is never compared against the sigma, so it does not apply.
 
 - [ ] **Step 1: Write the failing tests**
 
 Append to `test_btc_5m.py`:
 
 ```python
-class TestRegimeFromKlines(unittest.TestCase):
-    """The detector reads the closes sigma_annual already fetched."""
+class FakeKlineSession:
+    """Serves 1s klines from a generated price path, and counts requests."""
 
-    def _estimator(self, closes):
-        cfg = m.Config(api_key="k", api_secret="s")
+    def __init__(self, path_fn, start_ms, count):
+        # path_fn(i) -> close for second i
+        self.rows = [(start_ms + i * 1000, path_fn(i)) for i in range(count)]
+        self.requests = 0
 
-        class FakeResp:
+    def get(self, url, params=None, timeout=None):
+        self.requests += 1
+        start = int(params.get("startTime", 0))
+        end = int(params.get("endTime", 1 << 62))
+        limit = int(params.get("limit", 1000))
+        window = [r for r in self.rows if start <= r[0] <= end][:limit]
+        payload = [[ts, "0", "0", "0", f"{c}", "0"] for ts, c in window]
+
+        class Resp:
             status_code = 200
 
             def raise_for_status(self):
                 pass
 
             def json(self):
-                # Binance kline rows: index 4 is the close.
-                return [[0, "0", "0", "0", f"{c}", "0"] for c in closes]
+                return payload
 
-        class FakeSession:
-            def get(self, url, params=None, timeout=None):
-                return FakeResp()
+        return Resp()
 
-        return m.VolatilityEstimator(cfg, FakeSession())
 
-    def test_regime_is_unknown_before_sigma_is_called(self):
-        est = self._estimator([100.0] * 600)
-        self.assertEqual(est.regime("BTCUSDT").current, "UNKNOWN")
+class TestRegimeDetector(unittest.TestCase):
+
+    def _detector(self, path_fn, minutes=180):
+        cfg = m.Config(api_key="k", api_secret="s")
+        self.start = 1_700_000_000_000 // 300_000 * 300_000
+        session = FakeKlineSession(path_fn, self.start, minutes * 60)
+        self.now = self.start + minutes * 60 * 1000
+        return m.RegimeDetector(cfg, session), session
+
+    def test_reading_is_unknown_before_any_refresh(self):
+        det, _ = self._detector(lambda i: 100.0)
+        self.assertEqual(det.reading("BTCUSDT").current, "UNKNOWN")
 
     def test_a_steadily_climbing_market_reads_biased(self):
-        # 600 minutes climbing without a pullback: every 5m block is a
-        # straight run that ends far above where it opened.
-        closes = [100.0 * (1.0006 ** i) for i in range(600)]
-        est = self._estimator(closes)
+        # Rises every second without a pullback: every round is a straight
+        # run that never returns across its own opening price.
+        det, _ = self._detector(lambda i: 100.0 * (1.0000015 ** i))
         for _ in range(5):
-            est._cache.clear()
-            est.sigma_annual("BTCUSDT")
-        self.assertEqual(est.regime("BTCUSDT").current, "BIASED")
+            det._last_fetch.clear()
+            det.refresh("BTCUSDT", self.now)
+        self.assertEqual(det.reading("BTCUSDT").current, "BIASED")
 
-    def test_regime_survives_a_short_close_series(self):
-        est = self._estimator([100.0 + (i % 3) for i in range(40)])
-        est.sigma_annual("BTCUSDT")
-        self.assertIn(est.regime("BTCUSDT").current,
-                      ("UNKNOWN", "FLAT", "BIASED", "SWINGY"))
+    def test_a_market_oscillating_across_the_open_reads_swingy(self):
+        det, _ = self._detector(
+            lambda i: 100.0 + 0.5 * math.sin(i / 40.0))
+        for _ in range(5):
+            det._last_fetch.clear()
+            det.refresh("BTCUSDT", self.now)
+        self.assertEqual(det.reading("BTCUSDT").current, "SWINGY")
+
+    def test_the_cache_stops_a_refresh_from_refetching(self):
+        det, session = self._detector(lambda i: 100.0)
+        det.refresh("BTCUSDT", self.now)
+        seeded = session.requests
+        self.assertGreater(seeded, 1, "seeding should page through the buffer")
+        det.refresh("BTCUSDT", self.now)
+        self.assertEqual(session.requests, seeded,
+                         "a refresh inside regime_cache_s must not refetch")
+
+    def test_a_later_refresh_tops_up_rather_than_reseeding(self):
+        det, session = self._detector(lambda i: 100.0, minutes=180)
+        det.refresh("BTCUSDT", self.now)
+        seeded = session.requests
+        det._last_fetch.clear()
+        det.refresh("BTCUSDT", self.now + 60_000)
+        self.assertLess(session.requests - seeded, seeded,
+                        "top-up must be cheaper than the seed")
+
+    def test_the_buffer_is_trimmed_to_its_configured_span(self):
+        det, _ = self._detector(lambda i: 100.0, minutes=600)
+        det.refresh("BTCUSDT", self.now)
+        rows = det._buf["BTCUSDT"]
+        span = (rows[-1][0] - rows[0][0]) / 1000
+        cfg = m.Config(api_key="k", api_secret="s")
+        self.assertLessEqual(span, cfg.regime_buffer_s + 1)
 
     def test_reading_carries_its_measurements(self):
-        closes = [100.0 * (1.0006 ** i) for i in range(600)]
-        est = self._estimator(closes)
-        est.sigma_annual("BTCUSDT")
-        reading = est.regime("BTCUSDT")
-        keys = dict(reading.measures)
+        det, _ = self._detector(lambda i: 100.0 * (1.0000015 ** i))
+        det.refresh("BTCUSDT", self.now)
+        keys = dict(det.reading("BTCUSDT").measures)
         self.assertIn("travel_ratio", keys)
         self.assertIn("crossings", keys)
+
+    def test_a_failed_fetch_holds_the_last_reading(self):
+        det, session = self._detector(lambda i: 100.0 * (1.0000015 ** i))
+        for _ in range(5):
+            det._last_fetch.clear()
+            det.refresh("BTCUSDT", self.now)
+        before = det.reading("BTCUSDT").current
+
+        def boom(*a, **kw):
+            raise requests.RequestException("network down")
+
+        session.get = boom
+        det._last_fetch.clear()
+        det.refresh("BTCUSDT", self.now + 60_000)
+        self.assertEqual(det.reading("BTCUSDT").current, before)
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `python -m unittest test_btc_5m.TestRegimeFromKlines -v`
-Expected: FAIL with `AttributeError: 'VolatilityEstimator' object has no attribute 'regime'`
+Run: `python -m unittest test_btc_5m.TestRegimeDetector -v`
+Expected: FAIL with `AttributeError: module 'btc_5m_predictor' has no attribute 'RegimeDetector'`
 
-- [ ] **Step 3: Add the tracker store to `__init__`**
+- [ ] **Step 3: Write the class**
 
-In `VolatilityEstimator.__init__`, immediately after `self._trend: dict[str, Trend] = {}`, add:
+Insert into `btc_5m_predictor.py` immediately after `VolatilityEstimator`:
 
 ```python
+class RegimeDetector:
+    """
+    Which of three states the market is in, measured second by second.
+
+    WHY THIS DOES NOT SHARE THE VOLATILITY FETCH
+    -------------------------------------------
+    It was written that way first, because the 1m closes were already in
+    hand and reusing them cost nothing. Measurement killed it. Over 120
+    consecutive real BTCUSDT rounds, sampling the same rounds at 1m rather
+    than 1s sees 31% of the strike crossings and 36% of the travel, and
+    OVERSTATES straightness by 2.3x -- 13 of 40 rounds crossed the strike
+    and showed zero crossings at 1m.
+
+    Both classification axes are resolution-dependent, and in the same
+    direction: coarse sampling makes every market look straighter and calmer
+    than it is. That is not a small error at the margin, it is the exact
+    false BIASED reading that would route straddle money into a market which
+    had stopped swinging.
+
+    THE BUFFER
+    ----------
+    Two hours of 1s closes is 7200 candles, eight requests at the venue's
+    1000-candle limit. Paying that every minute would be wasteful, so the
+    buffer is seeded once and afterwards topped up with only the seconds
+    since the last refresh -- one request per minute in steady state.
+
+    A failed fetch HOLDS the last committed reading rather than falling back
+    to coarser data. A reading taken at a different resolution is not
+    comparable to the baseline it would be scored against; it would look
+    like the market had abruptly become straighter, which is the very error
+    this class exists to avoid.
+    """
+
+    def __init__(self, cfg: Config | ConfigStore,
+                 session: requests.Session) -> None:
+        self._store = None if isinstance(cfg, Config) else cfg
+        self._static_cfg = cfg if isinstance(cfg, Config) else None
+        self._session = session
+        self._buf: dict[str, list[tuple[int, float]]] = {}
+        self._last_fetch: dict[str, float] = {}
         self._trackers: dict[str, RegimeTracker] = {}
-        self._regime: dict[str, RegimeReading] = {}
-```
+        self._readings: dict[str, RegimeReading] = {}
 
-- [ ] **Step 4: Call the detector from `sigma_annual`**
+    @property
+    def _cfg(self) -> Config:
+        return self._static_cfg if self._store is None else self._store.current
 
-In `sigma_annual`, immediately after the existing line `self._trend[symbol] = self._measure_trend(closes)`, add:
+    def reading(self, symbol: str | None = None) -> RegimeReading:
+        """Last committed reading for `symbol`. Never raises."""
+        return self._readings.get(symbol or self._cfg.symbol, RegimeReading())
 
-```python
-        # Same closes as the sigma and the trend, deliberately. A regime read
-        # off a different fetch than the volatility it is scaled by is two
-        # snapshots of two moments pretending to be one.
-        self._measure_regime(closes, symbol)
-```
+    def _fetch(self, symbol: str, start_ms: int,
+               end_ms: int) -> list[tuple[int, float]]:
+        cfg = self._cfg
+        out: list[tuple[int, float]] = []
+        cursor = start_ms
+        while cursor < end_ms:
+            resp = self._session.get(
+                BASE + "/api/v3/klines",
+                params={"symbol": symbol, "interval": cfg.regime_interval,
+                        "startTime": cursor, "endTime": end_ms,
+                        "limit": 1000},
+                timeout=cfg.http_timeout_s)
+            resp.raise_for_status()
+            rows = resp.json()
+            if not rows:
+                break
+            for row in rows:
+                close = float(row[4])
+                if close > 0:
+                    out.append((int(row[0]), close))
+            nxt = int(rows[-1][0]) + 1000
+            if nxt <= cursor:
+                break
+            cursor = nxt
+        return out
 
-- [ ] **Step 5: Write the two methods**
-
-Insert into `VolatilityEstimator` immediately after `_measure_trend`:
-
-```python
-    def _measure_regime(self, closes: list[float], symbol: str) -> None:
+    def refresh(self, symbol: str, now_ms: int) -> None:
         """
-        Cut the closes into rounds, classify the recent ones, and commit.
+        Top the buffer up and reclassify. Safe to call every poll.
 
-        Costs one pass over data already in memory and no network at all.
+        Swallows network failures deliberately: a regime reading is an
+        opinion about which strategy suits the market, and losing it for a
+        minute must never be able to stop the loop that is managing real
+        money.
         """
         cfg = self._cfg
-        window = [c for c in closes if c > 0]
-        block = max(1, round(cfg.round_seconds / 60.0))
+        if time.time() - self._last_fetch.get(symbol, 0.0) < cfg.regime_cache_s:
+            return
+
+        buf = self._buf.get(symbol, [])
+        oldest = now_ms - cfg.regime_buffer_s * 1000
+        start = buf[-1][0] + 1000 if buf else oldest
+        try:
+            fresh = self._fetch(symbol, start, now_ms)
+        except (requests.RequestException, ValueError, KeyError,
+                IndexError) as exc:
+            LOG.debug("Regime feed for %s unavailable: %s", symbol, exc)
+            return
+
+        self._last_fetch[symbol] = time.time()
+        buf = [r for r in buf + fresh if r[0] >= oldest]
+        self._buf[symbol] = buf
+        self._classify(symbol, buf)
+
+    def _classify(self, symbol: str,
+                  rows: list[tuple[int, float]]) -> None:
+        cfg = self._cfg
         tracker = self._trackers.setdefault(
             symbol, RegimeTracker(cfg.regime_commit_readings))
-        if len(window) < block * 2 + 1:
-            self._regime[symbol] = tracker.reading
+        step_ms = cfg.round_seconds * 1000
+
+        # Grouped on the WALL CLOCK, because that is where rounds open. A
+        # block cut at an arbitrary offset from the first candle would
+        # measure a strike the venue never used.
+        groups: dict[int, list[float]] = {}
+        for ts, close in rows:
+            groups.setdefault(ts // step_ms, []).append(close)
+        keys = sorted(groups)
+        # Drop the round in progress: it has no outcome yet, and scoring a
+        # partial round against complete ones reads as an unusually calm one.
+        complete = [groups[k] for k in keys[:-1]
+                    if len(groups[k]) >= cfg.round_seconds * 0.9]
+        if len(complete) < cfg.regime_recent_rounds + cfg.regime_min_rounds:
+            self._readings[symbol] = tracker.reading
             return
 
-        steps = [math.log(b / a) for a, b in itertools.pairwise(window)]
-        sd_step = statistics.pstdev(steps)
+        flat = [c for chunk in complete for c in chunk]
+        steps = [math.log(b / a) for a, b in itertools.pairwise(flat)]
+        sd_step = statistics.pstdev(steps) if steps else 0.0
         if sd_step <= 0:
-            self._regime[symbol] = tracker.reading
+            self._readings[symbol] = tracker.reading
             return
-        sigma_block = sd_step * math.sqrt(block)
+        sigma_block = sd_step * math.sqrt(cfg.round_seconds)
 
-        # Blocks of one round each, oldest first, each including the close
-        # it opened at as its first sample -- that open is the strike.
-        edges = list(range(len(window) - 1, -1, -block))[::-1]
-        shapes = [measure_round_shape(window[a:b + 1], sigma_block)
-                  for a, b in itertools.pairwise(edges)]
-        if len(shapes) < cfg.regime_min_rounds + 1:
-            self._regime[symbol] = tracker.reading
-            return
-
+        shapes = [measure_round_shape(chunk, sigma_block)
+                  for chunk in complete]
         recent = shapes[-cfg.regime_recent_rounds:]
-        baseline = shapes[:-cfg.regime_recent_rounds] or shapes
+        baseline = shapes[:-cfg.regime_recent_rounds]
         label, measures = classify_regime(recent, baseline, cfg)
-        self._regime[symbol] = tracker.update(label, time.time(), measures)
-
-    def regime(self, symbol: str | None = None) -> RegimeReading:
-        """Regime state for `symbol`. Call sigma_annual first."""
-        return self._regime.get(symbol or self._cfg.symbol, RegimeReading())
+        self._readings[symbol] = tracker.update(label, time.time(), measures)
 ```
 
-- [ ] **Step 6: Run the tests to verify they pass**
+- [ ] **Step 4: Wire it into the Trader**
 
-Run: `python -m unittest test_btc_5m.TestRegimeFromKlines -v`
-Expected: PASS, 4 tests
+In `Trader.__init__`, immediately after the `VolatilityEstimator` is constructed, add:
 
-- [ ] **Step 7: Run the whole suite**
+```python
+        self._regime_detector = RegimeDetector(self._store or self._cfg,
+                                               self._vol._session)
+```
+
+Then replace the `_regime_reading` stub added in Task 10 with a version that refreshes first — if Task 10 has not yet run, add this method now:
+
+```python
+    def _regime_reading(self) -> RegimeReading:
+        self._regime_detector.refresh(self._cfg.symbol,
+                                      self._client.now_ms())
+        return self._regime_detector.reading(self._cfg.symbol)
+```
+
+- [ ] **Step 5: Run the tests to verify they pass**
+
+Run: `python -m unittest test_btc_5m.TestRegimeDetector -v`
+Expected: PASS, 8 tests
+
+- [ ] **Step 6: Run the whole suite**
 
 Run: `python -m unittest test_btc_5m 2>&1 | tail -5`
 Expected: OK
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
 git add btc_5m_predictor.py test_btc_5m.py
-git commit -m "Read the market's state from the closes the volatility already cost us"
+git commit -m "Measure the market's state second by second, not minute by minute"
 ```
 
 ---
@@ -1675,7 +1866,7 @@ Insert into `class Trader`, immediately after `_pin_gate`:
         if available < cfg.min_stake_usdt:
             return
 
-        reading = self._vol.regime()
+        reading = self._regime_reading()
         for raw in self._client.open_rounds():
             if any(k[0] == raw.symbol for k in self._positions):
                 continue
@@ -1684,7 +1875,7 @@ Insert into `class Trader`, immediately after `_pin_gate`:
             seconds_left = raw.seconds_remaining(self._client.now_ms())
             spot = self._client.spot_price(raw.symbol)
             sigma = self._vol.sigma_annual(raw.symbol)
-            reading = self._vol.regime(raw.symbol)
+            reading = self._regime_detector.reading(raw.symbol)
 
             block_sigma = sigma * math.sqrt(
                 cfg.round_seconds / (365.0 * 24.0 * 60.0 * 60.0))
@@ -1888,7 +2079,9 @@ Replace the whole of `Trader._maybe_enter` with:
         return cached
 
     def _regime_reading(self) -> RegimeReading:
-        return self._vol.regime()
+        self._regime_detector.refresh(self._cfg.symbol,
+                                      self._client.now_ms())
+        return self._regime_detector.reading(self._cfg.symbol)
 
     def _dispatch_entry(self, cfg: Config, bankroll: float,
                         mode: str) -> None:
@@ -2113,7 +2306,7 @@ Replace `Trader._maybe_scale_in_all` with:
             cfg = pos.entry_cfg or self._cfg
             if cfg.straddle:
                 continue
-            reading = self._vol.regime(pos.rnd.symbol)
+            reading = self._regime_detector.reading(pos.rnd.symbol)
             trend = self._vol.trend(pos.rnd.symbol)
             lock_in = self._lock_in_available(pos)
             action = self._position_action(reading, trend,
