@@ -7131,6 +7131,34 @@ class TestLastMinuteConfig(unittest.TestCase):
         self.assertGreaterEqual(
             spendable, c.last_minute_stake_pct * c.max_concurrent_positions)
 
+    def test_the_ceiling_is_off_by_default(self):
+        """
+        1.0 is "no ceiling", which is the rule as specified. Turning it on is
+        a decision about which trades the strategy is for, not a default.
+        """
+        self.assertEqual(lastminute_cfg().last_minute_max_price, 1.0)
+        self.assertEqual(
+            Config(api_key="k", api_secret="s").last_minute_max_price, 1.0)
+
+    def test_a_ceiling_at_or_under_the_floor_is_rejected(self):
+        """
+        No price could satisfy both, so the primary branch could never fire
+        and the profile would quietly become fallback-only.
+        """
+        for bad in (0.75, 0.60, 0.30):
+            with self.assertRaises(ValueError):
+                lastminute_cfg(last_minute_max_price=bad)
+
+    def test_a_ceiling_above_certainty_is_rejected(self):
+        with self.assertRaises(ValueError):
+            lastminute_cfg(last_minute_max_price=1.01)
+
+    def test_a_ceiling_between_the_floor_and_one_is_accepted(self):
+        for good in (0.80, 0.85, 0.90, 1.0):
+            self.assertEqual(
+                lastminute_cfg(last_minute_max_price=good).
+                last_minute_max_price, good)
+
     def test_a_floor_at_or_below_a_coin_flip_is_rejected(self):
         """Below 0.5 the floor can never fail, so the fallback is dead code."""
         for bad in (0.5, 0.4, 0.0):
@@ -7352,6 +7380,76 @@ class TestLastMinuteEntry(unittest.TestCase):
                            10 * m.wins_per_loss(0.75))
 
     # -- it consults nothing else -----------------------------------------
+
+    # -- the price ceiling ------------------------------------------------
+
+    def test_the_default_profile_buys_a_dear_leader(self):
+        """The ceiling is off by default, so nothing above the floor binds."""
+        t, _ = self._at(55.0, 0.97, 0.03)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
+    def test_a_ceiling_refuses_the_leader_above_it(self):
+        t, _ = self._at(55.0, 0.97, 0.03, last_minute_max_price=0.90)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        self.assertEqual(t._watching[1][1],
+                         "the leading side is priced above the ceiling")
+        # Refused, not written off: the leader can cheapen before the round
+        # ends, and a round that comes back under the ceiling is tradable.
+        self.assertNotIn(1, t._seen)
+
+    def test_a_ceiling_still_takes_the_band_below_it(self):
+        t, _ = self._at(55.0, 0.88, 0.12, last_minute_max_price=0.90)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
+    def test_the_ceiling_binds_just_above_it(self):
+        t, _ = self._at(55.0, 0.9001, 0.0999, last_minute_max_price=0.90)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+
+    def test_the_ceiling_clears_exactly_at_it(self):
+        t, _ = self._at(55.0, 0.90, 0.10, last_minute_max_price=0.90)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
+    def test_the_clock_never_relaxes_the_ceiling(self):
+        """
+        Unlike the floor, which the fallback drops on purpose, a round that
+        is already decided does not become a better bet for being nearly
+        over. Nothing about the ceiling is time-dependent.
+        """
+        for secs in (58.0, 44.0, 10.0):
+            t, _ = self._at(secs, 0.97, 0.03, last_minute_max_price=0.90)
+            t._maybe_enter(100.0, "PAPER")
+            self.assertEqual(t._positions, {}, f"{secs}s")
+
+    def test_the_ceiling_cannot_reach_the_fallbacks_prices(self):
+        """
+        The fallback only fires under the floor, and the ceiling is above it,
+        so the two can never contradict each other.
+        """
+        t, _ = self._at(40.0, 0.60, 0.40, last_minute_max_price=0.90)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
+    def test_the_quote_is_re_tested_against_the_ceiling(self):
+        """A book under the ceiling and a quote over it is not an approval."""
+        t, _ = self._at(55.0, 0.88, 0.12, client_cls=QuotingClient, live=True,
+                        last_minute_max_price=0.90)
+        t._client._quotes = {Side.UP: 0.95, Side.DOWN: 0.05}
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        self.assertEqual(t._watching[1][1],
+                         "the leading side is priced above the ceiling")
+
+    def test_the_ceiling_bounds_how_many_wins_cover_a_loss(self):
+        """What the knob is actually for, stated in the unit that matters."""
+        c = lastminute_cfg(last_minute_max_price=0.90)
+        self.assertAlmostEqual(m.wins_per_loss(c.last_minute_max_price),
+                               9.0, places=9)
+        self.assertGreater(m.win_return(c.last_minute_max_price, 200), 0.10)
 
     def test_the_model_gates_are_not_consulted(self):
         """

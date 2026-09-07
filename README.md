@@ -347,10 +347,16 @@ gets bought:
 | 0.90 | +11% | 9.0 |
 | 0.97 | +3% | 32.3 |
 
-That is the profile as specified, and it is written down in the code rather
-than guarded against. `--calibration-report`'s favourite-longshot table is what
-says whether the venue's late favourites win often enough to pay for the dear
-ones. Two rounds are left alone and neither is a price judgement: one where the
+`last_minute_max_price` is the one knob that changes this. It defaults to
+**1.0 — no ceiling**, which is the rule as specified; set it to `0.90` (9 wins
+per loss) or `0.85` (6) and those rounds are refused instead. It is off by
+default because refusing them is a decision about which trades the strategy is
+*for*, not a bug fix — `--calibration-report`'s favourite-longshot table is what
+says whether the venue's late favourites win often enough to pay for them.
+
+Unlike the floor, the ceiling is never relaxed by the clock: a round that is
+already decided does not become a better bet for being nearly over. And it can
+never contradict the fallback, which only ever fires *below* the floor. Two rounds are left alone and neither is a price judgement: one where the
 sides are quoted **level** (there is no dominant side, and picking one anyway
 would invent the only signal this strategy refuses to have), and one where the
 leader has rounded to **1.00** (it cannot pay back more than it cost).

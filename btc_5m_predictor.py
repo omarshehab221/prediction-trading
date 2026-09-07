@@ -492,6 +492,27 @@ class Config:
     # the floor would say the same thing, the floor could never fail, and
     # the fallback below would be dead code wearing the costume of a setting.
     last_minute_price_floor: float = 0.75
+    # Never pay more than this for the leader. 1.0 means NO ceiling, which
+    # is the rule as originally specified and the default here.
+    #
+    # It exists because the floor has nothing above it, and that asymmetry is
+    # where this strategy bleeds. The floor is a payout question wearing a
+    # price: at 0.75 a win pays about 33% and 3 wins cover a loss, but at
+    # 0.97 a win pays about 3% and it takes 32. Those are not the same trade,
+    # and the second one is what a round that is ALREADY DECIDED at 55
+    # seconds looks like -- so the dear fills are exactly the ones with the
+    # least left to win and the most already priced in.
+    #
+    # Deliberately a price and not a min_win_return: the return floor is the
+    # model path's instrument and it derives its cap from each market's fee,
+    # which is the right shape for a strategy that reasons in probabilities.
+    # This one reasons in nothing but the quote, so its ceiling is a quote.
+    #
+    # 0.90 (about 9 wins per loss) or 0.85 (about 6) are the settings worth
+    # trying; both are still above the 0.75 floor, so the band they leave --
+    # 0.75 to the ceiling -- is where this profile does its work. Below the
+    # floor the ceiling can never bind, so it does not touch the fallback.
+    last_minute_max_price: float = 1.0
     # Below this many seconds the floor is dropped and the leader is bought
     # at whatever it costs.
     #
@@ -721,6 +742,15 @@ class Config:
                 "straddle and scale_in cannot both be enabled")
         if not 0 < self.last_minute_stake_pct <= 0.25:
             raise ValueError("last_minute_stake_pct must be in (0, 0.25]")
+        if not self.last_minute_price_floor < self.last_minute_max_price <= 1.0:
+            # At or below the floor no price could satisfy both, so the
+            # primary branch could never fire and the profile would quietly
+            # become fallback-only -- a different strategy wearing this
+            # one's name. Above 1.0 it is not a price.
+            raise ValueError(
+                f"last_minute_max_price ({self.last_minute_max_price}) must "
+                f"be above last_minute_price_floor "
+                f"({self.last_minute_price_floor}) and at most 1.0")
         if not 0.5 < self.last_minute_price_floor < 1.0:
             # See the field comment: at or below 0.5 the floor can never
             # fail, so the fallback can never fire.
@@ -1070,6 +1100,11 @@ PROFILES: dict[str, dict] = {
     "lastminute": {"last_minute": True, "last_minute_stake_pct": 0.10,
                    "last_minute_start_s": 60.0,
                    "last_minute_price_floor": 0.75,
+                   # No ceiling, stated rather than inherited. This is the
+                   # rule as asked for: above the floor, price is not a
+                   # reason to refuse. Set it to 0.90 or 0.85 to stop buying
+                   # rounds the book has already finished pricing.
+                   "last_minute_max_price": 1.0,
                    "last_minute_fallback_s": 45.0,
                    "last_minute_deadline_s": 5.0,
                    # Matched to last_minute_stake_pct, not inherited. The
@@ -4446,6 +4481,13 @@ class Trader:
                      "last_minute_price_floor to take more of these before "
                      "the fallback has to.",
                      self._cfg.last_minute_price_floor)
+        elif top == "the leading side is priced above the ceiling":
+            LOG.info("  The rounds reaching the last minute were already "
+                     "decided, and %.2f is the most this profile will pay "
+                     "for one. That is the ceiling doing its job, not a "
+                     "fault. Raise last_minute_max_price to take them, "
+                     "understanding a win at 0.97 pays about 3%%.",
+                     self._cfg.last_minute_max_price)
         elif top == "the two sides are priced level":
             LOG.info("  The book could not separate UP from DOWN in the last "
                      "minute. There is no dominant side to buy in that, and "
@@ -5390,13 +5432,16 @@ class Trader:
             is bought at whatever it costs.
 
         The dear end is where this can bleed, and the dear end is the FIRST
-        branch, not the second. Nothing caps the price above the floor, so a
-        round already decided at 55 seconds quotes 0.97 and gets bought for
-        about 3% on a win, where it takes 32 wins to cover one loss -- against
-        3 wins at the 0.75 floor. That is the profile as specified, written
-        down here so it is a known cost rather than a discovered one; the
+        branch, not the second. By default nothing caps the price above the
+        floor, so a round already decided at 55 seconds quotes 0.97 and gets
+        bought for about 3% on a win, where it takes 32 wins to cover one
+        loss -- against 3 wins at the 0.75 floor. That is the profile as
+        specified, and last_minute_max_price is the one knob that changes it:
+        set it to 0.90 or 0.85 and those rounds are refused instead. It is
+        left at 1.0 by default because refusing them is a decision about
+        which trades the strategy is for, not a bug fix. The
         favourite-longshot table in --calibration-report is what says whether
-        the venue's late favourites win often enough to pay for it.
+        the venue's late favourites win often enough to pay for them.
 
         Two rounds are left alone, and neither is a judgement about price:
         one where the sides are quoted level, because there is no dearer side
@@ -5484,6 +5529,14 @@ class Trader:
                 self._watching[raw.topic_id] = (
                     raw.end_ms, "the leading side is priced at 1.00")
                 continue
+            if price > self._cfg.last_minute_max_price:
+                # Above the ceiling there is too little left to win for the
+                # whole stake it risks. Unlike the floor this is never
+                # relaxed by the clock: a round that is already decided does
+                # not become a better bet for being nearly over.
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "the leading side is priced above the ceiling")
+                continue
             if (price < self._cfg.last_minute_price_floor
                     and secs > self._cfg.last_minute_fallback_s):
                 self._watching[raw.topic_id] = (
@@ -5524,6 +5577,16 @@ class Trader:
                     LOG.info("%s: the %s quote came back at %.4f, which has "
                              "no payout; skipping", raw.slug, side.value,
                              quote.average_price)
+                    continue
+                if quote.average_price > self._cfg.last_minute_max_price:
+                    LOG.info("%s: the %s quote at %.4f is above the %.2f "
+                             "ceiling the book suggested it would clear; "
+                             "skipping", raw.slug, side.value,
+                             quote.average_price,
+                             self._cfg.last_minute_max_price)
+                    self._watching[raw.topic_id] = (
+                        raw.end_ms,
+                        "the leading side is priced above the ceiling")
                     continue
                 if (quote.average_price < self._cfg.last_minute_price_floor
                         and secs > self._cfg.last_minute_fallback_s):
@@ -6517,11 +6580,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(f"  max stake      "
                   f"{checked.last_minute_stake_pct:.0%} of bankroll "
                   f"per round")
+            ceiling = ("no ceiling"
+                       if checked.last_minute_max_price >= 1.0
+                       else f"never above "
+                            f"{checked.last_minute_max_price:.2f}")
             print(f"  entry rule     the dearer side at "
                   f"{checked.last_minute_price_floor:.2f}+ from "
                   f"{checked.last_minute_start_s:.0f}s, at any price from "
                   f"{checked.last_minute_fallback_s:.0f}s, nothing under "
-                  f"{checked.last_minute_deadline_s:.0f}s")
+                  f"{checked.last_minute_deadline_s:.0f}s; {ceiling}")
         else:
             print(f"  max stake      {checked.max_stake_pct:.0%} of bankroll")
         print(f"  min buffer     {checked.min_buffer_sigmas} sigma")
