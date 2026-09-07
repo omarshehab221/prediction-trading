@@ -7125,3 +7125,86 @@ class TestRoundShape(unittest.TestCase):
             shape = m.measure_round_shape(closes, sigma)
             self.assertEqual(shape.travel, 0.0)
             self.assertEqual(shape.crossings, 0)
+
+
+def _shapes(n, *, travel, straightness, terminal, crossings):
+    """n identical RoundShapes, for classifier tests."""
+    return [m.RoundShape(travel=travel, net=terminal,
+                         straightness=straightness, terminal=terminal,
+                         crossings=crossings) for _ in range(n)]
+
+
+class TestRegimeClassification(unittest.TestCase):
+
+    def setUp(self):
+        self.cfg = m.Config(api_key="k", api_secret="s")
+        # A neutral baseline: middling travel, middling terminal.
+        self.baseline = _shapes(100, travel=2.0, straightness=0.5,
+                                terminal=1.0, crossings=1)
+
+    def test_quiet_rounds_near_the_strike_are_flat(self):
+        recent = _shapes(24, travel=0.8, straightness=0.5, terminal=0.3,
+                         crossings=1)
+        label, measures = m.classify_regime(recent, self.baseline, self.cfg)
+        self.assertEqual(label, "FLAT")
+        self.assertLess(measures["travel_ratio"], 0.6)
+
+    def test_straight_rounds_ending_far_out_are_biased(self):
+        recent = _shapes(24, travel=3.0, straightness=0.9, terminal=2.5,
+                         crossings=0)
+        label, _ = m.classify_regime(recent, self.baseline, self.cfg)
+        self.assertEqual(label, "BIASED")
+
+    def test_wandering_rounds_that_end_nowhere_are_swingy(self):
+        recent = _shapes(24, travel=4.0, straightness=0.2, terminal=0.9,
+                         crossings=3)
+        label, _ = m.classify_regime(recent, self.baseline, self.cfg)
+        self.assertEqual(label, "SWINGY")
+
+    def test_unmatched_window_returns_no_label(self):
+        # Straight but not far out, few crossings: matches no rule.
+        recent = _shapes(24, travel=2.0, straightness=0.5, terminal=1.0,
+                         crossings=1)
+        label, measures = m.classify_regime(recent, self.baseline, self.cfg)
+        self.assertEqual(label, "")
+        self.assertIn("straightness", measures)
+
+    def test_too_few_rounds_returns_no_label(self):
+        recent = _shapes(3, travel=0.8, straightness=0.5, terminal=0.3,
+                         crossings=1)
+        label, measures = m.classify_regime(recent, self.baseline, self.cfg)
+        self.assertEqual(label, "")
+        self.assertEqual(measures, {})
+
+    def test_empty_baseline_returns_no_label(self):
+        recent = _shapes(24, travel=0.8, straightness=0.5, terminal=0.3,
+                         crossings=1)
+        label, _ = m.classify_regime(recent, [], self.cfg)
+        self.assertEqual(label, "")
+
+    def test_labels_are_mutually_exclusive_over_a_sweep(self):
+        # No input may satisfy two rules at once; that is what makes the
+        # order of the checks irrelevant to the answer.
+        for travel in (0.5, 1.5, 3.0, 5.0):
+            for straight in (0.1, 0.35, 0.5, 0.6, 0.95):
+                for terminal in (0.2, 0.9, 1.5, 3.0):
+                    for crossings in (0, 1, 2, 4):
+                        recent = _shapes(24, travel=travel,
+                                         straightness=straight,
+                                         terminal=terminal,
+                                         crossings=crossings)
+                        label, _ = m.classify_regime(recent, self.baseline,
+                                                     self.cfg)
+                        self.assertIn(label, ("", "FLAT", "BIASED", "SWINGY"))
+
+    def test_thresholds_are_ratios_so_a_vol_shift_does_not_relabel(self):
+        # Double every size in both windows: the label must not change.
+        recent = _shapes(24, travel=0.8, straightness=0.5, terminal=0.3,
+                         crossings=1)
+        loud_recent = _shapes(24, travel=1.6, straightness=0.5, terminal=0.6,
+                              crossings=1)
+        loud_baseline = _shapes(100, travel=4.0, straightness=0.5,
+                                terminal=2.0, crossings=1)
+        quiet, _ = m.classify_regime(recent, self.baseline, self.cfg)
+        loud, _ = m.classify_regime(loud_recent, loud_baseline, self.cfg)
+        self.assertEqual(quiet, loud)
