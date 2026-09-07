@@ -7054,27 +7054,67 @@ class TestStraddleEntry(unittest.TestCase):
         # Net vs the 100.0 start: +180 - 20 = +160.0.
         self.assertAlmostEqual(t._paper_bankroll, 260.0, places=9)
 
-    def test_a_first_leg_can_be_opened_well_into_a_round(self):
+    def test_the_opening_window_is_the_first_minute(self):
         """
-        Regression on the reported dead bot. At round open spot IS the
-        strike, so both sides price near 0.50 and neither can reach the 0.25
-        a first leg needs. A 15s opening window therefore pointed the opener
-        at the only stretch of the round where its entry price cannot occur,
-        and marked every round _seen the moment it elapsed. Live, that bought
-        one leg in an hour.
+        A first leg opened at t=240 of a 300s round has 60 seconds to find
+        its hedge, and usually does not. The window buys RUNWAY, not
+        cheapness: open early and the rest of the round is completion time.
+        """
+        c = straddle_cfg()
+        self.assertEqual(c.straddle_entry_window_s, 60.0)
+        self.assertEqual(m.Config.straddle_entry_window_s, 60.0)
+
+    def test_a_first_leg_opens_at_the_loosened_ceiling(self):
+        """
+        Sixty seconds in, spot has barely left the strike, so neither side is
+        anywhere near 0.25. A 0.25 ceiling on a 60s window would point the
+        opener at the one stretch of the round where its entry price cannot
+        occur -- the dead-bot failure, reintroduced from the other end. 0.38
+        is what an early book actually offers, and it still leaves 0.62 of
+        room for the hedge.
         """
         start = 1_700_000_000_000
         rnd = make_round(strike=100_000.0, start_ms=start,
-                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
-        books = {(1, Side.UP): [(0.15, 10_000)],
-                 (1, Side.DOWN): [(0.88, 10_000)]}
-        # Two minutes in: spot has moved, and UP is finally cheap.
-        client = FakeClient([rnd], [(start + 120_000, 100_000.0)], books, {})
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.38, 10_000)],
+                 (1, Side.DOWN): [(0.65, 10_000)]}
+        client = FakeClient([rnd], [(start + 30_000, 100_000.0)], books, {})
         t = self._trader(client)
 
         t._maybe_enter(100.0, "PAPER")
 
         self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+
+    def test_a_leg_dearer_than_the_opening_ceiling_is_still_refused(self):
+        """Loosened is not removed: 0.45 leaves too little room to hedge."""
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.45, 10_000)],
+                 (1, Side.DOWN): [(0.60, 10_000)]}
+        client = FakeClient([rnd], [(start + 30_000, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(t._positions, {})
+
+    def test_a_round_already_a_minute_old_is_left_alone(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.15, 10_000)],
+                 (1, Side.DOWN): [(0.88, 10_000)]}
+        client = FakeClient([rnd], [(start + 90_000, 100_000.0)], books, {})
+        t = self._trader(client)
+
+        t._maybe_enter(100.0, "PAPER")
+
+        self.assertEqual(t._positions, {})
+        self.assertIn(1, t._seen)
 
     def test_a_round_with_no_runway_left_to_hedge_is_left_alone(self):
         """
@@ -7190,6 +7230,71 @@ class TestStraddleEntry(unittest.TestCase):
         t._maybe_scale_in_all(100.0)   # must be a no-op: nothing to top up to
 
         self.assertEqual(t._positions, before)
+
+
+class TestStraddleCompletionBar(unittest.TestCase):
+    """
+    What the second leg holds out for, and why it is not a constant.
+
+    The bar used to be derived from straddle_first_leg_max_price -- the
+    OPENER's ceiling -- which made it over-ambitious the moment the opener
+    was loosened: a leg filled at 0.40 would refuse a 0.40 hedge that
+    matched its own profit exactly, and hold out for a 0.25 that no longer
+    had any relation to what the round cost. The bar is the open fill
+    itself: equal stakes at equal prices pay equally, so "as good as the
+    first leg" IS the open price. 0.25 stays a preferred entry, not a gate
+    on completing.
+    """
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self.rnd = make_round(fee_bps=0)
+        client = FakeClient([self.rnd], [(0, 100_000.0)], {}, {})
+        self.t = build_trader(client, straddle_cfg(db_path=self.db), self.db)
+
+    def tearDown(self):
+        os.unlink(self.db)
+
+    def _wait(self, be_open, be_other, seconds_left):
+        return self.t._completion_is_worth_waiting_out(
+            self.rnd, be_open, be_other, seconds_left)
+
+    def test_a_hedge_matching_the_open_price_is_taken_at_once(self):
+        # The regression. Opened at 0.40, offered 0.40: same price, same
+        # payout, round locked in. Nothing about waiting improves it.
+        self.assertFalse(self._wait(0.40, 0.40, 280.0))
+
+    def test_a_hedge_dearer_than_the_open_price_is_waited_out_early(self):
+        # 0.55 guarantees the round (0.40 + 0.55 < 1.00) but is worse than
+        # the leg already held, and there are four minutes to better it.
+        self.assertTrue(self._wait(0.40, 0.55, 280.0))
+
+    def test_that_same_hedge_is_taken_as_the_deadline_approaches(self):
+        self.assertFalse(self._wait(0.40, 0.55, 35.0))
+
+    def test_a_cheap_opener_still_holds_out_for_a_cheap_hedge(self):
+        # Unchanged behaviour where the two numbers used to agree.
+        self.assertTrue(self._wait(0.25, 0.70, 280.0))
+        self.assertFalse(self._wait(0.25, 0.25, 280.0))
+
+    def test_an_opener_at_even_money_is_not_choosy(self):
+        # be_open >= 0.5 leaves no room: the preferred price and the
+        # break-even limit are the same number or crossed.
+        self.assertFalse(self._wait(0.50, 0.49, 280.0))
+        self.assertFalse(self._wait(0.60, 0.39, 280.0))
+
+    def test_the_bar_never_consults_the_opening_ceiling(self):
+        # Moving the opener's ceiling must not move the completion bar.
+        loose = build_trader(
+            FakeClient([self.rnd], [(0, 100_000.0)], {}, {}),
+            straddle_cfg(db_path=self.db, straddle_first_leg_max_price=0.49),
+            self.db)
+        for be_other in (0.30, 0.45, 0.55):
+            self.assertEqual(
+                loose._completion_is_worth_waiting_out(
+                    self.rnd, 0.40, be_other, 280.0),
+                self._wait(0.40, be_other, 280.0))
 
 
 # --------------------------------------------------------------------------

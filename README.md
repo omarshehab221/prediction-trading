@@ -180,7 +180,7 @@ side from the model; the last two do not consult it at all.
 | `micro` | 0.35–0.75 | 20% | — | 200–25s | $7 |
 | `balanced` | 0.10–0.90 | 5% | — | 150–25s | $100 |
 | `convex` | 0.05–0.35 | 2% | — | 280–30s | $100 |
-| `straddle` | both sides | 20% per leg | — | 240s from open | $100 |
+| `straddle` | both sides | 20% per leg | — | 60s from open | $100 |
 | `lastminute` *(default)* | any | 10% per round | — | 60–5s | $100 |
 
 **`buffer`** encodes "wait for a buffer to open, back the side it favours,

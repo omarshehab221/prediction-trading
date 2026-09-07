@@ -396,24 +396,22 @@ class Config:
     straddle_stake_pct: float = 0.05
     # How long after a round opens a FIRST leg may still be started.
     #
-    # This used to be 15-20 seconds, on the theory that the mispricing worth
-    # catching was a round-open phenomenon. That was true of the original
-    # strategy, which bought both sides immediately at whatever price was
-    # showing. It is exactly wrong for this one, which waits for ONE side to
-    # get cheap: at round open spot IS the strike, so both sides sit near
-    # 0.50 by construction and neither can be near
-    # straddle_first_leg_max_price. A side only reaches 0.25 once spot has
-    # moved well away from the strike, which takes minutes.
+    # This window buys RUNWAY, not cheapness. The two legs are bought at
+    # different moments and only the pair is a straddle, so the scarce thing
+    # is not the entry price -- it is the time left to find the other side
+    # after the first is on the book. An opener at t=240 of a 300s round has
+    # 60 seconds to be hedged in and usually is not; one at t=30 has four
+    # minutes. Open inside the first minute, then spend the rest of the
+    # round completing.
     #
-    # So a 15s window pointed the opener at precisely the part of the round
-    # where its entry price cannot occur, and marked every round _seen the
-    # moment it elapsed. Live, that bought one leg in an hour -- and only
-    # because BTC happened to move hard inside fourteen seconds.
-    #
-    # 240 of a 300s round leaves 60s of runway after the latest possible
-    # open. The runway floor below that is what actually protects a late
-    # entry from being unhedgeable.
-    straddle_entry_window_s: float = 240.0
+    # The window and straddle_first_leg_max_price are one decision, not two.
+    # A minute in, spot has barely left the strike and both sides still
+    # price near 0.50, so a 0.25 ceiling here would point the opener at the
+    # one stretch of the round where its entry price cannot occur -- which
+    # is the dead-bot failure a 15s window used to cause, reintroduced from
+    # the other end. The ceiling is loosened to match (see below); paying
+    # 0.40 for four minutes of completion time is the trade being made.
+    straddle_entry_window_s: float = 60.0
     # Optional per-leg sanity ceiling. 1.0 means no ceiling: every round in
     # the window is taken at whatever price is on offer, deliberately,
     # because this strategy's premise is that direction does not matter and
@@ -441,22 +439,25 @@ class Config:
     # a round that cost 2 stakes. Prices summing to 1.00 constrains one
     # instant, not one round.
     #
-    # The price a leg has to reach to be worth buying at all -- 0.25, a 4x
-    # payout. It governs BOTH legs, and which side it happens to be is never
-    # considered: whichever of UP and DOWN is showing this price is the one
-    # that gets bought, first or second.
+    # The most the OPENING leg may cost. This governs the first leg only:
+    # what the second holds out for is derived from what the first actually
+    # filled at, not from this number (_completion_is_worth_waiting_out).
+    # Which side it happens to be is never considered -- whichever of UP and
+    # DOWN is showing a price under this is the one that gets bought.
+    #
+    # 0.25 -- a 4x payout -- is the price this strategy would LIKE, and it
+    # is still what the second leg is measured against once a leg fills
+    # there. It is the wrong ceiling for a first minute, though: 0.25 does
+    # not exist that early, so a bot holding out for it opens nothing. 0.40
+    # is what an early book actually offers.
     #
     # The number matters more than it looks. After filling at p, the other
     # side stays worth buying all the way up to (1 - p), so an opener at
-    # 0.25 leaves an enormous 0.75 of room to complete in, while one at 0.49
-    # leaves almost none and stands a real chance of being stranded.
-    #
-    # For the SECOND leg this is the price to hold out for, not a hard
-    # ceiling: once ANY price would lock the round in, refusing one this
-    # side of 0.25 only makes sense while there is still time to find
-    # better, so the bar slides from here toward the break-even limit as the
-    # round runs out (_completion_is_worth_waiting_out).
-    straddle_first_leg_max_price: float = 0.25
+    # 0.40 leaves 0.60 of room to complete in, while one at 0.49 leaves
+    # almost none and stands a real chance of being stranded. That room,
+    # against the four minutes the shortened entry window leaves to use it,
+    # is the whole reason 0.40 is tolerable and 0.49 is not.
+    straddle_first_leg_max_price: float = 0.40
     # Opening a round is limited to straddle_entry_window_s. COMPLETING one
     # is not: a hedge that locks the profit in at t=120s is worth exactly
     # what one at t=9s is worth, and refusing it would leave a naked
@@ -1017,10 +1018,11 @@ PROFILES: dict[str, dict] = {
     # bankroll produced a per-leg stake under min_stake_usdt and the profile
     # silently never traded.
     "straddle": {"straddle": True, "straddle_stake_pct": 0.20,
-                 # Most of the round, not the first few seconds. The cheap
-                 # side this profile waits for does not exist at round open,
-                 # when spot is the strike and both sides price near 0.50.
-                 "straddle_entry_window_s": 240.0,
+                 # The first minute, and then four minutes to hedge in.
+                 # Opening late is what strands legs; opening early is only
+                 # possible at a price the early book offers, which is why
+                 # this moves together with straddle_first_leg_max_price.
+                 "straddle_entry_window_s": 60.0,
                  # No side is ever picked by price here, so these bands are
                  # left at their widest legal setting rather than inherited
                  # from another profile -- nothing below should silently
@@ -4871,17 +4873,26 @@ class Trader:
 
         Any second leg with be_other < 1 - be_open guarantees the round, but
         they are not equally good: cheaper is more profit. Early in a round
-        there is time to hold out for the same 4x the first leg had to clear;
-        as the hedge deadline approaches there is not, and a smaller locked-in
-        profit beats an open directional bet. The bar slides between the two
-        rather than sitting at either extreme, because a fixed high bar
-        strands positions and a fixed low one takes the first crumb offered.
+        there is time to hold out; as the hedge deadline approaches there is
+        not, and a smaller locked-in profit beats an open directional bet.
+        The bar slides between the two rather than sitting at either extreme,
+        because a fixed high bar strands positions and a fixed low one takes
+        the first crumb offered.
+
+        What it slides FROM is the open leg's own fill price. Equal stakes at
+        equal prices pay equally, so "a hedge as good as the leg already
+        held" is exactly be_open -- the completion price that matches the
+        first leg's profit. Deriving it from straddle_first_leg_max_price
+        instead, as this used to, tied the bar to the OPENER's ceiling: a leg
+        filled at 0.40 would refuse a 0.40 hedge that matched it exactly and
+        hold out for a 0.25 bearing no relation to what the round had cost.
+        0.25 is a preferred entry price, not a gate on completing.
         """
-        preferred = breakeven_probability(
-            self._cfg.straddle_first_leg_max_price, raw.fee_bps)
+        preferred = be_open
         limit = 1.0 - be_open
         if preferred >= limit:
-            # The open leg was not cheap enough to be choosy about the other.
+            # be_open >= 0.5: the open leg was not cheap enough to be choosy
+            # about the other. Anything that locks the round in will do.
             return False
         span = raw.duration_ms / 1000.0 - self._cfg.straddle_hedge_deadline_s
         slack = seconds_left - self._cfg.straddle_hedge_deadline_s
@@ -4900,12 +4911,16 @@ class Trader:
         and the round is completed later from the other end. A round whose
         DOWN goes cheap first is the same trade as one whose UP does.
 
-        Cheap enough means straddle_first_leg_max_price -- 0.25 by default,
-        a 4x payout. That is not a preference dressed up as a rule: after
-        filling at p, the other side stays worth buying all the way up to
-        (1 - p), so a first leg at 0.25 leaves 0.75 of room to complete in,
-        while one at 0.45 leaves 0.55 and one at 0.49 leaves almost nothing.
-        The cheaper the entry, the likelier the round ever gets hedged.
+        Cheap enough means straddle_first_leg_max_price -- 0.40 by default.
+        That is not a preference dressed up as a rule: after filling at p,
+        the other side stays worth buying all the way up to (1 - p), so a
+        first leg at 0.40 leaves 0.60 of room to complete in, while one at
+        0.49 leaves almost nothing. It is deliberately looser than the 0.25
+        this strategy would prefer, because the opening window is the first
+        minute of the round and 0.25 does not exist that early -- what the
+        loosened price buys is the four minutes of completion time that make
+        the hedge findable at all. Whatever it fills at is then the bar the
+        second leg is measured against (_completion_is_worth_waiting_out).
 
         Returns True if a leg was opened.
         """
@@ -5117,13 +5132,15 @@ class Trader:
 
           * both sides clear together right now -- taken immediately, sized
             by straddle_split, with no legging risk at all. Rare.
-          * one side is cheap enough on its own (straddle_first_leg_max_price,
-            a 4x payout by default) -- opened alone, and completed later by
-            _complete_half_straddles once the other side becomes worth
-            buying. That is the path this profile actually trades.
+          * one side is cheap enough on its own
+            (straddle_first_leg_max_price) -- opened alone, and completed
+            later by _complete_half_straddles once the other side becomes
+            worth buying, where "worth" means as good as the price the open
+            leg itself got. That is the path this profile actually trades.
 
-        Opening is confined to straddle_entry_window_s; completing is not,
-        and runs until straddle_hedge_deadline_s before settlement.
+        Opening is confined to straddle_entry_window_s -- the first minute,
+        so the rest of the round is completion time. Completing is not, and
+        runs until straddle_hedge_deadline_s before settlement.
 
         Legs are separate MARKET FOK orders -- this venue has no limit order
         type -- so in live mode every leg is quoted and re-tested against the
