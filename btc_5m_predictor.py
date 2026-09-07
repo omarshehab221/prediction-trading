@@ -2031,6 +2031,40 @@ class OrderNotFilled(ApiError):
     """
 
 
+class NothingToRedeem(ApiError):
+    """
+    The venue accepted the claim and found nothing to claim.
+
+    Separate from ApiError for the same reason OrderNotFilled is: this one is
+    a fact -- the tokens are gone, which on a winning position means the
+    payout has already been credited, usually because the operator redeemed
+    it by hand in the Binance app. A bare ApiError is an absence of
+    information. Returning an empty hash list for both made them
+    indistinguishable from a batch still in flight, so the claim worker
+    re-submitted a redemption that could never succeed for the whole timeout
+    and then held the token as unredeemed forever.
+    """
+
+
+# Message fragments that mean the same fact arrived as an error rather than
+# an empty batch. Deliberately narrow: a match drops the bot's claim on real
+# money, so anything vaguer than "there is nothing here to redeem" must fall
+# through to the ordinary retry.
+_ALREADY_REDEEMED_HINTS: tuple[str, ...] = (
+    "already redeemed", "already been redeemed", "already claimed",
+    "already been claimed", "no redeemable", "not redeemable",
+    "nothing to redeem", "no position to redeem",
+)
+
+
+def _is_already_redeemed(exc: BaseException) -> bool:
+    """Whether the venue's refusal says the tokens are already gone."""
+    if not isinstance(exc, ApiError):
+        return False        # a transport failure proves nothing either way
+    text = str(exc).lower()
+    return any(hint in text for hint in _ALREADY_REDEEMED_HINTS)
+
+
 class VolatilityEstimator:
     """Annualised sigma AND tail thickness from recent 1m returns."""
 
@@ -3364,10 +3398,26 @@ class PredictionClient:
             tx = res.get("txHash")
             if tx:
                 hashes.append(str(tx))
-        if not hashes and payload.get("batchId"):
-            LOG.info("Redemption batch %s accepted, no tx hash yet",
-                     payload["batchId"])
+        if not hashes:
+            if payload.get("batchId"):
+                LOG.info("Redemption batch %s accepted, no tx hash yet",
+                         payload["batchId"])
+            else:
+                # Accepted, no hash, no batch: the venue took the request and
+                # had nothing to act on. On a winning position that means the
+                # tokens are already gone -- redeemed elsewhere -- and the
+                # caller must stop, not resubmit.
+                raise NothingToRedeem(
+                    f"nothing redeemable for {', '.join(token_ids)}")
         return hashes
+
+    # A redemption transaction that will never land. The claim worker has to
+    # tell these apart from "not confirmed yet": one wants a fresh attempt,
+    # the other wants more patience.
+    DEAD_REDEEM_STATUSES = frozenset({
+        "FAILED", "FAIL", "REVERTED", "DROPPED", "REJECTED", "ERROR",
+        "CANCELLED", "CANCELED", "EXPIRED",
+    })
 
     def redeem_status(self, tx_hash: str) -> str | None:
         """Status of a redemption transaction, or None if unknown."""
@@ -4352,6 +4402,25 @@ class Trader:
             finally:
                 self._claim_queue.task_done()
 
+    def _claimed_elsewhere(self, token_id: str, payout: float,
+                           pos: Position, reason: BaseException) -> None:
+        """
+        Stop chasing a win the venue says is no longer redeemable.
+
+        Almost always the operator claimed it by hand. The bot's only proof
+        of a landed claim is the status of a tx hash it submitted itself, so
+        a redemption performed anywhere else is invisible to it: without this
+        the worker resubmits until claim_timeout_s and then keeps the token
+        in _unredeemed for the life of the process, where it inflates
+        _outstanding, blocks every reconciliation, and pins a pending mode
+        switch on winnings that were credited long ago.
+        """
+        with self._claim_lock:
+            self._unredeemed.pop(token_id, None)
+        LOG.warning("Nothing left to redeem for %s: treating %.2f USDT as "
+                    "already credited (claimed outside this bot?) -- %s",
+                    pos.rnd.slug, payout, reason)
+
     def _claim_relentlessly(self, pos: Position) -> None:
         """
         Redeem one winning position and keep trying until it is confirmed.
@@ -4378,7 +4447,13 @@ class Trader:
                                                       chain_id)
                     LOG.info("Redeeming %.2f USDT (tx %s)", payout,
                              ", ".join(hashes) or "pending")
+                except NothingToRedeem as exc:
+                    self._claimed_elsewhere(token_id, payout, pos, exc)
+                    return
                 except (ApiError, requests.RequestException) as exc:
+                    if _is_already_redeemed(exc):
+                        self._claimed_elsewhere(token_id, payout, pos, exc)
+                        return
                     LOG.debug("Redeem attempt for %s failed, retrying: %s",
                               token_id, exc)
                     time.sleep(self._cfg.claim_poll_interval_s)
@@ -4401,6 +4476,19 @@ class Trader:
                     LOG.info("Redemption confirmed: %.2f USDT credited (%s)",
                              payout, pos.rnd.slug)
                     return
+                if any(s in PredictionClient.DEAD_REDEEM_STATUSES
+                       for s in statuses if s):
+                    # The transaction is not coming back. Forget the hash and
+                    # go round again: either the resubmission succeeds, or
+                    # batch_redeem answers that there is nothing left to
+                    # claim -- which is what a hand-redemption racing the
+                    # bot's own transaction looks like from here.
+                    LOG.warning("Redemption tx for %s reported %s; "
+                                "resubmitting", pos.rnd.slug,
+                                ", ".join(s or "?" for s in statuses))
+                    hashes = []
+                    with self._claim_lock:
+                        self._unredeemed[token_id] = (payout, [], chain_id)
 
             time.sleep(self._cfg.claim_poll_interval_s)
 

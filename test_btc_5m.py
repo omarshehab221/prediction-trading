@@ -1327,6 +1327,115 @@ class TestRedemption(unittest.TestCase):
         t._settle_open()
         self.assertEqual(client.redeemed, [])
 
+    # -- redeemed by hand, outside the bot ---------------------------------
+
+    def test_a_hand_redeemed_win_stops_being_chased(self):
+        """
+        The operator claims the win in the Binance app. The bot must notice.
+
+        Its only success signal used to be the status of a tx hash IT had
+        submitted, so a redemption performed anywhere else was invisible: the
+        worker re-submitted the claim every poll for the whole timeout and
+        then kept the token in _unredeemed forever, where nothing retries it.
+        """
+        client = self._client()
+        calls = []
+
+        def nothing_left(token_ids, chain_id="56"):
+            calls.append(tuple(token_ids))
+            raise m.NothingToRedeem("no redeemable balance for 1")
+
+        client.batch_redeem = nothing_left
+        client.balance = 105.0                 # the money is already there
+        t = self._win_once(client, claim_timeout_s=0.5,
+                           claim_poll_interval_s=0.01)
+        t._claim_queue.join()
+        self.assertEqual(len(calls), 1)        # asked once, took the answer
+        self.assertEqual(t._unredeemed, {})    # no phantom left behind
+        self.assertAlmostEqual(t._outstanding(), 0.0, places=6)
+
+    def test_venue_saying_already_redeemed_ends_the_claim(self):
+        """The same fact delivered as an error rather than an empty batch."""
+        client = self._client()
+        calls = []
+
+        def already(token_ids, chain_id="56"):
+            calls.append(tuple(token_ids))
+            raise m.ApiError("token has already been redeemed")
+
+        client.batch_redeem = already
+        t = self._win_once(client, claim_timeout_s=0.5,
+                           claim_poll_interval_s=0.01)
+        t._claim_queue.join()
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(t._unredeemed, {})
+
+    def test_a_dead_redemption_tx_is_resubmitted_then_stops(self):
+        """
+        A hand-redemption that races the bot's own transaction.
+
+        The bot gets a tx hash, the operator claims in the app, and the bot's
+        transaction reverts. Once a hash existed the worker only ever asked
+        for its status, so a terminal failure kept it polling a transaction
+        that would never confirm until the timeout ran out.
+        """
+        client = self._client()
+        client.redeem_state = "REVERTED"
+        calls = []
+
+        def redeem(token_ids, chain_id="56"):
+            calls.append(tuple(token_ids))
+            if len(calls) == 1:
+                return ["0xtx1"]
+            raise m.NothingToRedeem("nothing redeemable for 1")
+
+        client.batch_redeem = redeem
+        t = self._win_once(client, claim_timeout_s=0.5,
+                           claim_poll_interval_s=0.01)
+        t._claim_queue.join()
+        self.assertEqual(len(calls), 2)        # resubmitted once, then stopped
+        self.assertEqual(t._unredeemed, {})
+
+    def test_a_genuine_redeem_failure_is_still_retried(self):
+        """
+        The escape hatch must not swallow real failures.
+
+        A transient rejection is an absence of information, not proof the
+        money landed, and dropping the token on one would strand a real win.
+        """
+        client = self._client()
+        client.redeem_fails = True
+        t = self._win_once(client, claim_timeout_s=0.2,
+                           claim_poll_interval_s=0.01)
+        t._claim_queue.join()
+        self.assertIn("1", t._unredeemed)       # still tracked
+
+
+class TestBatchRedeemResponses(unittest.TestCase):
+    """Telling 'accepted, in flight' apart from 'there was nothing to claim'."""
+
+    @staticmethod
+    def _client(payload):
+        c = PredictionClient.__new__(PredictionClient)
+        c._store = None
+        c._static_cfg = cfg()
+        c._wallet = m.WalletRef("0xa", "w1")
+        c._request = lambda name, params=None: payload
+        return c
+
+    def test_tx_hashes_are_returned(self):
+        c = self._client({"results": [{"txHash": "0xdead"}]})
+        self.assertEqual(c.batch_redeem(["1"], "56"), ["0xdead"])
+
+    def test_accepted_batch_without_a_hash_is_in_flight(self):
+        c = self._client({"results": [], "batchId": "b1"})
+        self.assertEqual(c.batch_redeem(["1"], "56"), [])
+
+    def test_empty_response_means_nothing_was_redeemable(self):
+        c = self._client({"results": []})
+        with self.assertRaises(m.NothingToRedeem):
+            c.batch_redeem(["1"], "56")
+
 
 class TestStudentT(unittest.TestCase):
     """Tail model, verified against scipy where available."""
