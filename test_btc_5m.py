@@ -650,6 +650,109 @@ class TestRiskManager(unittest.TestCase):
         self.assertAlmostEqual(r.realised_pnl, -10.0, places=6)
         self.assertAlmostEqual(r.external_flow, -40.0, places=6)
 
+    # -- the venue corrects the bot's arithmetic ---------------------------
+    #
+    # Everything above separates the bot's trading from everyone else's
+    # money. It cannot tell either of those from a third thing: the bot's own
+    # PnL arithmetic being WRONG. settle_pnl models the fee and the fill, and
+    # any error in that model shows up as exactly the same residue a deposit
+    # does -- so it was silently rebased into the baseline and relabelled an
+    # external flow, once per trade, for as long as the bot ran.
+
+    def test_a_credit_that_lands_short_corrects_pnl_not_the_baseline(self):
+        """
+        The venue is authoritative. A win booked at +12.00 that actually
+        credits 11.80 means the fee model is off by 0.20 -- that is a trading
+        result, not somebody's withdrawal, and the daily limit has to see it.
+        """
+        r = RiskManager(cfg(), 100.0)
+        r.record_result(True, 0.5, pnl=12.0)
+        r.expect_credit(32.0)             # 20 stake back + 12 won
+        r.check(70.0, 32.0)               # still in flight
+        r.check(111.80, 0.0)              # credited 0.20 light
+
+        self.assertAlmostEqual(r.realised_pnl, 11.80, places=6)
+        self.assertAlmostEqual(r.pnl_correction, -0.20, places=6)
+        self.assertAlmostEqual(r.external_flow, 0.0, places=6)
+        self.assertAlmostEqual(r._day_start_bankroll, 100.0, places=9)
+
+    def test_the_correction_is_bounded_by_a_plausible_fee(self):
+        """
+        A withdrawal landing in the same window as a claim must not be
+        swallowed as a trading loss -- that is the bug the external flow
+        split exists to prevent. The residue is genuinely ambiguous, so it
+        is capped rather than guessed: a fee can explain reconcile_tolerance
+        of the payout and not a cent more.
+        """
+        c = cfg(reconcile_tolerance=0.10)
+        r = RiskManager(c, 100.0)
+        r.record_result(True, 0.5, pnl=12.0)
+        r.expect_credit(32.0)
+        r.check(71.80, 0.0)               # credited light AND -40 by hand
+
+        self.assertAlmostEqual(r.pnl_correction, -3.20, places=6)   # 10% of 32
+        self.assertAlmostEqual(r.external_flow, -37.0, places=6)
+        # Whatever the split, no money is invented or lost by it.
+        self.assertAlmostEqual(r.pnl_correction + r.external_flow,
+                               -40.20, places=6)
+
+    def test_the_cap_scales_with_the_payout_it_explains(self):
+        """A bigger claim can hide a bigger fee, and nothing else can."""
+        c = cfg(reconcile_tolerance=0.10)
+        small = RiskManager(c, 100.0)
+        small.expect_credit(10.0)
+        small.check(80.0, 0.0)
+
+        big = RiskManager(c, 100.0)
+        big.expect_credit(100.0)
+        big.check(80.0, 0.0)
+
+        self.assertAlmostEqual(small.pnl_correction, -1.0, places=6)
+        self.assertAlmostEqual(big.pnl_correction, -10.0, places=6)
+
+    def test_an_expectation_is_consumed_once(self):
+        """A credit explains the drift at its own settlement, and no later."""
+        r = RiskManager(cfg(), 100.0)
+        r.record_result(True, 0.5, pnl=12.0)
+        r.expect_credit(32.0)
+        r.check(112.0, 0.0)               # landed exactly; nothing to correct
+        self.assertAlmostEqual(r.pnl_correction, 0.0, places=6)
+
+        r.check(72.0, 0.0)                # a later withdrawal
+        self.assertAlmostEqual(r.pnl_correction, 0.0, places=6)
+        self.assertAlmostEqual(r.external_flow, -40.0, places=6)
+
+    def test_a_direct_correction_moves_realised_pnl(self):
+        """
+        The settlement-time path. _reconcile measures the gap against a
+        balance read seconds either side of one settlement, which is far too
+        narrow a window for a deposit, so it is charged straight to PnL.
+        """
+        r = RiskManager(cfg(), 100.0)
+        r.record_result(False, 0.5, pnl=-20.0)
+        r.correct_realised_pnl(-0.35)
+        self.assertAlmostEqual(r.realised_pnl, -20.35, places=6)
+        self.assertAlmostEqual(r.pnl_correction, -0.35, places=6)
+
+    def test_a_corrected_loss_still_trips_the_daily_limit(self):
+        """
+        The point of all of it. A model that under-reports every loss must
+        not be able to walk the bot past its own stop.
+        """
+        r = RiskManager(cfg(daily_loss_limit_pct=0.20), 100.0)
+        r.record_result(False, 0.6, pnl=-19.0)
+        r.correct_realised_pnl(-2.0)      # the venue took 2.00 more
+        with self.assertRaises(TradingHalted):
+            r.check(79.0, 0.0)
+
+    def test_the_halt_message_reports_corrections_separately(self):
+        r = RiskManager(cfg(daily_loss_limit_pct=0.20), 100.0)
+        r.record_result(False, 0.6, pnl=-19.0)
+        r.correct_realised_pnl(-2.0)
+        with self.assertRaises(TradingHalted) as caught:
+            r.check(79.0, 0.0)
+        self.assertIn("correction", str(caught.exception).lower())
+
     def test_consecutive_losses(self):
         r = RiskManager(cfg(max_consecutive_losses=3), 100.0)
         for _ in range(3):
@@ -5181,6 +5284,78 @@ class TestBalanceReconciliation(unittest.TestCase):
             finally:
                 m.LOG.removeHandler(handler); m.LOG.setLevel(prev)
             self.assertTrue(any("RECONCILE MISMATCH" in r for r in records))
+        finally:
+            os.unlink(db)
+
+    def test_a_mismatch_is_charged_to_pnl_not_merely_logged(self):
+        """
+        The drift the bot was leaking. _reconcile already measured the gap
+        between what settling should have moved and what it did -- across a
+        window seconds wide, far too narrow for a deposit -- and then threw
+        the number away. RiskManager saw the same residue later, could not
+        tell it from somebody's deposit, and rebased it into the baseline.
+        A fee under-modelled by a few cents a round was laundered every round.
+        """
+        fd, db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            c = cfg(db_path=db, live=True)
+            t = build_trader(FakeClient([], [(0, 65_000.0)], {}, {}), c, db)
+            rnd = make_round()
+            pos = Position(1, rnd,
+                           Signal(Side.UP, 0.9, 0.60, 0.02, 1.0, 60.0, 2.0),
+                           1.0, 1)
+            t._account_risk = m.RiskManager(c, 100.0)
+            risk = t._risk_for(rnd.symbol)
+
+            # A loss: the stake left at entry, so settling should move
+            # nothing. It moved -0.15, which is a cost the model missed.
+            t._reconcile(pos, False, -1.0, 100.0, 99.85)
+
+            self.assertAlmostEqual(risk.pnl_correction, -0.15, places=6)
+            self.assertAlmostEqual(t._account_risk.pnl_correction, -0.15,
+                                   places=6)
+        finally:
+            os.unlink(db)
+
+    def test_a_settlement_that_agrees_corrects_nothing(self):
+        fd, db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            c = cfg(db_path=db, live=True)
+            t = build_trader(FakeClient([], [(0, 65_000.0)], {}, {}), c, db)
+            rnd = make_round()
+            pos = Position(1, rnd,
+                           Signal(Side.UP, 0.9, 0.60, 0.02, 1.0, 60.0, 2.0),
+                           1.0, 1)
+            t._account_risk = m.RiskManager(c, 100.0)
+
+            t._reconcile(pos, False, -1.0, 100.0, 100.0)
+
+            self.assertAlmostEqual(
+                t._risk_for(rnd.symbol).pnl_correction, 0.0, places=9)
+        finally:
+            os.unlink(db)
+
+    def test_an_uncredited_win_corrects_nothing_yet(self):
+        """
+        The payout lands after this runs, so there is nothing to compare
+        against. Correcting here would book the whole gross payout as a
+        modelling error.
+        """
+        fd, db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            c = cfg(db_path=db, live=True)
+            t = build_trader(FakeClient([], [(0, 65_000.0)], {}, {}), c, db)
+            rnd = make_round()
+            pos = Position(1, rnd,
+                           Signal(Side.UP, 0.9, 0.60, 0.02, 1.0, 60.0, 2.0),
+                           1.0, 1)
+            t._account_risk = m.RiskManager(c, 100.0)
+            t._unredeemed["tok"] = (1.6667, [], "56")
+
+            t._reconcile(pos, True, 0.65, 100.0, 100.0)
+
+            self.assertAlmostEqual(
+                t._risk_for(rnd.symbol).pnl_correction, 0.0, places=9)
         finally:
             os.unlink(db)
 

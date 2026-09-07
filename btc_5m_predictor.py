@@ -2297,6 +2297,23 @@ class RiskManager:
         # the strategy.
         self._realised_pnl = 0.0
         self._external_flow = 0.0
+        # The third thing a balance movement can be, and the one this used to
+        # have no name for: the bot's OWN arithmetic being wrong. settle_pnl
+        # models the fee and the fill, and an error in that model leaves
+        # exactly the residue a deposit leaves. Every one of them was rebased
+        # into the baseline and relabelled an external flow -- so a fee the
+        # bot under-modelled by a few cents a round was laundered, round after
+        # round, and the daily limit slowly stopped describing the account.
+        # The venue is authoritative; corrections are booked as PnL and
+        # counted here so the two can still be told apart in a report.
+        self._pnl_correction = 0.0
+        # A payout that has settled but not yet landed on chain. Recorded so
+        # the drift it eventually causes can be charged to the trade rather
+        # than to a phantom depositor -- and BOUNDED by it, so a withdrawal
+        # sharing the same window is not swallowed whole as a trading loss.
+        self._expected_credit = 0.0
+        # Touched from the claim worker as well as the trading loop.
+        self._lock = threading.Lock()
 
     @property
     def _cfg(self) -> Config:
@@ -2311,6 +2328,37 @@ class RiskManager:
     def external_flow(self) -> float:
         """Balance movement today that this bot did not cause."""
         return self._external_flow
+
+    @property
+    def pnl_correction(self) -> float:
+        """How much the venue has moved today's PnL away from our own sums."""
+        return self._pnl_correction
+
+    def expect_credit(self, amount: float) -> None:
+        """
+        Declare a payout that has settled but has not landed yet.
+
+        This is what licenses the next reconciliation to read a shortfall as
+        a trading result. Without it a claim that credits light is
+        indistinguishable from a withdrawal, and the bot has to assume the
+        more flattering of the two.
+        """
+        with self._lock:
+            self._expected_credit += max(amount, 0.0)
+
+    def correct_realised_pnl(self, delta: float) -> None:
+        """
+        Book a difference the venue reported against what we calculated.
+
+        Called where the measurement is trustworthy on its own -- either side
+        of a single settlement, seconds apart, far too narrow a window for a
+        deposit to be a plausible explanation.
+        """
+        if abs(delta) <= EPS:
+            return
+        with self._lock:
+            self._realised_pnl += delta
+            self._pnl_correction += delta
 
     def calibration_z(self) -> float | None:
         """
@@ -2339,6 +2387,8 @@ class RiskManager:
             self._actual_wins = self._samples = 0
             self._realised_pnl = 0.0
             self._external_flow = 0.0
+            self._pnl_correction = 0.0
+            self._expected_credit = 0.0
             LOG.info("New trading day; baseline bankroll %.2f", bankroll)
 
     def reconcile(self, bankroll: float,
@@ -2388,6 +2438,29 @@ class RiskManager:
         The tolerance is derived from the venue minimum rather than being a
         new tunable: anything smaller than a fraction of the smallest order
         the venue accepts cannot be a trade.
+
+        WHAT A CLAIM IN FLIGHT CHANGES
+        ------------------------------
+        Not every residue is somebody else's money. A payout that settled and
+        has not landed yet is the bot's own, and when it lands SHORT -- a fee
+        the model missed, a partial redemption -- the difference is a trading
+        result. Charging it to a phantom depositor is how a wrong fee model
+        stays invisible: rebased away once per won round, for as long as the
+        bot runs, while the daily limit drifts further from the account it is
+        supposed to be protecting.
+
+        So a declared credit (expect_credit) licenses a correction, and
+        reconcile_tolerance bounds it: the venue may differ from our sums by
+        that fraction of the payout, which is what an unmodelled fee or a
+        partial redemption looks like. That is the same meaning the knob
+        already carries at settlement, applied to the same question.
+
+        The bound is the point. Drift beyond what a fee could explain is not
+        a fee, so a withdrawal landing in the same window as a claim still
+        reads as a withdrawal for all but a sliver -- which is what keeps a
+        manual order from reading as a drawdown. The split of a genuinely
+        ambiguous residue cannot be recovered; it can only be capped, and
+        capping it in the strategy's DISFAVOUR is the safe direction.
         """
         if outstanding is None:
             return 0.0
@@ -2398,8 +2471,27 @@ class RiskManager:
             return 0.0
         expected = self._day_start_bankroll + self._realised_pnl
         drift = bankroll - expected
+        with self._lock:
+            claimable = self._expected_credit
+            # Flat, so anything owed has either landed or is not coming. The
+            # expectation explains this reconciliation and no later one.
+            self._expected_credit = 0.0
         if abs(drift) <= tolerance:
             return 0.0
+
+        room = claimable * self._cfg.reconcile_tolerance
+        correction = max(-room, min(room, drift))
+        if abs(correction) > EPS:
+            self._realised_pnl += correction
+            self._pnl_correction += correction
+            LOG.info("Venue credited %+.2f USDT against what this bot "
+                     "calculated; booked as a trading result, not an external "
+                     "movement. Today's corrections %+.2f USDT.",
+                     correction, self._pnl_correction)
+            drift -= correction
+            if abs(drift) <= tolerance:
+                return 0.0
+
         self._day_start_bankroll = max(self._day_start_bankroll + drift, EPS)
         self._external_flow += drift
         LOG.info("External balance movement %+.2f USDT (deposit, withdrawal "
@@ -2425,8 +2517,10 @@ class RiskManager:
             # it? -- and answering it in the halt line is the difference
             # between a diagnosis and a mystery.
             self._halt(f"daily loss limit: {drawdown:.1%} down on this bot's "
-                       f"own trades ({self.realised_pnl:+.2f} USDT; external "
-                       f"movements {self.external_flow:+.2f} USDT excluded) "
+                       f"own trades ({self.realised_pnl:+.2f} USDT, including "
+                       f"{self.pnl_correction:+.2f} of venue correction; "
+                       f"external movements {self.external_flow:+.2f} USDT "
+                       f"excluded) "
                        f"(limit {self._cfg.daily_loss_limit_pct:.0%})")
         z = self.calibration_z()
         if z is not None:
@@ -4359,6 +4453,20 @@ class Trader:
         LOG.warning("MODE NOW %s -- bankroll %.2f, risk counters reset",
                     "LIVE" if wanted else "PAPER", bankroll)
 
+    def _correct_pnl(self, symbol: str, delta: float) -> None:
+        """
+        Push a venue-measured correction into every manager that books PnL.
+
+        Both of them or neither: the per-market manager owns the streak and
+        the account manager owns the daily limit, and a correction that
+        reached only one would leave the two disagreeing about the same day.
+        """
+        if abs(delta) <= EPS:
+            return
+        self._risk_for(symbol).correct_realised_pnl(delta)
+        if self._account_risk is not None:
+            self._account_risk.correct_realised_pnl(delta)
+
     def _bankroll(self) -> float:
         """
         Tradable balance, including winnings that are settled but not yet
@@ -5993,6 +6101,15 @@ class Trader:
             before = self._live_bankroll("settlement")
 
         if won and self._live:
+            # Say what is owed before handing it to the claim worker. The
+            # credit lands minutes later and may land light; declaring it is
+            # what lets reconciliation read a shortfall as this trade's
+            # result rather than as a stranger's withdrawal.
+            payout = max(pos.committed_usdt, pos.signal.stake_usdt) / max(
+                pos.signal.fill_price, EPS)
+            self._risk_for(key[0]).expect_credit(payout)
+            if self._account_risk is not None:
+                self._account_risk.expect_credit(payout)
             self._claim(pos)
 
         self._journal.resolve(pos.trade_id, won, pnl, source)
@@ -6035,6 +6152,23 @@ class Trader:
         A win moves the balance by the GROSS payout, and only once the claim
         has been credited on chain -- which is normally after this runs, so
         that case is noted rather than flagged.
+
+        WHY THE GAP IS BOOKED AND NOT JUST PRINTED
+        ------------------------------------------
+        This used to warn and stop there, which left the bot certain that its
+        own arithmetic was wrong and unwilling to do anything about it. The
+        residue did not disappear: RiskManager met it later, could not tell
+        it from a deposit, and rebased it into the day's baseline. So a fee
+        the model under-counted by a few cents was laundered once per round,
+        every round, and the daily loss limit drifted further from the
+        account it exists to protect for as long as the bot ran.
+
+        Here the measurement is trustworthy on its own terms. Both balances
+        are read seconds apart around a single settlement -- a window far too
+        narrow for a deposit to be the likely explanation -- so the gap is
+        charged to PnL, where the venue's version wins. Anything genuinely
+        external is still caught later, by the reconciliation that is built
+        to look for it.
         """
         actual = after - before
         # A loss should move nothing: the money went out when the order did.
@@ -6053,13 +6187,15 @@ class Trader:
                       expected_pnl)
             return
 
+        correction = actual - expected_move
+        self._correct_pnl(pos.rnd.symbol, correction)
         LOG.warning(
             "RECONCILE MISMATCH on %s: settling %s should have moved the "
             "balance %+.4f, it moved %+.4f (gap %.4f, P&L %+.4f). The venue "
             "is authoritative -- something here is counting a stake or a fee "
-            "the venue does not.",
+            "the venue does not, so %+.4f is booked against today's P&L.",
             pos.rnd.slug, "a win" if won else "a loss", expected_move, actual,
-            drift, expected_pnl)
+            drift, expected_pnl, correction)
 
     def _drain(self, timeout_s: float | None = None) -> None:
         deadline = time.time() + (timeout_s if timeout_s is not None
