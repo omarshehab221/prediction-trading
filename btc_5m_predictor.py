@@ -68,7 +68,7 @@ import threading
 import time
 import urllib.parse
 import queue
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 from decimal import ROUND_DOWN, Decimal
 from enum import Enum
@@ -1380,6 +1380,60 @@ class Trend:
         return (f"{arrow}/{self.phase} impulse={self.impulse:.2f} "
                 f"run={self.run} decay={self.decay:.2f} "
                 f"left~{self.rounds_left:.1f}r eff={self.efficiency:.2f}")
+
+
+@dataclass(frozen=True)
+class RoundShape:
+    """
+    What one round's price path did, relative to the price it opened at.
+
+    The opening price is the strike proxy, and that is not an approximation
+    of convenience: the venue publishes variantData.startPrice, and it is
+    the market's price at the moment the round opened. Measuring against it
+    is measuring against the thing the round actually settles on.
+
+    Every size is divided by one block's worth of noise, so "far" means far
+    for this hour rather than a fixed number of basis points.
+    """
+
+    travel: float = 0.0        # distance walked inside the round / sigma
+    net: float = 0.0           # signed end-to-end displacement / sigma
+    straightness: float = 0.0  # |net| / travel, in [0, 1]
+    terminal: float = 0.0      # |net|, i.e. how far from strike it finished
+    crossings: int = 0         # sign flips of (close - strike) after the open
+
+
+def measure_round_shape(closes: Sequence[float],
+                        sigma_block: float) -> RoundShape:
+    """
+    Measure one round's path. `closes[0]` is the open, and is the strike.
+
+    Returns a zero shape rather than raising on degenerate input. A single
+    bad close in a kline feed must not be able to take the trading loop
+    down, and "this round told us nothing" is the honest reading of it.
+    """
+    if len(closes) < 2 or sigma_block <= 0:
+        return RoundShape()
+    strike = closes[0]
+    if strike <= 0 or any(c <= 0 for c in closes):
+        return RoundShape()
+
+    steps = [math.log(b / a) for a, b in itertools.pairwise(closes)]
+    travelled = sum(abs(s) for s in steps)
+    if travelled <= 0:
+        return RoundShape()
+
+    net = math.log(closes[-1] / strike)
+    # Only the samples AFTER the open have a side. The open is the strike,
+    # so counting it would score every round as starting on some side.
+    signs = [1 if c > strike else -1 for c in closes[1:] if c != strike]
+    crossings = sum(1 for a, b in itertools.pairwise(signs) if a != b)
+
+    return RoundShape(travel=travelled / sigma_block,
+                      net=net / sigma_block,
+                      straightness=abs(net) / travelled,
+                      terminal=abs(net) / sigma_block,
+                      crossings=crossings)
 
 
 @dataclass(frozen=True)

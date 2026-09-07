@@ -7081,3 +7081,47 @@ class TestStraddleEntry(unittest.TestCase):
         t._maybe_scale_in_all(100.0)   # must be a no-op: nothing to top up to
 
         self.assertEqual(t._positions, before)
+
+
+class TestRoundShape(unittest.TestCase):
+    """One round's path, measured against the price it opened at."""
+
+    def test_straight_ramp_is_perfectly_efficient(self):
+        # Never turns around, so distance travelled == net displacement.
+        closes = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0]
+        shape = m.measure_round_shape(closes, sigma_block=0.01)
+        self.assertAlmostEqual(shape.straightness, 1.0, places=6)
+        self.assertEqual(shape.crossings, 0)
+        self.assertGreater(shape.terminal, 0.0)
+        self.assertGreater(shape.net, 0.0)
+
+    def test_sawtooth_across_the_open_crosses_repeatedly(self):
+        # Above, below, above, below: four sign flips after the open.
+        closes = [100.0, 101.0, 99.0, 101.0, 99.0, 101.0]
+        shape = m.measure_round_shape(closes, sigma_block=0.01)
+        self.assertEqual(shape.crossings, 4)
+        self.assertLess(shape.straightness, 0.2)
+        self.assertGreater(shape.travel, 0.0)
+
+    def test_flat_path_travels_almost_nothing(self):
+        closes = [100.0, 100.01, 100.0, 99.99, 100.0, 100.01]
+        flat = m.measure_round_shape(closes, sigma_block=0.01)
+        ramp = m.measure_round_shape([100.0, 101.0, 102.0, 103.0, 104.0,
+                                      105.0], sigma_block=0.01)
+        self.assertLess(flat.travel, ramp.travel)
+        self.assertLess(flat.terminal, ramp.terminal)
+
+    def test_terminal_is_the_absolute_net(self):
+        closes = [100.0, 99.0, 98.0, 97.0, 96.0, 95.0]
+        shape = m.measure_round_shape(closes, sigma_block=0.01)
+        self.assertLess(shape.net, 0.0)
+        self.assertAlmostEqual(shape.terminal, abs(shape.net), places=9)
+
+    def test_degenerate_inputs_return_a_zero_shape(self):
+        for closes, sigma in (([], 0.01), ([100.0], 0.01),
+                              ([100.0, 101.0], 0.0),
+                              ([0.0, 101.0], 0.01),
+                              ([-5.0, 101.0], 0.01)):
+            shape = m.measure_round_shape(closes, sigma)
+            self.assertEqual(shape.travel, 0.0)
+            self.assertEqual(shape.crossings, 0)
