@@ -170,15 +170,18 @@ to one.
 
 ## 6. Profiles
 
-Five strategies, differing in which contracts they buy:
+Seven strategies, differing in which contracts they buy. The first five pick a
+side from the model; the last two do not consult it at all.
 
 | Profile | Entry band | Max stake | Buffer gate | Entry window | Paper |
 |---|---|---|---|---|---|
-| `buffer` *(default)* | 0.55–0.80 | 10% | ≥0.75σ | 270–15s | $25 |
+| `buffer` | 0.55–0.80 | 10% | ≥0.75σ | 270–15s | $25 |
 | `favorite` | 0.55–0.80 | 10% | — | 120–20s | $25 |
 | `micro` | 0.35–0.75 | 20% | — | 200–25s | $7 |
 | `balanced` | 0.10–0.90 | 5% | — | 150–25s | $100 |
 | `convex` | 0.05–0.35 | 2% | — | 280–30s | $100 |
+| `straddle` | both sides | 20% per leg | — | 240s from open | $100 |
+| `lastminute` *(default)* | any | 10% per round | — | 60–5s | $100 |
 
 **`buffer`** encodes "wait for a buffer to open, back the side it favours,
 press it while the market has inertia — and refuse any price whose win is too
@@ -196,6 +199,13 @@ report's favourite-longshot table measures.
 **`micro`** exists because a small account cannot use a percentage cap: at $6.64
 a $1 minimum order *is* 15% of the balance. That risk is forced by arithmetic,
 not chosen.
+
+**`straddle`** buys *both* sides of a round, at two different moments, and only
+when the pair's worst case still pays back more than it cost. No side is ever
+picked, so direction stops mattering.
+
+**`lastminute`** is described in §6.3. It is the only profile that reads
+nothing but the price.
 
 ### 6.1 The return floor (`buffer` only)
 
@@ -306,6 +316,50 @@ unwound halfway through the round.
 
 ---
 
+### 6.3 The last minute (`lastminute`)
+
+One rule, and nothing underneath it:
+
+> With **60 seconds** left, buy whichever side is **dearer** — the one the book
+> has already picked — provided it is quoted at **0.75 or better**. Inside the
+> last **45 seconds**, buy it at whatever it costs. Stop at **5 seconds**.
+
+No model probability, no edge test, no buffer, no trend, no volatility — none
+of it is computed, let alone consulted. The premise is that a price is a
+forecast, and in the last minute of a five-minute round it is a forecast with
+almost no time left in which to be wrong.
+
+The floor and the fallback are one rule in two halves, not a rule and an
+excuse. A leader under 0.75 means the round is still a genuine contest and
+there is time for it to stop being one, so nothing is bought yet. At 45s that
+time has run out, and *"no side reached 0.75"* has itself become the answer:
+the round **is** close, the leader is the best read available, and — because it
+failed the floor — it is **cheap**.
+
+**Where this can bleed is the first branch, not the fallback.** Nothing caps
+the price above the floor, so a round already decided at 55s quotes 0.97 and
+gets bought:
+
+| Fill | Pays on a win | Wins to cover one loss |
+|---|---|---|
+| 0.60 (fallback) | +65% | 1.5 |
+| 0.75 (floor) | +33% | 3.0 |
+| 0.90 | +11% | 9.0 |
+| 0.97 | +3% | 32.3 |
+
+That is the profile as specified, and it is written down in the code rather
+than guarded against. `--calibration-report`'s favourite-longshot table is what
+says whether the venue's late favourites win often enough to pay for the dear
+ones. Two rounds are left alone and neither is a price judgement: one where the
+sides are quoted **level** (there is no dominant side, and picking one anyway
+would invent the only signal this strategy refuses to have), and one where the
+leader has rounded to **1.00** (it cannot pay back more than it cost).
+
+The journal records the **market's** implied probability, not a forecast —
+there is none. That is what lets the calibration breaker ask this profile's one
+health question: *are the favourites I am buying winning as often as I paid for
+them to?* It halts if they are not.
+
 ## 7. Risk controls
 
 Every one fails closed.
@@ -327,7 +381,7 @@ Every one fails closed.
 
 ## 8. Configuration and hot reload
 
-All 70 settings live in `config.json`. Layering: defaults → profile → file
+All 99 settings live in `config.json`. Layering: defaults → profile → file
 overrides → CLI.
 
 The file is **re-read whenever it changes** — no restart. Reload is atomic and

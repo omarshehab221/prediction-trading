@@ -471,6 +471,46 @@ class Config:
     # open leg to settlement as an outright directional bet.
     straddle_force_hedge: bool = True
 
+    # --- Last minute (buy whichever side the book has already picked) -----
+    # A third entry strategy, and the simplest thing in this file. It reads
+    # no model, no volatility, no buffer and no trend. With a minute left it
+    # looks at the two asks, buys the dearer one -- the side the book is
+    # calling the winner -- and does nothing else for the rest of the round.
+    #
+    # The premise is that a price is a forecast, and in the last minute of a
+    # five-minute round it is a forecast with almost no time left in which to
+    # be wrong. That is a claim about this venue's late pricing, not about
+    # BTC, and --calibration-report's favourite-longshot table is the thing
+    # that settles it. Nothing here is derived from the model, so nothing
+    # here can be defended by the model either.
+    last_minute: bool = False
+    # When the hunt opens, in seconds before settlement.
+    last_minute_start_s: float = 60.0
+    # The price the leading side must show to be bought on sight.
+    #
+    # Above 0.5 by construction: at or below it the "dearer side" test and
+    # the floor would say the same thing, the floor could never fail, and
+    # the fallback below would be dead code wearing the costume of a setting.
+    last_minute_price_floor: float = 0.75
+    # Below this many seconds the floor is dropped and the leader is bought
+    # at whatever it costs.
+    #
+    # Not a relaxation of the rule -- the rest of it. The floor only fails to
+    # clear while the two sides are still close, which is to say while the
+    # round is genuinely undecided; and in exactly that case the dearer side
+    # is both the best read available AND cheap, because "no side reached
+    # 0.75" means the thing being bought is under 0.75 by definition. Holding
+    # out past this point forfeits the round waiting for a price that the
+    # book has already declined to print.
+    last_minute_fallback_s: float = 45.0
+    # Stop trying. A MARKET order needs a book to still be there, and the
+    # last few seconds of a round are when it is not.
+    last_minute_deadline_s: float = 5.0
+    # Stake per round, as a fraction of bankroll. One side, one order, one
+    # round -- so unlike a straddle leg this is the whole commitment to the
+    # round rather than half of it.
+    last_minute_stake_pct: float = 0.05
+
     # --- Claiming (background, non-blocking) --------------------------
     # A win must be claimed (on-chain redemption) before its proceeds are
     # real, spendable balance, and that can take anywhere from about a
@@ -679,6 +719,35 @@ class Config:
             # probability -- there is nothing for scale-in to top up toward.
             raise ValueError(
                 "straddle and scale_in cannot both be enabled")
+        if not 0 < self.last_minute_stake_pct <= 0.25:
+            raise ValueError("last_minute_stake_pct must be in (0, 0.25]")
+        if not 0.5 < self.last_minute_price_floor < 1.0:
+            # See the field comment: at or below 0.5 the floor can never
+            # fail, so the fallback can never fire.
+            raise ValueError("last_minute_price_floor must be in (0.5, 1)")
+        if self.last_minute_deadline_s < 0:
+            raise ValueError("last_minute_deadline_s must be non-negative")
+        if not (self.last_minute_deadline_s < self.last_minute_fallback_s
+                <= self.last_minute_start_s):
+            # Ordered, or one of the three silently does nothing: a fallback
+            # later than the start never gets a chance to hold the floor up,
+            # and one earlier than the deadline never gets a chance to drop
+            # it. Both read as configuration and behave as nothing.
+            raise ValueError(
+                f"require last_minute_deadline_s "
+                f"({self.last_minute_deadline_s}) < last_minute_fallback_s "
+                f"({self.last_minute_fallback_s}) <= last_minute_start_s "
+                f"({self.last_minute_start_s})")
+        if self.last_minute and self.straddle:
+            # Two entry strategies behind one dispatch. Enabling both would
+            # silently run whichever branch happens to be tested first.
+            raise ValueError("straddle and last_minute cannot both be enabled")
+        if self.last_minute and self.scale_in:
+            # Scale-in tops a position up toward the Kelly stake for a RISING
+            # model probability. This strategy has no model probability --
+            # there is nothing for a top-up to aim at.
+            raise ValueError(
+                "last_minute and scale_in cannot both be enabled")
         if self.claim_poll_interval_s <= 0:
             raise ValueError("claim_poll_interval_s must be positive")
         if self.claim_timeout_s <= 0:
@@ -976,6 +1045,76 @@ PROFILES: dict[str, dict] = {
                  # Raise it to demand a minimum locked-in return -- 0.01 for
                  # 1% of the pair, and correspondingly fewer rounds.
                  "straddle_min_worst_case_return": 0.0},
+    # ONE RULE. With a minute left, buy whichever side is dearer -- the one
+    # the book has already picked -- provided it is quoted at 0.75 or better.
+    # Inside the last 45 seconds, buy it whatever it costs. Nothing else is
+    # consulted and nothing else is done: no model probability, no edge test,
+    # no buffer, no trend, no scale-in, no second leg.
+    #
+    # WHAT THE TWO HALVES COST, STATED PLAINLY
+    # ----------------------------------------
+    # They are not the same trade, and the expensive one is not the fallback.
+    # A 0.75 fill pays about 33% on a win at a 2% fee, so 3 wins cover a
+    # loss. But the floor has NO ceiling above it, and a round already
+    # decided at 55 seconds quotes 0.97 -- which this profile buys, for about
+    # 3% on a win, where it takes 32 wins to cover one loss. That is where
+    # this strategy can bleed, and it is the primary branch, not the
+    # fallback: the fallback only ever fires below 0.75 and therefore only
+    # ever buys the CHEAP end.
+    #
+    # No max_entry_price is imposed to stop that, deliberately -- the band is
+    # left at its widest legal setting so nothing downstream quietly
+    # reinstates a filter this profile was written to do without. The
+    # favourite-longshot table in --calibration-report is what says whether
+    # the venue's late favourites win often enough to pay for the dear ones.
+    "lastminute": {"last_minute": True, "last_minute_stake_pct": 0.10,
+                   "last_minute_start_s": 60.0,
+                   "last_minute_price_floor": 0.75,
+                   "last_minute_fallback_s": 45.0,
+                   "last_minute_deadline_s": 5.0,
+                   # Matched to last_minute_stake_pct, not inherited. The
+                   # last-minute path never consults max_stake_pct -- it
+                   # sizes off its own fraction directly -- so a disagreeing
+                   # value would make --check-config and --preflight both
+                   # report a cap that is not in force, which is exactly the
+                   # lie the straddle profile had to be corrected for.
+                   "max_stake_pct": 0.10,
+                   # Widest legal band. No side is ever chosen on a price
+                   # judgement here beyond the floor itself, so nothing below
+                   # should silently reject a leader the rule already picked.
+                   "min_entry_price": 0.01, "max_entry_price": 0.99,
+                   # Inert on this path -- there is no edge computation to
+                   # threshold -- but stated rather than inherited so a
+                   # change to the defaults cannot reshape this profile.
+                   "min_edge": 0.02, "min_edge_ratio": 0.0,
+                   "min_win_return": 0.0, "min_buffer_sigmas": 0.0,
+                   # A loss costs a full 10% of bankroll, so the 20% default
+                   # would halt the day after two of them. 35% leaves the
+                   # 3.5-loss headroom the other single-sided profiles have.
+                   "daily_loss_limit_pct": 0.35,
+                   # Tight: entries happen in the last minute, when the two
+                   # sides have separated and the leader's quote is firm.
+                   "assumed_spread_pct": 0.03,
+                   "kelly_fraction": 0.25,
+                   # A late book is thinner than a mid-round one, and this
+                   # profile has no way to wait for a better one, so a
+                   # liquidity floor here would simply refuse rounds without
+                   # improving the fills it does get. The venue's own FOK
+                   # kill is the real protection; see _place_leg.
+                   "min_liquidity": 0.0, "max_rounds_per_day": 300,
+                   "paper_start_bankroll": 100.0,
+                   # Inert unless scale_in is enabled, which validation
+                   # forbids for this profile; sized to its own band.
+                   "max_blended_price": 0.5,
+                   # Never on: there is no model probability to top up
+                   # toward, which is why Config rejects the combination.
+                   "scale_in": False,
+                   # One position per round and one round per market, so two
+                   # slots is two live markets, not two bets on one.
+                   "max_concurrent_positions": 2,
+                   # 30% held back leaves 70% spendable against a 10% stake,
+                   # which funds both slots with room to spare.
+                   "reserve_pct": 0.30},
 }
 
 
@@ -986,7 +1125,7 @@ PROFILES: dict[str, dict] = {
 # The default strategy, declared once. Previously six literals across four
 # files each carried their own copy of this, which is precisely how a default
 # drifts: change five and the sixth silently disagrees.
-DEFAULT_PROFILE = "straddle"
+DEFAULT_PROFILE = "lastminute"
 
 # Fields that cannot change while the bot is running. Swapping any of these
 # mid-flight would leave the process in a state that does not match what it
@@ -4298,6 +4437,21 @@ class Trader:
             LOG.info("  Sizing the pair by payout put one leg under the "
                      "venue minimum. Raise straddle_stake_pct, or fund the "
                      "wallet, so the cheap side still clears it.")
+        elif top == "no side has reached the price floor":
+            LOG.info("  The leader never reached %.2f while the floor was "
+                     "still in force. Reaching expiry on that reason also "
+                     "means the fallback never got a look -- no poll landed "
+                     "inside its window, usually because the position slots "
+                     "were full or the market was halted. Lower "
+                     "last_minute_price_floor to take more of these before "
+                     "the fallback has to.",
+                     self._cfg.last_minute_price_floor)
+        elif top == "the two sides are priced level":
+            LOG.info("  The book could not separate UP from DOWN in the last "
+                     "minute. There is no dominant side to buy in that, and "
+                     "picking one anyway would be inventing a signal. This "
+                     "is the profile refusing rounds, not failing to see "
+                     "them.")
         elif top == "edge below the floor":
             LOG.info("  The venue is pricing these rounds close to the "
                      "model. That is a market with no edge in it, not a "
@@ -4442,6 +4596,8 @@ class Trader:
         """Dispatch to whichever entry strategy the config selects."""
         if self._cfg.straddle:
             self._maybe_enter_straddle(bankroll, mode)
+        elif self._cfg.last_minute:
+            self._maybe_enter_last_minute(bankroll, mode)
         else:
             self._maybe_enter_model(bankroll, mode)
 
@@ -4503,12 +4659,24 @@ class Trader:
         number is tradable, and without clamping it into range, which would
         quietly turn "this side is worthless" into "this side is a bargain".
         """
-        levels = self._client.asks_for(raw, side)
-        price = (levels[0][0] if levels
-                 else min(raw.quote_for(side)
-                          * (1.0 + self._cfg.assumed_spread_pct), 0.999))
-        price = raw.round_price(price)
+        price = raw.round_price(self._raw_book_price(raw, side))
         return price if 0.0 < price < 1.0 else None
+
+    def _raw_book_price(self, raw: Round, side: Side) -> float:
+        """
+        Best ask for one side, before rounding and before the usability test.
+
+        Split out from _book_price because RANKING the two sides and BUYING
+        one of them are different questions. A side that has decayed to 0.004
+        is not tradable and _book_price is right to answer None, but it is
+        still unambiguously the cheaper of the two -- and a caller asking
+        "which side is the book calling the winner?" needs that answer, not a
+        None it would have to guess the direction of.
+        """
+        levels = self._client.asks_for(raw, side)
+        return (levels[0][0] if levels
+                else min(raw.quote_for(side)
+                         * (1.0 + self._cfg.assumed_spread_pct), 0.999))
 
     def _place_leg(self, raw: Round, side: Side, price: float, stake: float,
                    quote: "Quote | None" = None
@@ -4541,18 +4709,18 @@ class Trader:
                 try:
                     stake = self._client.confirm_fill(order_id, stake)
                 except OrderNotFilled as exc:
-                    LOG.warning("Straddle %s: the %s leg did not fill (%s); "
-                                "no position recorded", raw.slug, side.value,
+                    LOG.warning("%s: the %s order did not fill (%s); no "
+                                "position recorded", raw.slug, side.value,
                                 exc)
                     return None
                 except (ApiError, requests.RequestException) as exc:
-                    LOG.error("Straddle %s: %s leg placed but the fill could "
+                    LOG.error("%s: the %s order was placed but the fill could "
                               "NOT be confirmed either way (%s); recording it "
                               "at the requested %.2f USDT so it is settled "
                               "and claimed rather than stranded",
                               raw.slug, side.value, exc, stake)
             if quote.fee_usdt > 0:
-                LOG.debug("Straddle %s %s fee %.4f USDT", raw.slug,
+                LOG.debug("%s %s fee %.4f USDT", raw.slug,
                           side.value, quote.fee_usdt)
         return price, stake, order_id
 
@@ -5199,7 +5367,217 @@ class Trader:
                     or available < self._cfg.min_stake_usdt):
                 return
 
+    def _maybe_enter_last_minute(self, bankroll: float, mode: str) -> None:
+        """
+        Buy whichever side the book has already picked, as the clock runs out.
+
+        One rule, and nothing underneath it. No model probability, no edge
+        test, no buffer, no trend, no volatility -- none of it is computed,
+        let alone consulted. With last_minute_start_s left in the round, read
+        the two asks, take the DEARER one, and stop.
+
+        The floor and the fallback are one rule in two halves, not a rule and
+        an excuse:
+
+          * above last_minute_fallback_s the leader must show
+            last_minute_price_floor. A leader under it means the round is
+            still a genuine contest, and there is time left for it to stop
+            being one, so nothing is bought yet.
+          * at or below last_minute_fallback_s that time has run out, and
+            "no side reached 0.75" has itself become the answer: the round
+            IS close, the leader is the best read anyone has of how it will
+            land, and -- because it failed the floor -- it is cheap. So it
+            is bought at whatever it costs.
+
+        The dear end is where this can bleed, and the dear end is the FIRST
+        branch, not the second. Nothing caps the price above the floor, so a
+        round already decided at 55 seconds quotes 0.97 and gets bought for
+        about 3% on a win, where it takes 32 wins to cover one loss -- against
+        3 wins at the 0.75 floor. That is the profile as specified, written
+        down here so it is a known cost rather than a discovered one; the
+        favourite-longshot table in --calibration-report is what says whether
+        the venue's late favourites win often enough to pay for it.
+
+        Two rounds are left alone, and neither is a judgement about price:
+        one where the sides are quoted level, because there is no dearer side
+        to buy and resolving that with a coin flip on UP would be inventing a
+        signal; and one where the leader has rounded to 1.00, because a
+        contract at 1.00 cannot pay back more than it cost, so buying it is
+        a fee with extra steps.
+
+        Everything the other strategies share still applies: the daily loss
+        limit, the calibration breaker, the streak cap, the reserve, the
+        concurrency cap and fill confirmation. Those are not strategy, they
+        are the difference between a bot that is losing and one that has
+        stopped.
+        """
+        now_ms = self._client.now_ms()
+        self._prune(now_ms)
+
+        if len(self._positions) >= self._cfg.max_concurrent_positions:
+            return
+
+        target = bankroll * self._cfg.last_minute_stake_pct
+        # Two different conditions, and conflating them is what once hid the
+        # same bug on the straddle path. Sizing under the venue minimum is a
+        # configuration fault that will never clear on its own, so it is loud
+        # and said once. Capital tied up in another market is the ordinary
+        # state of a profile holding a position, so it stays quiet.
+        if target < self._cfg.min_stake_usdt:
+            msg = ("The last-minute profile cannot enter any round: %.2f "
+                   "USDT (%.1f%% of a %.2f bankroll) is below the %.2f venue "
+                   "minimum. Raise last_minute_stake_pct or fund the wallet "
+                   "-- nothing will be traded until one of those changes."
+                   % (target, self._cfg.last_minute_stake_pct * 100, bankroll,
+                      self._cfg.min_stake_usdt))
+            if msg != self._idle_reason:
+                self._idle_reason = msg
+                LOG.warning("%s", msg)
+            return
+        self._idle_reason = ""
+
+        if self._available(bankroll) < self._cfg.min_stake_usdt:
+            LOG.debug("No uncommitted bankroll for a last-minute entry "
+                      "(%.2f committed of %.2f, %.0f%% reserved)",
+                      self._committed(), bankroll,
+                      self._cfg.reserve_pct * 100)
+            return
+
+        for raw in self._client.list_rounds():
+            if raw.topic_id in self._seen:
+                continue
+            # One position per market: a second on the same symbol is the
+            # same bet twice, not diversification.
+            if any(k[0] == raw.symbol for k in self._positions):
+                continue
+            try:
+                self._risk_for(raw.symbol).check(bankroll)
+            except TradingHalted as exc:
+                LOG.debug("%s halted: %s", raw.symbol, exc)
+                continue
+
+            secs = raw.seconds_remaining(now_ms)
+            if secs > self._cfg.last_minute_start_s:
+                # Deliberately NOT marked seen. Its minute has not come yet.
+                continue
+            if secs <= self._cfg.last_minute_deadline_s:
+                # Out of time. Whatever reason was last recorded against this
+                # round is the informative one, so it is left standing rather
+                # than overwritten with the clock running out -- that is a
+                # consequence of the real reason, not the reason.
+                self._watching.setdefault(
+                    raw.topic_id,
+                    (raw.end_ms,
+                     "the last minute ran out with no side to buy"))
+                self._seen[raw.topic_id] = raw.end_ms
+                continue
+
+            asks = {side: self._raw_book_price(raw, side)
+                    for side in (Side.UP, Side.DOWN)}
+            if asks[Side.UP] == asks[Side.DOWN]:
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "the two sides are priced level")
+                continue
+            side = max(asks, key=asks.get)
+            price = self._book_price(raw, side)
+            if price is None:
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "the leading side is priced at 1.00")
+                continue
+            if (price < self._cfg.last_minute_price_floor
+                    and secs > self._cfg.last_minute_fallback_s):
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "no side has reached the price floor")
+                continue
+
+            # Recomputed per round, not once per pass: entering one round
+            # commits capital that the next round in this pass must not be
+            # sized against as though it were still free.
+            stake = min(target, self._available(bankroll))
+            if stake < self._cfg.min_stake_usdt:
+                LOG.debug("%s: %.2f left after the reserve and %.2f already "
+                          "committed, under the %.2f minimum", raw.slug,
+                          stake, self._committed(), self._cfg.min_stake_usdt)
+                continue
+
+            quote = None
+            if self._live:
+                # Re-read the balance immediately before committing. The
+                # figure from the top of the loop is seconds old and may
+                # predate a settlement, a redemption landing or a manual
+                # withdrawal; sizing from it can ask for more than the
+                # account holds, which the venue rejects with -9000.
+                fresh = self._live_bankroll("last-minute entry")
+                if fresh is None:
+                    continue
+                stake = min(stake, fresh)
+                if stake < self._cfg.min_stake_usdt:
+                    LOG.warning("%s: the wallet holds %.2f, under the %.2f "
+                                "minimum order; skipping", raw.slug, fresh,
+                                self._cfg.min_stake_usdt)
+                    continue
+                quote = self._client.get_quote(raw, side, stake)
+                # The quote is authoritative and the book was only a screen.
+                # Re-test the rule on the price that will actually execute,
+                # or the floor binds on a number nobody pays.
+                if not 0.0 < quote.average_price < 1.0:
+                    LOG.info("%s: the %s quote came back at %.4f, which has "
+                             "no payout; skipping", raw.slug, side.value,
+                             quote.average_price)
+                    continue
+                if (quote.average_price < self._cfg.last_minute_price_floor
+                        and secs > self._cfg.last_minute_fallback_s):
+                    LOG.info("%s: the %s quote at %.4f is under the %.2f "
+                             "floor with %.0fs left; waiting", raw.slug,
+                             side.value, quote.average_price,
+                             self._cfg.last_minute_price_floor, secs)
+                    self._watching[raw.topic_id] = (
+                        raw.end_ms, "no side has reached the price floor")
+                    continue
+                price = quote.average_price
+
+            self._watching.pop(raw.topic_id, None)
+            self._seen[raw.topic_id] = raw.end_ms
+            placed = self._place_leg(raw, side, price, stake, quote)
+            if placed is None:
+                continue              # killed by the venue; nothing opened
+            price, stake, order_id = placed
+
+            # model_prob is the MARKET'S implied probability, not a forecast
+            # of ours -- this strategy makes none. Recording the price
+            # restated as a probability is what makes the calibration breaker
+            # mean something here: it then asks "are the favourites I am
+            # buying winning as often as I paid for them to?", which is the
+            # one health question this profile has, and halts if they are
+            # not. A neutral 0.5 would have left that test permanently and
+            # uninformatively positive. edge is 0.0 for the same reason:
+            # paying the market price is by definition no edge over it.
+            implied = breakeven_probability(price, raw.fee_bps)
+            sig = Signal(side, model_prob=implied, fill_price=price,
+                         edge=0.0, stake_usdt=stake,
+                         seconds_left=raw.seconds_remaining(now_ms))
+            tid = self._journal.record(mode, raw, sig, spot=math.nan,
+                                       sigma=math.nan, bankroll=bankroll,
+                                       order_id=order_id)
+            self._positions[(raw.symbol, side)] = Position(
+                tid, raw, sig, stake, 1)
+            LOG.info("LAST MINUTE %s | %s %.4f (%.2f) implied %.1f%% "
+                     "pays %+.0f%% (%.0fs left)%s", raw.slug, side.value,
+                     price, stake, implied * 100,
+                     win_return(price, raw.fee_bps) * 100, secs,
+                     "  [floor dropped]"
+                     if price < self._cfg.last_minute_price_floor else "")
+
+            if (len(self._positions) >= self._cfg.max_concurrent_positions
+                    or self._available(bankroll) < self._cfg.min_stake_usdt):
+                return
+
     def _maybe_scale_in_all(self, bankroll: float) -> None:
+        if self._cfg.last_minute:
+            # One order, one round, held to settlement. Config rejects
+            # last_minute + scale_in outright; this is the belt to that
+            # brace, so a future caller cannot route around the validation.
+            return
         if self._cfg.straddle:
             # Both legs are bought once, at round-open, and left alone until
             # settlement -- no top-up, no exit, nothing sold mid-round. This
@@ -5673,6 +6051,28 @@ def preflight(cfg: Config) -> int:
         if bal < cfg.min_stake_usdt:
             notes.append(f"  <-- below the {cfg.min_stake_usdt:.2f} minimum "
                          f"order size; no order can be placed")
+        elif cfg.last_minute:
+            # The last-minute path never calls kelly_stake either, so probing
+            # it would answer a question about a strategy this profile does
+            # not run. Report the sizing that IS in force, and the two limits
+            # that can silently zero it out.
+            per_round = bal * cfg.last_minute_stake_pct
+            spendable = bal * (1.0 - cfg.reserve_pct)
+            notes.append(f"  -> last-minute stakes {per_round:.2f} per round; "
+                         f"{spendable:.2f} spendable after the "
+                         f"{cfg.reserve_pct:.0%} reserve")
+            if per_round < cfg.min_stake_usdt:
+                notes.append(
+                    f"  <-- UNTRADEABLE: {per_round:.2f} per round is under "
+                    f"the {cfg.min_stake_usdt:.2f} venue minimum, so no "
+                    f"round will ever be entered. Raise "
+                    f"last_minute_stake_pct (now "
+                    f"{cfg.last_minute_stake_pct:.0%}) or add funds.")
+            elif spendable < per_round:
+                notes.append(
+                    f"  <-- UNTRADEABLE: one round needs {per_round:.2f} but "
+                    f"only {spendable:.2f} is spendable. Lower reserve_pct "
+                    f"(now {cfg.reserve_pct:.0%}) or last_minute_stake_pct.")
         elif cfg.straddle:
             # The straddle path never calls kelly_stake, so probing it here
             # would answer a question about a strategy this profile does not
@@ -6113,6 +6513,15 @@ def main(argv: Iterable[str] | None = None) -> int:
             print(f"  max stake      "
                   f"{checked.straddle_stake_pct:.0%} of bankroll per leg, "
                   f"{checked.straddle_stake_pct * 2:.0%} per round")
+        elif checked.last_minute:
+            print(f"  max stake      "
+                  f"{checked.last_minute_stake_pct:.0%} of bankroll "
+                  f"per round")
+            print(f"  entry rule     the dearer side at "
+                  f"{checked.last_minute_price_floor:.2f}+ from "
+                  f"{checked.last_minute_start_s:.0f}s, at any price from "
+                  f"{checked.last_minute_fallback_s:.0f}s, nothing under "
+                  f"{checked.last_minute_deadline_s:.0f}s")
         else:
             print(f"  max stake      {checked.max_stake_pct:.0%} of bankroll")
         print(f"  min buffer     {checked.min_buffer_sigmas} sigma")

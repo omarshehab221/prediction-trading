@@ -2914,8 +2914,8 @@ class TestProfileDefaults(unittest.TestCase):
         self.assertEqual(m.default_config_document()["active_profile"],
                          m.DEFAULT_PROFILE)
 
-    def test_default_profile_is_buffer(self):
-        self.assertEqual(m.DEFAULT_PROFILE, "straddle")
+    def test_default_profile_is_the_last_minute_one(self):
+        self.assertEqual(m.DEFAULT_PROFILE, "lastminute")
 
     def test_default_profile_exists(self):
         self.assertIn(m.DEFAULT_PROFILE, m.PROFILES)
@@ -7081,3 +7081,394 @@ class TestStraddleEntry(unittest.TestCase):
         t._maybe_scale_in_all(100.0)   # must be a no-op: nothing to top up to
 
         self.assertEqual(t._positions, before)
+
+
+# --------------------------------------------------------------------------
+# Last minute: buy the dearer side as the clock runs out, and nothing else
+# --------------------------------------------------------------------------
+
+
+def lastminute_cfg(**kw) -> Config:
+    base = dict(api_key="k", api_secret="s", live=False,
+                **m.PROFILES["lastminute"])
+    base.update(kw)
+    return Config(**base)
+
+
+class TestLastMinuteConfig(unittest.TestCase):
+
+    def test_the_profile_is_internally_valid(self):
+        lastminute_cfg()          # must not raise
+
+    def test_the_switch_is_off_everywhere_else(self):
+        for name, values in m.PROFILES.items():
+            if name == "lastminute":
+                continue
+            self.assertNotIn("last_minute", values,
+                             f"{name} should not touch the last-minute switch")
+
+    def test_it_is_off_by_default(self):
+        self.assertFalse(Config(api_key="k", api_secret="s").last_minute)
+
+    def test_the_declared_stake_cap_does_not_contradict_the_real_one(self):
+        """
+        max_stake_pct is inert on this path, which is exactly why it must not
+        disagree with last_minute_stake_pct: --check-config and --preflight
+        both read it, and a config advertising one cap while staking another
+        is lying to whoever reads it.
+        """
+        c = lastminute_cfg()
+        self.assertGreaterEqual(c.max_stake_pct, c.last_minute_stake_pct)
+
+    def test_the_reserve_leaves_room_for_the_concurrent_rounds_allowed(self):
+        """
+        reserve_pct is the one limit that CAN throttle this path, via
+        _available. A reserve that cannot fund the slots the profile claims
+        makes max_concurrent_positions a dead setting.
+        """
+        c = lastminute_cfg()
+        spendable = 1.0 - c.reserve_pct
+        self.assertGreaterEqual(
+            spendable, c.last_minute_stake_pct * c.max_concurrent_positions)
+
+    def test_a_floor_at_or_below_a_coin_flip_is_rejected(self):
+        """Below 0.5 the floor can never fail, so the fallback is dead code."""
+        for bad in (0.5, 0.4, 0.0):
+            with self.assertRaises(ValueError):
+                lastminute_cfg(last_minute_price_floor=bad)
+
+    def test_a_floor_at_or_above_certainty_is_rejected(self):
+        for bad in (1.0, 1.2):
+            with self.assertRaises(ValueError):
+                lastminute_cfg(last_minute_price_floor=bad)
+
+    def test_the_three_clocks_must_be_ordered(self):
+        with self.assertRaises(ValueError):          # fallback after start
+            lastminute_cfg(last_minute_start_s=30.0,
+                           last_minute_fallback_s=45.0)
+        with self.assertRaises(ValueError):          # fallback at the deadline
+            lastminute_cfg(last_minute_fallback_s=5.0,
+                           last_minute_deadline_s=5.0)
+        with self.assertRaises(ValueError):          # deadline after fallback
+            lastminute_cfg(last_minute_deadline_s=50.0)
+
+    def test_a_fallback_equal_to_the_start_is_legal(self):
+        """It means "never hold out for the floor", which is a real setting."""
+        c = lastminute_cfg(last_minute_fallback_s=60.0)
+        self.assertEqual(c.last_minute_fallback_s, c.last_minute_start_s)
+
+    def test_stake_bounds(self):
+        for bad in (0.0, -0.1, 0.3):
+            with self.assertRaises(ValueError):
+                lastminute_cfg(last_minute_stake_pct=bad)
+
+    def test_it_cannot_run_alongside_the_straddle(self):
+        """Two entry strategies, one dispatch; one would silently win."""
+        with self.assertRaises(ValueError):
+            lastminute_cfg(straddle=True)
+
+    def test_it_cannot_scale_in(self):
+        """There is no model probability for a top-up to aim at."""
+        with self.assertRaises(ValueError):
+            lastminute_cfg(scale_in=True)
+
+    def test_the_band_does_not_narrow_the_rule(self):
+        """
+        The entry band is not this profile's gate and must not act as one:
+        anything the rule can buy -- a 0.98 leader, or a 0.20 one after the
+        floor drops -- has to sit inside it.
+        """
+        c = lastminute_cfg()
+        self.assertLessEqual(c.min_entry_price, 0.05)
+        self.assertGreaterEqual(c.max_entry_price, 0.98)
+
+
+class TestLastMinuteEntry(unittest.TestCase):
+    """The whole strategy: dearer side, floor, fallback, and nothing else."""
+
+    START = 1_700_000_000_000
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self._built = []
+
+    def tearDown(self):
+        # Windows refuses to unlink a file sqlite still holds open, and a
+        # Journal outlives the Trader that made it. Closing here keeps a
+        # tearDown failure from masking the assertion the test actually made.
+        for trader in self._built:
+            trader._journal._conn.close()
+        os.unlink(self.db)
+
+    def _build(self, client, c):
+        trader = build_trader(client, c, self.db)
+        self._built.append(trader)
+        return trader
+
+    def _round(self, **kw):
+        base = dict(strike=100_000.0, start_ms=self.START,
+                    end_ms=self.START + (m.DEFAULT_ROUND_SECONDS * 1000),
+                    fee_bps=200)
+        base.update(kw)
+        return make_round(**base)
+
+    def _at(self, secs_left, up, down, client_cls=FakeClient, **cfgkw):
+        """A trader looking at one round with `secs_left` to run."""
+        rnd = self._round()
+        now = rnd.end_ms - int(secs_left * 1000)
+        books = {}
+        if up is not None:
+            books[(1, Side.UP)] = [(up, 10_000)]
+        if down is not None:
+            books[(1, Side.DOWN)] = [(down, 10_000)]
+        client = client_cls([rnd], [(now, 100_000.0)], books, {})
+        c = lastminute_cfg(db_path=self.db, **cfgkw)
+        return self._build(client, c), client
+
+    # -- dispatch ---------------------------------------------------------
+
+    def test_dispatch_uses_the_last_minute_path_when_enabled(self):
+        c = lastminute_cfg(db_path=self.db)
+        t = self._build(FakeClient([], [(0, 100_000.0)], {}, {}), c)
+        called = {"last": False, "straddle": False, "model": False}
+        t._maybe_enter_last_minute = lambda *a: called.__setitem__("last", True)
+        t._maybe_enter_straddle = lambda *a: called.__setitem__("straddle", True)
+        t._maybe_enter_model = lambda *a: called.__setitem__("model", True)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(called, {"last": True, "straddle": False,
+                                  "model": False})
+
+    # -- the clock --------------------------------------------------------
+
+    def test_nothing_happens_before_the_last_minute(self):
+        t, _ = self._at(90.0, 0.85, 0.15)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        # Not written off either: its minute has not arrived yet.
+        self.assertNotIn(1, t._seen)
+
+    def test_the_minute_opens_exactly_at_the_configured_second(self):
+        t, _ = self._at(60.0, 0.85, 0.15)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
+    def test_the_deadline_closes_the_round(self):
+        t, _ = self._at(4.0, 0.85, 0.15)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        self.assertIn(1, t._seen)
+
+    # -- the rule ---------------------------------------------------------
+
+    def test_it_buys_the_dearer_side(self):
+        t, _ = self._at(55.0, 0.80, 0.20)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+        self.assertAlmostEqual(
+            t._positions[("BTCUSDT", Side.UP)].signal.fill_price, 0.80)
+
+    def test_dearer_is_not_a_preference_for_up(self):
+        t, _ = self._at(55.0, 0.20, 0.80)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.DOWN)])
+
+    def test_a_leader_under_the_floor_waits(self):
+        t, _ = self._at(55.0, 0.60, 0.40)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        self.assertEqual(t._watching[1][1],
+                         "no side has reached the price floor")
+        # Refused, not written off: the price may reach the floor by 50s.
+        self.assertNotIn(1, t._seen)
+
+    def test_the_floor_binds_just_under_it(self):
+        t, _ = self._at(55.0, 0.7499, 0.2501)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+
+    def test_the_floor_clears_exactly_at_it(self):
+        t, _ = self._at(55.0, 0.75, 0.25)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
+    def test_the_fallback_buys_the_leader_under_the_floor(self):
+        t, _ = self._at(40.0, 0.60, 0.40)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+        self.assertAlmostEqual(
+            t._positions[("BTCUSDT", Side.UP)].signal.fill_price, 0.60)
+
+    def test_the_fallback_opens_exactly_at_its_second(self):
+        t, _ = self._at(45.0, 0.60, 0.40)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
+    def test_the_fallback_still_takes_the_dearer_side(self):
+        t, _ = self._at(40.0, 0.45, 0.55)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.DOWN)])
+
+    def test_level_prices_are_left_alone(self):
+        """
+        There is no dominant side in a tie, and picking one anyway would be
+        inventing the only signal this strategy refuses to have.
+        """
+        t, _ = self._at(40.0, 0.50, 0.50)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        self.assertEqual(t._watching[1][1], "the two sides are priced level")
+
+    def test_a_leader_at_one_is_left_alone(self):
+        """1.00 can never pay back more than it cost; buying it is a fee."""
+        t, _ = self._at(40.0, 1.00, 0.001)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        self.assertEqual(t._watching[1][1],
+                         "the leading side is priced at 1.00")
+
+    def test_a_worthless_other_side_does_not_block_the_leader(self):
+        """
+        _book_price answers None for a side that has decayed to nothing, and
+        ranking must not mistake that for "no price to compare against".
+        """
+        t, _ = self._at(40.0, 0.97, 0.0001)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+
+    def test_a_dear_leader_is_bought_without_complaint(self):
+        """
+        The cost of the rule as specified: 0.97 pays about 3% on a win, so
+        it takes 32 of them to cover one loss, against 3 at the 0.75 floor.
+        Nothing stops it, deliberately -- this test exists so the arithmetic
+        is a known cost rather than a discovery.
+        """
+        t, _ = self._at(55.0, 0.97, 0.03)
+        t._maybe_enter(100.0, "PAPER")
+        sig = t._positions[("BTCUSDT", Side.UP)].signal
+        self.assertAlmostEqual(sig.fill_price, 0.97)
+        self.assertLess(m.win_return(sig.fill_price, 200), 0.04)
+        self.assertGreater(m.wins_per_loss(sig.fill_price),
+                           10 * m.wins_per_loss(0.75))
+
+    # -- it consults nothing else -----------------------------------------
+
+    def test_the_model_gates_are_not_consulted(self):
+        """
+        The point of the profile. An edge floor and a buffer gate that would
+        refuse every round on the model path must change nothing here.
+        """
+        t, _ = self._at(55.0, 0.85, 0.15, min_edge=0.90, min_edge_ratio=5.0,
+                        min_buffer_sigmas=9.0)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
+    def test_the_model_entry_window_is_not_consulted(self):
+        t, _ = self._at(55.0, 0.85, 0.15, entry_window_start_s=280,
+                        entry_window_end_s=270)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
+    def test_no_spot_or_volatility_is_read(self):
+        """
+        Nothing about the underlying enters this decision, so a client that
+        raises on being asked must still produce the trade.
+        """
+        t, client = self._at(55.0, 0.85, 0.15)
+
+        def boom(*a, **kw):
+            raise AssertionError("the last-minute path read the underlying")
+
+        client.spot_price = boom
+        t._vol.sigma_annual = boom
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
+    # -- sizing and bookkeeping -------------------------------------------
+
+    def test_the_stake_is_the_profiles_own_fraction(self):
+        t, _ = self._at(55.0, 0.85, 0.15)
+        t._maybe_enter(100.0, "PAPER")
+        pos = t._positions[("BTCUSDT", Side.UP)]
+        self.assertAlmostEqual(pos.signal.stake_usdt, 10.0)
+        self.assertAlmostEqual(pos.committed_usdt, 10.0)
+
+    def test_the_reserve_caps_the_stake(self):
+        t, _ = self._at(55.0, 0.85, 0.15, reserve_pct=0.95)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertAlmostEqual(
+            t._positions[("BTCUSDT", Side.UP)].signal.stake_usdt, 5.0)
+
+    def test_a_stake_under_the_venue_minimum_trades_nothing(self):
+        t, _ = self._at(55.0, 0.85, 0.15)
+        t._maybe_enter(5.0, "PAPER")          # 10% of 5.00 is 0.50
+        self.assertEqual(t._positions, {})
+
+    def test_the_journal_records_the_markets_implied_probability(self):
+        """
+        Not a forecast -- there is none. Recording the price restated as a
+        probability is what lets the calibration breaker ask the one health
+        question this profile has: are these favourites winning as often as
+        I paid for them to?
+        """
+        t, _ = self._at(55.0, 0.80, 0.20)
+        t._maybe_enter(100.0, "PAPER")
+        sig = t._positions[("BTCUSDT", Side.UP)].signal
+        self.assertAlmostEqual(sig.model_prob,
+                               m.breakeven_probability(0.80, 200))
+        self.assertEqual(sig.edge, 0.0)
+
+    def test_one_position_per_market(self):
+        t, _ = self._at(55.0, 0.85, 0.15)
+        t._maybe_enter(100.0, "PAPER")
+        t._seen.clear()                       # as if the round were fresh
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(len(t._positions), 1)
+
+    def test_an_entered_round_is_not_revisited(self):
+        t, _ = self._at(55.0, 0.85, 0.15)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(1, t._seen)
+        self.assertNotIn(1, t._watching)
+
+    def test_scale_in_never_runs(self):
+        t, _ = self._at(55.0, 0.85, 0.15)
+        t._maybe_enter(100.0, "PAPER")
+        before = dict(t._positions)
+        t._maybe_scale_in_all(100.0)
+        self.assertEqual(t._positions, before)
+
+    def test_a_halted_market_is_not_traded(self):
+        t, _ = self._at(55.0, 0.85, 0.15)
+        t._risk_for("BTCUSDT").halted_reason = "daily loss limit"
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+
+    # -- live mode --------------------------------------------------------
+
+    def test_the_quote_not_the_book_decides_in_live_mode(self):
+        """
+        The book is a screen; the executed price is what the rule has to hold
+        on. A book showing 0.80 and a quote coming back at 0.70 is a trade
+        the floor refuses, not one it already approved.
+        """
+        t, _ = self._at(55.0, 0.80, 0.20, client_cls=QuotingClient, live=True)
+        t._client._quotes = {Side.UP: 0.70, Side.DOWN: 0.30}
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        self.assertEqual(t._watching[1][1],
+                         "no side has reached the price floor")
+
+    def test_a_worse_quote_is_still_taken_after_the_floor_drops(self):
+        t, _ = self._at(40.0, 0.80, 0.20, client_cls=QuotingClient, live=True)
+        t._client._quotes = {Side.UP: 0.70, Side.DOWN: 0.30}
+        t._maybe_enter(100.0, "PAPER")
+        self.assertAlmostEqual(
+            t._positions[("BTCUSDT", Side.UP)].signal.fill_price, 0.70)
+
+    def test_a_killed_order_records_no_position(self):
+        t, _ = self._at(55.0, 0.80, 0.20, client_cls=QuotingClient, live=True)
+        t._client._quotes = {Side.UP: 0.80, Side.DOWN: 0.20}
+        t._client.kill_fills = True
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
