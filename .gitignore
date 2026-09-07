@@ -3,3 +3,6 @@
 __pycache__/
 *.py[cod]
 *.stackdump
+
+# Cached klines for the backtest (36 MB, ~40 min to refetch)
+.klines-*
