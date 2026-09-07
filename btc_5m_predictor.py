@@ -2371,20 +2371,6 @@ class RiskManager:
         with self._lock:
             self._expected_credit += max(amount, 0.0)
 
-    def correct_realised_pnl(self, delta: float) -> None:
-        """
-        Book a difference the venue reported against what we calculated.
-
-        Called where the measurement is trustworthy on its own -- either side
-        of a single settlement, seconds apart, far too narrow a window for a
-        deposit to be a plausible explanation.
-        """
-        if abs(delta) <= EPS:
-            return
-        with self._lock:
-            self._realised_pnl += delta
-            self._pnl_correction += delta
-
     def calibration_z(self) -> float | None:
         """
         How far observed wins sit below what the model predicted, in sigmas.
@@ -2486,6 +2472,33 @@ class RiskManager:
         manual order from reading as a drawdown. The split of a genuinely
         ambiguous residue cannot be recovered; it can only be capped, and
         capping it in the strategy's DISFAVOUR is the safe direction.
+
+        NOTHING IS EVER LEFT OVER
+        -------------------------
+        However the residue is split, ALL of it is absorbed, so that after
+        this returns
+
+            _day_start_bankroll + _realised_pnl == bankroll
+
+        exactly. The venue's number is the truth and this pair is only a
+        decomposition of it; a decomposition that does not add up is just a
+        slower way of being wrong.
+
+        This used to return early whenever the drift was under `tolerance`,
+        on the reasoning that something smaller than a fraction of the venue
+        minimum cannot be a trade. True, and irrelevant: the drift is
+        measured against the baseline ABSOLUTELY, not since the last call, so
+        an unabsorbed cent is measured again next time and every time after.
+        A model that runs a few cents light per round therefore sat under the
+        threshold, invisible, until the accumulated total crossed it in one
+        step -- at which point the whole accumulation was rebased into the
+        baseline as somebody's deposit. The threshold turned a steady leak
+        into a periodic laundering, which is precisely the drift it was meant
+        to be too small to cause.
+
+        So the threshold now governs REPORTING only: dust is absorbed
+        quietly, a real movement is absorbed and announced. Either way the
+        identity above holds on the way out.
         """
         if outstanding is None:
             return 0.0
@@ -2501,7 +2514,7 @@ class RiskManager:
             # Flat, so anything owed has either landed or is not coming. The
             # expectation explains this reconciliation and no later one.
             self._expected_credit = 0.0
-        if abs(drift) <= tolerance:
+        if abs(drift) <= EPS:
             return 0.0
 
         room = claimable * self._cfg.reconcile_tolerance
@@ -2514,15 +2527,21 @@ class RiskManager:
                      "movement. Today's corrections %+.2f USDT.",
                      correction, self._pnl_correction)
             drift -= correction
-            if abs(drift) <= tolerance:
-                return 0.0
+        if abs(drift) <= EPS:
+            return 0.0
 
         self._day_start_bankroll = max(self._day_start_bankroll + drift, EPS)
         self._external_flow += drift
-        LOG.info("External balance movement %+.2f USDT (deposit, withdrawal "
-                 "or an order this bot did not place); baseline rebased to "
-                 "%.2f. Not counted as a trading result.",
-                 drift, self._day_start_bankroll)
+        if abs(drift) > tolerance:
+            LOG.info("External balance movement %+.2f USDT (deposit, "
+                     "withdrawal or an order this bot did not place); "
+                     "baseline rebased to %.2f. Not counted as a trading "
+                     "result.", drift, self._day_start_bankroll)
+        else:
+            # Too small to be a trade or a transfer, and still absorbed --
+            # see NOTHING IS EVER LEFT OVER above.
+            LOG.debug("Absorbed %+.4f USDT of unattributable drift; baseline "
+                      "now %.2f", drift, self._day_start_bankroll)
         return drift
 
     def check(self, bankroll: float,
@@ -4478,20 +4497,6 @@ class Trader:
         LOG.warning("MODE NOW %s -- bankroll %.2f, risk counters reset",
                     "LIVE" if wanted else "PAPER", bankroll)
 
-    def _correct_pnl(self, symbol: str, delta: float) -> None:
-        """
-        Push a venue-measured correction into every manager that books PnL.
-
-        Both of them or neither: the per-market manager owns the streak and
-        the account manager owns the daily limit, and a correction that
-        reached only one would leave the two disagreeing about the same day.
-        """
-        if abs(delta) <= EPS:
-            return
-        self._risk_for(symbol).correct_realised_pnl(delta)
-        if self._account_risk is not None:
-            self._account_risk.correct_realised_pnl(delta)
-
     def _bankroll(self) -> float:
         """
         Tradable balance, including winnings that are settled but not yet
@@ -6178,22 +6183,35 @@ class Trader:
         has been credited on chain -- which is normally after this runs, so
         that case is noted rather than flagged.
 
-        WHY THE GAP IS BOOKED AND NOT JUST PRINTED
-        ------------------------------------------
-        This used to warn and stop there, which left the bot certain that its
-        own arithmetic was wrong and unwilling to do anything about it. The
-        residue did not disappear: RiskManager met it later, could not tell
-        it from a deposit, and rebased it into the day's baseline. So a fee
-        the model under-counted by a few cents was laundered once per round,
-        every round, and the daily loss limit drifted further from the
-        account it exists to protect for as long as the bot ran.
+        WHY THIS ONLY REPORTS, AND DOES NOT BOOK
+        ----------------------------------------
+        It briefly did book the gap against PnL, on the reasoning that two
+        balance reads seconds apart cannot bracket a deposit. The reads are
+        that close together; they are not that clean, and the arithmetic here
+        was wrong in a way that cost real money.
 
-        Here the measurement is trustworthy on its own terms. Both balances
-        are read seconds apart around a single settlement -- a window far too
-        narrow for a deposit to be the likely explanation -- so the gap is
-        charged to PnL, where the venue's version wins. Anything genuinely
-        external is still caught later, by the reconciliation that is built
-        to look for it.
+        A WIN is the fatal case. Its payout lands minutes later, so `actual`
+        is near zero here while `expected_move` is the whole gross payout,
+        and the only thing standing between that and a correction of MINUS
+        THE ENTIRE PAYOUT was a guard requiring the balance to be unchanged
+        to the last EPS. Anything at all moving in the window defeats it --
+        an earlier claim landing, dust, or the other leg of the very same
+        straddle round settling a moment before, which is not an edge case
+        but the normal shape of every straddle. A won round could book its
+        payout into PnL and then immediately subtract it again.
+
+        A LOSS is only better by degree: expected_move is zero, so any
+        unrelated credit landing inside the window reads as this round's
+        modelling error.
+
+        The window is too narrow for a deposit and still too wide for
+        attribution, which leaves this measurement useful as a SIGNAL and
+        unfit as a LEDGER ENTRY. So it warns, and the books are squared where
+        the measurement is unambiguous instead: RiskManager.reconcile, which
+        runs only with a flat book and nothing in flight, and which anchors
+        the baseline to the venue's balance so that no residue survives to
+        accumulate. The venue is still the single source of truth -- this is
+        just not the place that reads it.
         """
         actual = after - before
         # A loss should move nothing: the money went out when the order did.
@@ -6202,25 +6220,26 @@ class Trader:
         reference = max(abs(expected_move), self._cfg.min_stake_usdt)
         drift = abs(actual - expected_move)
 
-        if won and self._unredeemed and abs(actual) < EPS:
-            LOG.debug("Balance unchanged; winnings still unredeemed")
+        if won:
+            # The claim is queued, not credited. There is nothing to compare
+            # against yet and there will not be before this returns.
+            LOG.debug("Settled a win on %s; payout %.4f not yet credited, "
+                      "balance moved %+.4f", pos.rnd.slug, expected_move,
+                      actual)
             return
         if drift <= reference * self._cfg.reconcile_tolerance:
-            LOG.debug("Reconciled %s: expected the balance to move %+.4f, "
-                      "it moved %+.4f (P&L %+.4f)",
-                      "a win" if won else "a loss", expected_move, actual,
-                      expected_pnl)
+            LOG.debug("Reconciled a loss: expected the balance to move "
+                      "%+.4f, it moved %+.4f (P&L %+.4f)",
+                      expected_move, actual, expected_pnl)
             return
 
-        correction = actual - expected_move
-        self._correct_pnl(pos.rnd.symbol, correction)
         LOG.warning(
-            "RECONCILE MISMATCH on %s: settling %s should have moved the "
-            "balance %+.4f, it moved %+.4f (gap %.4f, P&L %+.4f). The venue "
-            "is authoritative -- something here is counting a stake or a fee "
-            "the venue does not, so %+.4f is booked against today's P&L.",
-            pos.rnd.slug, "a win" if won else "a loss", expected_move, actual,
-            drift, expected_pnl, correction)
+            "RECONCILE MISMATCH on %s: settling a loss should have moved the "
+            "balance %+.4f, it moved %+.4f (gap %.4f, P&L %+.4f). Either a "
+            "cost is unmodelled here or something landed in the window. Not "
+            "booked -- the balance is squared against the venue when the book "
+            "next goes flat.",
+            pos.rnd.slug, expected_move, actual, drift, expected_pnl)
 
     def _drain(self, timeout_s: float | None = None) -> None:
         deadline = time.time() + (timeout_s if timeout_s is not None

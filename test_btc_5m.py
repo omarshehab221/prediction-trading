@@ -722,33 +722,62 @@ class TestRiskManager(unittest.TestCase):
         self.assertAlmostEqual(r.pnl_correction, 0.0, places=6)
         self.assertAlmostEqual(r.external_flow, -40.0, places=6)
 
-    def test_a_direct_correction_moves_realised_pnl(self):
+    def test_nothing_is_left_over_for_the_next_call_to_find(self):
         """
-        The settlement-time path. _reconcile measures the gap against a
-        balance read seconds either side of one settlement, which is far too
-        narrow a window for a deposit, so it is charged straight to PnL.
+        The leak. Drift is measured against the baseline ABSOLUTELY, not
+        since the last call, so anything left unabsorbed is measured again
+        next time and every time after. Sub-threshold drift therefore did not
+        stay small -- it stayed INVISIBLE while it accumulated, then crossed
+        the threshold in one step and was rebased away as somebody's deposit.
+        After reconciling, the decomposition has to add back up to the number
+        the venue reported.
         """
         r = RiskManager(cfg(), 100.0)
-        r.record_result(False, 0.5, pnl=-20.0)
-        r.correct_realised_pnl(-0.35)
-        self.assertAlmostEqual(r.realised_pnl, -20.35, places=6)
-        self.assertAlmostEqual(r.pnl_correction, -0.35, places=6)
+        r.record_result(False, 0.5, pnl=-5.0)
+        r.check(94.97, 0.0)               # 0.03 unexplained, under tolerance
+
+        self.assertAlmostEqual(r._day_start_bankroll + r.realised_pnl,
+                               94.97, places=9)
+
+    def test_a_steady_small_leak_does_not_accumulate_unseen(self):
+        """
+        Three cents a round, ten rounds. Under the old threshold none of the
+        first few were absorbed, the total crossed 0.10, and the whole
+        accumulation was announced as an external movement -- a laundering
+        caused by the very threshold meant to be too small to matter.
+        """
+        # Neither the streak counter nor the daily limit is what is under
+        # test here; both are lifted out of the way.
+        r = RiskManager(cfg(max_consecutive_losses=99,
+                            daily_loss_limit_pct=0.90), 100.0)
+        balance = 100.0
+        for _ in range(10):
+            r.record_result(False, 0.5, pnl=-1.0)
+            balance -= 1.03               # the venue takes 0.03 more each time
+            r.check(balance, 0.0)
+            self.assertAlmostEqual(r._day_start_bankroll + r.realised_pnl,
+                                   balance, places=9)
+
+        self.assertAlmostEqual(balance, 89.70, places=9)
+        self.assertAlmostEqual(r.external_flow, -0.30, places=6)
 
     def test_a_corrected_loss_still_trips_the_daily_limit(self):
         """
         The point of all of it. A model that under-reports every loss must
-        not be able to walk the bot past its own stop.
+        not be able to walk the bot past its own stop. The correction comes
+        from the venue's own balance, via a declared credit that landed light.
         """
         r = RiskManager(cfg(daily_loss_limit_pct=0.20), 100.0)
         r.record_result(False, 0.6, pnl=-19.0)
-        r.correct_realised_pnl(-2.0)      # the venue took 2.00 more
+        r.expect_credit(20.0)             # room for a 2.00 fee
         with self.assertRaises(TradingHalted):
-            r.check(79.0, 0.0)
+            r.check(79.0, 0.0)            # venue took 2.00 more than modelled
+        self.assertAlmostEqual(r.pnl_correction, -2.0, places=6)
 
     def test_the_halt_message_reports_corrections_separately(self):
         r = RiskManager(cfg(daily_loss_limit_pct=0.20), 100.0)
         r.record_result(False, 0.6, pnl=-19.0)
-        r.correct_realised_pnl(-2.0)
+        r.expect_credit(20.0)
         with self.assertRaises(TradingHalted) as caught:
             r.check(79.0, 0.0)
         self.assertIn("correction", str(caught.exception).lower())
@@ -5280,21 +5309,24 @@ class TestBalanceReconciliation(unittest.TestCase):
             handler = Cap(); prev = m.LOG.level
             m.LOG.setLevel(_log.WARNING); m.LOG.addHandler(handler)
             try:
-                t._reconcile(pos, True, 0.65, 100.0, 100.20)
+                # A loss: the stake left at entry, so nothing should move.
+                # A win cannot be used to make this point any more -- its
+                # payout has not landed when _reconcile runs, so there is
+                # nothing yet to disagree with.
+                t._reconcile(pos, False, -1.0, 100.0, 99.80)
             finally:
                 m.LOG.removeHandler(handler); m.LOG.setLevel(prev)
             self.assertTrue(any("RECONCILE MISMATCH" in r for r in records))
         finally:
             os.unlink(db)
 
-    def test_a_mismatch_is_charged_to_pnl_not_merely_logged(self):
+    def test_a_settlement_mismatch_is_reported_and_not_booked(self):
         """
-        The drift the bot was leaking. _reconcile already measured the gap
-        between what settling should have moved and what it did -- across a
-        window seconds wide, far too narrow for a deposit -- and then threw
-        the number away. RiskManager saw the same residue later, could not
-        tell it from somebody's deposit, and rebased it into the baseline.
-        A fee under-modelled by a few cents a round was laundered every round.
+        A balance read either side of one settlement is a useful SIGNAL and
+        an unfit LEDGER ENTRY: the window is too narrow for a deposit and
+        still too wide for attribution, because anything else landing inside
+        it lands on this round's account. Squaring the books is left to
+        reconcile(), which runs only with a flat book.
         """
         fd, db = tempfile.mkstemp(suffix=".db"); os.close(fd)
         try:
@@ -5305,15 +5337,45 @@ class TestBalanceReconciliation(unittest.TestCase):
                            Signal(Side.UP, 0.9, 0.60, 0.02, 1.0, 60.0, 2.0),
                            1.0, 1)
             t._account_risk = m.RiskManager(c, 100.0)
-            risk = t._risk_for(rnd.symbol)
 
-            # A loss: the stake left at entry, so settling should move
-            # nothing. It moved -0.15, which is a cost the model missed.
             t._reconcile(pos, False, -1.0, 100.0, 99.85)
 
-            self.assertAlmostEqual(risk.pnl_correction, -0.15, places=6)
-            self.assertAlmostEqual(t._account_risk.pnl_correction, -0.15,
-                                   places=6)
+            self.assertAlmostEqual(
+                t._risk_for(rnd.symbol).pnl_correction, 0.0, places=9)
+            self.assertAlmostEqual(
+                t._account_risk.pnl_correction, 0.0, places=9)
+        finally:
+            os.unlink(db)
+
+    def test_an_uncredited_win_is_never_charged_its_own_payout(self):
+        """
+        The bug that made this worse than the drift it was fixing. A win's
+        payout lands minutes after settlement, so the balance has not moved
+        by it yet; the correction on offer was therefore MINUS THE WHOLE
+        PAYOUT, guarded only by the balance being unchanged to the last EPS.
+
+        A straddle settles its second leg moments after its first, so the
+        window routinely contains someone else's movement. Here that is a
+        0.02 dusting -- enough to defeat an exact-zero guard, nowhere near
+        enough to mean the 1.67 payout evaporated.
+        """
+        fd, db = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        try:
+            c = cfg(db_path=db, live=True)
+            t = build_trader(FakeClient([], [(0, 65_000.0)], {}, {}), c, db)
+            rnd = make_round()
+            pos = Position(1, rnd,
+                           Signal(Side.UP, 0.9, 0.60, 0.02, 1.0, 60.0, 2.0),
+                           1.0, 1)
+            t._account_risk = m.RiskManager(c, 100.0)
+            t._unredeemed["tok"] = (1.6667, [], "56")
+
+            t._reconcile(pos, True, 0.65, 100.0, 100.02)
+
+            self.assertAlmostEqual(
+                t._risk_for(rnd.symbol).pnl_correction, 0.0, places=9)
+            self.assertAlmostEqual(
+                t._account_risk.pnl_correction, 0.0, places=9)
         finally:
             os.unlink(db)
 
@@ -5339,7 +5401,8 @@ class TestBalanceReconciliation(unittest.TestCase):
         """
         The payout lands after this runs, so there is nothing to compare
         against. Correcting here would book the whole gross payout as a
-        modelling error.
+        modelling error. Same claim as the test above, with an undisturbed
+        window -- the property must not depend on that.
         """
         fd, db = tempfile.mkstemp(suffix=".db"); os.close(fd)
         try:
