@@ -230,9 +230,7 @@ Trader tick
 
 ## Configuration
 
-Six new fields on `Config`, each read at exactly one site and each given a
-profile override so `coherence.py`'s "no profile overrides it" check stays
-quiet:
+Six new fields on `Config`, each read at exactly one site:
 
 | Field | Default | Purpose |
 |---|---|---|
@@ -242,6 +240,17 @@ quiet:
 | `ws_stale_s` | `5.0` | Connection silence beyond this marks the feed unhealthy |
 | `ws_reconnect_max_s` | `30.0` | Backoff ceiling |
 | `ws_recycle_s` | `82800.0` | Proactive reconnect at 23h, ahead of the venue's 24h close |
+
+No profile overrides these. `coherence.py`'s "no profile overrides it" audit
+only fires on names matching its `strategyish` regex, and none of these do --
+correctly, because they are plumbing, not strategy. `ws_` is added to that
+check's `plumbing` regex so the exemption is stated rather than incidental.
+
+`coherence.py`'s other config check -- declared but never read, which is an
+error, not a warning -- does bite, and is the reason the corpus change in the
+Toolchain section is a prerequisite rather than a nicety: every one of these
+fields is read from `ws_feeds.py`, and a single-file analysis would call all
+six dead settings.
 
 `ws_enabled` resolves through `ConfigStore`, so setting it to `false` drops a
 running bot to REST-only on the next hot reload without a redeploy. That is
