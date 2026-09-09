@@ -5089,6 +5089,51 @@ class TestDeploymentManifests(unittest.TestCase):
         self.assertIn("CONFIG_PATH=/var/data/", text)
         self.assertIn("DB_PATH=/var/data/", text)
 
+    def test_the_shell_gate_is_pinned_to_lf(self):
+        """
+        A Windows clone with core.autocrlf=true rewrites LF to CRLF, and bash
+        reads the carriage return as part of the command:
+
+            verify.sh: line 22: $'\\r': command not found
+
+        entrypoint.sh is the container ENTRYPOINT and verify.sh is the gate
+        that runs before the bot is allowed to trade, so both break on a
+        fresh Windows clone -- and Linux never sees it, which is what makes
+        it worth pinning rather than remembering.
+        """
+        import os as _os
+        path = _os.path.join(self.here, ".gitattributes")
+        if not _os.path.exists(path):
+            self.fail(".gitattributes is missing; shell scripts are then at "
+                      "the mercy of whoever cloned the repo")
+        with open(path) as fh:
+            rules = fh.read()
+        for name in ("*.sh", "entrypoint.sh", "verify.sh", "Dockerfile"):
+            # MULTILINE, or the anchor only ever matches the top of
+            # the file and every rule below the first reads as absent.
+            self.assertRegex(
+                rules,
+                re.compile(rf"^{re.escape(name)}\s+.*eol=lf", re.M),
+                msg=f"{name} is not pinned to LF")
+
+    def test_the_scripts_on_disk_actually_have_lf_endings(self):
+        """
+        The rule and the bytes are two different claims. This checks the
+        second one, because a rule added after the files were checked out
+        governs the next clone and not this working copy.
+        """
+        import os as _os
+        for name in ("verify.sh", "entrypoint.sh", "checkup.sh", "Dockerfile"):
+            path = _os.path.join(self.here, name)
+            if not _os.path.exists(path):
+                continue
+            with open(path, "rb") as fh:
+                raw = fh.read()
+            self.assertEqual(
+                raw.count(b"\r\n"), 0,
+                f"{name} has CRLF line endings; bash and Docker both read "
+                f"the carriage return as content")
+
 
 class TestMultiMarket(unittest.TestCase):
     """

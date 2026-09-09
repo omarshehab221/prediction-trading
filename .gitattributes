@@ -1,0 +1,44 @@
+# Line endings, decided by the repository rather than by whoever cloned it.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# core.autocrlf=true on a Windows checkout rewrites LF to CRLF on the way out
+# of git. For most files that is harmless. For a shell script it is fatal and
+# the error does not name the cause:
+#
+#     verify.sh: line 22: $'\r': command not found
+#     verify.sh: line 36: syntax error near unexpected token `$'{\r''
+#
+# bash reads the carriage return as part of the command. entrypoint.sh is the
+# container ENTRYPOINT and verify.sh is the gate that runs before the bot is
+# allowed to trade, so a fresh clone on Windows breaks both -- locally, and in
+# any image built from that clone.
+#
+# Render is unaffected, because git stores these blobs with LF and a Linux
+# checkout writes them back unchanged. That is exactly what makes it worth
+# pinning: the failure appears only on the machine doing the work, which is
+# the machine least likely to be blamed.
+
+# Normalise every text file to LF in the repository. Working-copy endings are
+# still per-platform for anything not pinned below, so this changes what is
+# stored, not what Windows editors see.
+* text=auto
+
+# These must be LF in the working copy too, not merely in storage.
+*.sh text eol=lf
+entrypoint.sh text eol=lf
+verify.sh text eol=lf
+checkup.sh text eol=lf
+
+# Docker's parser is not a shell, but a line continuation followed by CRLF is
+# still a way to get a build failure that reads as a syntax error in a file
+# nobody edited. The COPY here spans two lines, so this is not theoretical.
+Dockerfile text eol=lf
+
+# YAML is whitespace-significant and Render parses it server-side.
+*.yaml text eol=lf
+*.yml text eol=lf
+
+# The cached klines are binary as far as git is concerned; they are gitignored
+# anyway, and this makes sure a stray `git add -f` cannot corrupt one.
+*.csv -text
