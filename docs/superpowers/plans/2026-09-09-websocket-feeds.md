@@ -732,7 +732,24 @@ BINANCE_API_KEY=build BINANCE_API_SECRET=build python coherence.py --source btc_
 
 Expected: exit 0. The six `ws_*` fields are read by `ws_url` and by `__post_init__`, so none is reported dead. If any *is* reported, do not silence it — that means it is genuinely unwired and Task 6 has to reach it.
 
-- [ ] **Step 12: Install the dependency locally and commit**
+- [ ] **Step 12: Install the dependency locally. Do NOT commit yet.**
+
+**Discovered during execution.** `coherence.py` treats a `Config` field that nothing reads as an *error*, not a warning. After this task, four things have no reader:
+
+```
+btc_5m_predictor.py: L843: ws_url() is defined but never called -- dead code
+btc_5m_predictor.py: Config.ws_enabled is declared but never read -- dead setting
+btc_5m_predictor.py: Config.ws_reconnect_max_s is declared but never read -- dead setting
+btc_5m_predictor.py: Config.ws_stale_s is declared but never read -- dead setting
+```
+
+`ws_recycle_s` escapes only because `__post_init__` reads it through a real attribute access; the others are validated through `getattr(self, name)` in a loop, which the AST cannot see. `default_config_document` does enumerate every field, so the settings reach `config.json` and the `ws_enabled: false` rollback works — but it enumerates them reflectively via `dataclasses.fields`, which is equally invisible.
+
+There is no split of Tasks 2 through 6 that ends green: `ws_stale_s` and `ws_reconnect_max_s` first get a reader in Task 3, `ws_url` in Task 4, and `ws_enabled` only in Task 6. **The transport layer is atomic by construction**, and the right response is to let it be one commit rather than to weaken the gate that said so.
+
+So: carry Tasks 2 through 5 in the working tree, running each task's tests as written, and make the single commit at Task 6 Step 10. The TDD cycle per task is unchanged; only the commit boundary moves.
+
+- [ ] **Step 12b: Install the dependency (deferred commit)**
 
 ```bash
 pip install -r requirements.txt

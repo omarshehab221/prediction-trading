@@ -75,6 +75,8 @@ from enum import Enum
 
 import requests
 
+import ws_feeds
+
 LOG = logging.getLogger("btc5m")
 
 BASE = "https://api.binance.com"
@@ -90,6 +92,14 @@ EPS = 1e-9
 
 # Fallback only, for journal rows written before the fee column existed.
 DEFAULT_FEE_BPS = 200
+
+# How far the WebSocket-derived ask ladder may sit from the REST ladder it is
+# validated against, at top of book, in absolute price. Loose enough to
+# survive the few hundred milliseconds between the push and the REST reply on
+# a live book; far tighter than the |1 - 2p| error a transposed side mapping
+# would produce anywhere away from 0.50, which is the mistake this check
+# exists to catch.
+WS_BOOK_VALIDATE_TOL = 0.02
 
 # Verified against @binance/w3w-prediction. Overridable in the config
 # file under "endpoints"; run --write-config to generate one.
@@ -586,6 +596,23 @@ class Config:
     poll_interval_s: float = 2.0
     recv_window_ms: int = 5000
     http_timeout_s: float = 10.0
+    # -- WebSocket feeds ----------------------------------------------------
+    # False drops the bot to REST-only, which is exactly the behaviour it had
+    # before these existed. Resolves through ConfigStore, so it is the
+    # rollback path: edit the file, and the running bot stops using the
+    # sockets on its next reload without a redeploy.
+    ws_enabled: bool = True
+    ws_spot_url: str = "wss://stream.binance.com:9443/stream"
+    ws_book_url: str = "wss://api.binance.com/sapi/wss"
+    # Silence on a socket for longer than this marks the feed unhealthy and
+    # sends every read back to REST. Measured on the CONNECTION, never per
+    # market: a book that is not changing sends nothing, so per-market
+    # silence cannot tell a quiet market from a dead socket.
+    ws_stale_s: float = 5.0
+    ws_reconnect_max_s: float = 30.0
+    # The venue closes the connection at 24h. Handing over early turns a
+    # scheduled surprise into a planned one.
+    ws_recycle_s: float = 82800.0        # 23h
     paper_start_bankroll: float = 100.0
     endpoints: tuple[tuple[str, str], ...] = ()
     profile_name: str = "custom"
@@ -652,9 +679,15 @@ class Config:
             raise ValueError("fill_confirm_delay_s must be positive")
         for name in ("clock_resync_s", "settle_grace_s", "settle_timeout_s",
                      "drain_timeout_s", "drain_poll_s", "prune_after_s",
-                     "vol_cache_s", "error_backoff_max_s", "auth_wait_poll_s"):
+                     "vol_cache_s", "error_backoff_max_s", "auth_wait_poll_s",
+                     "ws_stale_s", "ws_reconnect_max_s", "ws_recycle_s"):
             if getattr(self, name) <= 0:
                 raise ValueError(f"{name} must be positive")
+        if self.ws_recycle_s >= 24 * 3600:
+            raise ValueError(
+                "ws_recycle_s must be under 24h: the venue closes the "
+                "connection at 24h, and recycling at or after that point "
+                "guarantees the drop arrives as an unplanned gap")
         if self.auth_wait_timeout_s < 0:
             raise ValueError("auth_wait_timeout_s must be non-negative")
         if self.trend_min_run < 1:
@@ -808,6 +841,16 @@ class Config:
     def ep(self, name: str) -> tuple[str, str]:
         """(method, path) for a named endpoint."""
         return (dict(self.endpoints) or DEFAULT_ENDPOINTS)[name]
+
+    def ws_url(self, which: str) -> str:
+        """
+        Socket URL by feed name. Mirrors `ep` deliberately.
+
+        Named lookup rather than two attribute reads for the same reason the
+        endpoint table is one: a typo becomes a KeyError here instead of a
+        connection to whatever the misspelled attribute happened to hold.
+        """
+        return {"spot": self.ws_spot_url, "book": self.ws_book_url}[which]
 
 
 PROFILES: dict[str, dict] = {
@@ -2095,11 +2138,10 @@ def _is_already_redeemed(exc: BaseException) -> bool:
 class VolatilityEstimator:
     """Annualised sigma AND tail thickness from recent 1m returns."""
 
-    def __init__(self, cfg: Config | ConfigStore,
-                 session: requests.Session) -> None:
+    def __init__(self, cfg: Config | ConfigStore, market_data) -> None:
         self._store = None if isinstance(cfg, Config) else cfg
         self._static_cfg = cfg if isinstance(cfg, Config) else None
-        self._session = session
+        self._market_data = market_data
         self._cache: dict[str, tuple[float, float]] = {}
         self._df_cache: dict[str, float | None] = {}
         self._clamped: dict[str, bool] = {}
@@ -2116,13 +2158,10 @@ class VolatilityEstimator:
         if cached is not None and time.time() - cached[1] < self._cfg.vol_cache_s:
             return cached[0]
 
-        r = self._session.get(
-            BASE + "/api/v3/klines",
-            params={"symbol": symbol, "interval": "1m",
-                    "limit": self._cfg.vol_lookback_min},
-            timeout=self._cfg.http_timeout_s)
-        r.raise_for_status()
-        closes = [float(k[4]) for k in r.json()]
+        # Through the seam rather than fetched here: the socket keeps a
+        # window that is already current, and the REST fetch behind it is
+        # the same one this used to make.
+        closes = self._market_data.closes(symbol)
         if len(closes) < 10:
             raise ApiError("insufficient kline history for volatility")
 
@@ -2826,6 +2865,21 @@ class PredictionClient:
                 status=451)
         r.raise_for_status()
         return float(r.json()["price"])
+
+    def kline_closes(self, symbol: str, limit: int) -> list[float]:
+        """
+        Recent 1m closes, most recent last.
+
+        Lives here rather than in the volatility estimator because two
+        callers need it now: the estimator, and the socket feed seeding its
+        window. One fetch, one parse, one place to fix.
+        """
+        r = self._session.get(
+            BASE + "/api/v3/klines",
+            params={"symbol": symbol, "interval": "1m", "limit": limit},
+            timeout=self._cfg.http_timeout_s)
+        r.raise_for_status()
+        return [float(k[4]) for k in r.json()]
 
     # -- account ------------------------------------------------------------
 
@@ -4361,7 +4415,9 @@ class Trader:
         # later read goes through the _cfg property and sees reloads.
         config = self._resolve(cfg)
         self._client = PredictionClient(cfg)
-        self._vol = VolatilityEstimator(cfg, self._client.session)
+        self._market_data = ws_feeds.MarketData(
+            self._client, self._store or self._static_cfg)
+        self._vol = VolatilityEstimator(cfg, self._market_data)
         self._journal = Journal(config.db_path, config.profile_name)
         self._paper_bankroll = config.paper_start_bankroll
         # Per-symbol so one market's losing streak cannot gate another's
@@ -4757,6 +4813,10 @@ class Trader:
         self._install_signal_handlers()
         try:
             self._client.sync_clock()
+            self._market_data.start()
+            feeds = self._market_data.status()
+            LOG.info("Feeds: spot %s, book %s", feeds["spot"],
+                     feeds["book"])
             if self._live:
                 w = self._client.wallet()
                 LOG.info("Prediction wallet %s", w.address)
@@ -4811,6 +4871,19 @@ class Trader:
                     self._maybe_scale_in_all(bankroll)
                     self._maybe_enter(bankroll,
                                       "LIVE" if self._live else "PAPER")
+                    # Subscriptions follow the markets actually in
+                    # play, and are set AFTER discovery rather than
+                    # before it. Config.symbols defaults to empty --
+                    # meaning trade everything the venue lists -- so
+                    # the set is not knowable until the venue has
+                    # been asked. Driving this off open positions
+                    # instead would subscribe to nothing whenever the
+                    # bot is flat, which is most of the time, and the
+                    # feed would never carry a price to be healthy
+                    # about.
+                    self._market_data.track(
+                        self._cfg.symbols
+                        or {r.symbol for r in self._hydrated.values()})
                     self._errors = 0
                 except (TradingHalted, Shutdown):
                     raise
@@ -5520,7 +5593,7 @@ class Trader:
             # Spot and volatility must come from the same series, or the
             # model is fed a price and a sigma describing different assets.
             symbol = self._client.market_symbol(rnd.feed_symbol)
-            spot = self._client.spot_price(symbol)
+            spot = self._market_data.spot(symbol)
             sigma = self._vol.sigma_annual(symbol)
             if self._cfg.halt_on_clamped_sigma and self._vol.is_clamped(symbol):
                 LOG.warning("Skipping %s: volatility clamped, so every edge "
@@ -5530,7 +5603,7 @@ class Trader:
             trend = self._vol.trend(symbol)
             book = {}
             for side in Side:
-                levels = self._client.asks_for(rnd, side)
+                levels = self._market_data.asks(rnd, side)
                 if levels:
                     book[side] = levels
 
@@ -5928,7 +6001,7 @@ class Trader:
             return                       # too late to fill
 
         symbol = self._client.market_symbol(pos.rnd.feed_symbol)
-        spot = self._client.spot_price(symbol)
+        spot = self._market_data.spot(symbol)
         sigma = self._vol.sigma_annual(symbol)
         if self._cfg.halt_on_clamped_sigma and self._vol.is_clamped(symbol):
             return
@@ -5941,7 +6014,7 @@ class Trader:
         if prob <= pos.signal.model_prob:
             return                       # not more favourable than before
 
-        levels = self._client.asks_for(pos.rnd, pos.signal.side)
+        levels = self._market_data.asks(pos.rnd, pos.signal.side)
         if not levels:
             return
         price = levels[0][0]
@@ -6379,8 +6452,19 @@ def preflight(cfg: Config) -> int:
 
     check("public spot", lambda: f"{cfg.symbol} {client.spot_price():,.2f}")
     check("clock sync", lambda: f"offset {client.sync_clock()} ms")
+
+    md = ws_feeds.MarketData(client, cfg)
+    md.start()
+    # A moment for the handshakes. Not a health gate: REST-only is a
+    # supported running mode, and PREFLIGHT_REQUIRED=1 must not start
+    # refusing boots because an accelerator was slow.
+    time.sleep(2.0)
+    feeds = md.status()
+    check("websocket feeds",
+          lambda: f"spot {feeds['spot']}, book {feeds['book']}")
+    md.stop()
     def vol_check() -> str:
-        est = VolatilityEstimator(cfg, client.session)
+        est = VolatilityEstimator(cfg, ws_feeds.MarketData(client, cfg))
         sigma = est.sigma_annual()
         raw = est.raw_sigma()
         note = ""

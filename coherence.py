@@ -59,6 +59,7 @@ SOURCE_PATH = "btc_5m_predictor.py"
 # that is working.
 CORPUS_SRC = ""
 CORPUS_TREE: ast.Module = ast.Module(body=[], type_ignores=[])
+CORPUS_MODULES: set[str] = set()
 MULTI_FILE = False
 
 
@@ -69,12 +70,16 @@ def load(path: str) -> tuple[str, ast.Module]:
 
 def set_corpus(paths: list[str]) -> list[tuple[str, str, ast.Module]]:
     """Load every path, build the merged corpus, and return the parts."""
-    global CORPUS_SRC, CORPUS_TREE, MULTI_FILE
+    global CORPUS_SRC, CORPUS_TREE, CORPUS_MODULES, MULTI_FILE
     loaded = [(p, *load(p)) for p in paths]
     CORPUS_SRC = "\n".join(src for _, src, _ in loaded)
     CORPUS_TREE = ast.Module(
         body=[node for _, _, tree in loaded for node in tree.body],
         type_ignores=[])
+    # Each module's own name, so prose in one may name another. Without this
+    # ws_feeds.py's docstring pointing at btc_5m_predictor reads as a mention
+    # of something that no longer exists.
+    CORPUS_MODULES = {os.path.basename(p).removesuffix(".py") for p in paths}
     MULTI_FILE = len(loaded) > 1
     return loaded
 
@@ -221,15 +226,17 @@ def check_attributes(src: str, tree: ast.Module, f: Findings) -> None:
                 else:
                     read.add(node.attr)
         # An attribute may legitimately be read by code outside the class
-        # (exception payloads, dataclass fields), so check module-wide.
-        module_read = {n.attr for n in ast.walk(tree)
+        # (exception payloads, dataclass fields) and outside the file: a
+        # Config field read only from the transport module is read. Asked of
+        # the corpus for the same reason the config and dead-code checks are.
+        module_read = {n.attr for n in ast.walk(CORPUS_TREE)
                        if isinstance(n, ast.Attribute)
                        and isinstance(n.ctx, ast.Load)}
         for name, line in sorted(assigned.items(), key=lambda kv: kv[1]):
             if name.startswith("__") or name in read or name in module_read:
                 continue
-            f.error(f"L{line}: {cls.name}.{name} is assigned but never "
-                    f"read -- leftover state")
+            f.error(where(f"L{line}: {cls.name}.{name} is assigned but never "
+                          f"read -- leftover state"))
         for name in sorted(read - set(assigned)):
             if name.startswith("_") and not hasattr(object, name):
                 # Reading state the constructor never sets is how a test that
@@ -292,8 +299,8 @@ def check_stale_prose(src: str, tree: ast.Module, f: Findings) -> None:
                 prose.append((getattr(node, "lineno", 0), doc))
 
     import os as _os
-    module_name = _os.path.basename(SOURCE_PATH).removesuffix(".py")
-    live.add(module_name)
+    live.add(_os.path.basename(SOURCE_PATH).removesuffix(".py"))
+    live |= CORPUS_MODULES
     pattern = re.compile(r"\b([a-z_][a-z0-9_]{4,})\b")
     english = re.compile(
         r"^(should|which|would|because|through|therefore|instead|already|"

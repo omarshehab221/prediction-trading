@@ -21,6 +21,7 @@ import sys
 from decimal import Decimal
 
 import btc_5m_predictor as m
+import ws_feeds
 
 HOSTILE_FLOATS = [
     0.0, -0.0, 1.0, -1.0, 1e-300, 1e300, -1e300,
@@ -172,6 +173,37 @@ def fuzz_settle(rng: random.Random, trials: int) -> None:
         cheaper = m.settle_pnl(stake, price / 2, True, fee)
         check("cheaper pays more", cheaper >= win - 1e-9,
               f"{cheaper} vs {win}")
+
+
+def fuzz_derived_ladder(rng: random.Random, trials: int) -> None:
+    """
+    A derived ladder must be well-formed, and the mirror its own inverse.
+
+    Well-formedness alone would pass a mapping that quietly dropped a level
+    or clamped a price into range. The round trip is what actually pins the
+    transformation: mirroring twice has to land back where it started.
+    """
+    for _ in range(trials):
+        prices = sorted({round(rng.uniform(0.01, 0.98), 4)
+                         for _ in range(rng.randint(1, 8))})
+        book_bids = [(p, round(rng.uniform(0.1, 5000.0), 4)) for p in prices]
+        book_asks = [(min(0.99, p + 0.01), s) for p, s in book_bids]
+
+        for side in m.Side:
+            got = ws_feeds.derive_asks(book_asks, book_bids, side)
+            check("derived ladder ascends", got == sorted(got), str(got))
+            check("derived prices are in (0,1)",
+                  all(0.0 < p < 1.0 for p, _ in got), str(got))
+            check("derived sizes are positive",
+                  all(s > 0 for _, s in got), str(got))
+
+        once = ws_feeds.derive_asks(book_asks, book_bids, m.Side.DOWN)
+        twice = ws_feeds.derive_asks(once, once, m.Side.DOWN)
+        check("mirror is an involution",
+              len(twice) == len(book_bids)
+              and all(abs(p1 - p2) < 1e-9 and abs(s1 - s2) < 1e-9
+                      for (p1, s1), (p2, s2) in zip(sorted(book_bids), twice)),
+              f"{sorted(book_bids)} -> {twice}")
 
 
 def fuzz_wei(rng: random.Random, trials: int) -> None:
@@ -374,6 +406,7 @@ def main() -> int:
         ("breakeven", fuzz_breakeven),
         ("kelly sizing", fuzz_kelly),
         ("order book walking", fuzz_walk_book),
+        ("derived ladder", fuzz_derived_ladder),
         ("settlement P&L", fuzz_settle),
         ("wei conversion", fuzz_wei),
         ("payload parsers", fuzz_parsers),
