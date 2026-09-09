@@ -127,6 +127,8 @@ DEFAULT_ENDPOINTS: dict[str, tuple[str, str]] = {
     "positions": ("GET", "/sapi/v1/w3w/wallet/prediction/position/list"),
     "settled_history": ("GET", "/sapi/v1/w3w/wallet/prediction/position/settled-history"),
     "order_history": ("GET", "/sapi/v1/w3w/wallet/prediction/order/history"),
+    "order_list": ("GET", "/sapi/v1/w3w/wallet/prediction/order/list"),
+    "batch_cancel": ("POST", "/sapi/v1/w3w/wallet/prediction/trade/batch-cancel"),
     "batch_redeem": ("POST", "/sapi/v1/w3w/wallet/prediction/batch-redeem"),
     "redeem_status": ("GET", "/sapi/v1/w3w/wallet/prediction/redeem/status"),
     "portfolio": ("GET", "/sapi/v1/w3w/wallet/prediction/pnl/portfolio"),
@@ -1634,6 +1636,27 @@ class Quote:
     order_type: OrderType = OrderType.MARKET
     price_limit: float | None = None
     amount_in: float = 0.0
+
+
+@dataclass(frozen=True)
+class OrderState:
+    """
+    What the venue says about one order right now.
+
+    Exists because confirm_fill cannot answer this. It raises unless the
+    order filled, which is right for FOK -- where "did not fill" means
+    killed -- and wrong for GTC, where "still resting" is the ordinary
+    answer and raising on it abandons a live order.
+
+    filled_usdt is meaningful in EVERY status, DEAD included: an order
+    cancelled after a partial fill is terminal and still holds real shares,
+    and dropping the fill because the status is terminal strands them.
+    """
+
+    status: str                      # RESTING | PARTIAL | FILLED | DEAD
+    filled_usdt: float
+    filled_shares: float
+    price: float | None
 
 
 @dataclass(frozen=True)
@@ -3736,6 +3759,76 @@ class PredictionClient:
             f"could not confirm order {order_id} filled after "
             f"{self._cfg.fill_confirm_attempts} attempts (last status "
             f"{last_status}); refusing to record a position that may not exist")
+
+    def active_orders(self, market_id: int | None = None) -> list[dict]:
+        """Orders the venue still considers live."""
+        payload = self._request("order_list", {
+            "walletAddress": self.wallet().address,
+            "l1Category": "crypto",
+            "marketId": market_id,
+            "limit": self._cfg.settled_history_limit})
+        orders = payload.get("orders")
+        return list(orders) if isinstance(orders, list) else []
+
+    def cancel_orders(self, order_ids: list[str]
+                      ) -> tuple[list[str], dict[str, str]]:
+        """
+        Ask the venue to retract resting orders.
+
+        Returns (cancelled ids, {id: reason} for the rest). The failures are
+        reported and never interpreted here, because the usual reason a
+        cancel fails is that the order filled first. A caller that reads
+        `failed` as "still resting" walks away from a real position, which
+        then settles, wins, and is never claimed because nothing knows it
+        exists. The caller re-reads each order's state instead.
+        """
+        if not order_ids:
+            return [], {}
+        wallet = self.wallet()
+        payload = self._request("batch_cancel", {
+            "walletAddress": wallet.address,
+            "walletId": wallet.wallet_id,
+            "cancelInfoList": [{"orderId": str(o)} for o in order_ids]})
+        cancelled = [str(o) for o in (payload.get("canceled") or [])]
+        failed: dict[str, str] = {}
+        for entry in payload.get("failed") or []:
+            if isinstance(entry, dict) and entry.get("orderId"):
+                failed[str(entry["orderId"])] = str(entry.get("reason") or "")
+        return cancelled, failed
+
+    def order_state(self, order_id: str) -> OrderState | None:
+        """
+        Resting, partly filled, filled or dead -- an answer, not an exception.
+
+        Active orders are consulted first: an order that is both live and
+        partly filled appears there with its fill, and the history may not
+        have caught up. Returns None when the venue has no record of the
+        order at all, which is the absence of knowledge and must NOT be read
+        as DEAD -- an order the history lags is still out there.
+        """
+        for order in self.active_orders():
+            if str(order.get("orderId")) == str(order_id):
+                return self._read_order(order)
+        found = self.order_fill(order_id)
+        if found is None:
+            return None
+        return self._read_order(found)
+
+    def _read_order(self, order: dict) -> OrderState:
+        """One venue order dict, read into an OrderState."""
+        status = str(order.get("status") or "").upper()
+        filled_usdt = _as_float_or_none(order.get("filledUsdtAmount")) or 0.0
+        filled_shares = _as_float_or_none(order.get("filledShareQty")) or 0.0
+        price = _as_float_or_none(order.get("price"))
+        if status in self.DEAD_ORDER_STATUSES:
+            state = "DEAD"
+        elif status in self.FILLED_ORDER_STATUSES:
+            state = "FILLED"
+        elif filled_usdt > 0:
+            state = "PARTIAL"
+        else:
+            state = "RESTING"
+        return OrderState(state, filled_usdt, filled_shares, price)
 
     # -- settlement ---------------------------------------------------------
 

@@ -49,6 +49,8 @@ ENDPOINT_INTERFACES: dict[str, tuple[str, str]] = {
     "place_order": ("PlaceOrderRequest", "PlaceOrderResponse"),
     "positions": ("ListPositionsRequest", "ListPositionsResponse"),
     "order_history": ("QueryOrderHistoryRequest", "QueryOrderHistoryResponse"),
+    "order_list": ("QueryActiveOrdersRequest", "QueryActiveOrdersResponse"),
+    "batch_cancel": ("BatchCancelOrdersRequest", "BatchCancelOrdersResponse"),
     "settled_history": ("QuerySettledPositionHistoryRequest",
                         "QuerySettledPositionHistoryResponse"),
     "batch_redeem": ("BatchRedeemRequest", "BatchRedeemResponse"),

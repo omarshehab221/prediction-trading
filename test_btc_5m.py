@@ -5848,6 +5848,91 @@ class TestLimitQuoting(unittest.TestCase):
             c.get_quote(make_round(), plan)
 
 
+class TestOrderStateAndCancel(unittest.TestCase):
+    """A GTC order's ordinary answer is 'still resting', not an exception."""
+
+    def _client(self, active=(), history=()):
+        c = build_client(_wallet=m.WalletRef("0xabc", "w1"))
+        c.sent = []
+
+        def fake_request(name, params=None):
+            c.sent.append((name, dict(params or {})))
+            if name == "order_list":
+                return {"orders": list(active)}
+            if name == "order_history":
+                return {"orders": list(history)}
+            if name == "batch_cancel":
+                return {"canceled": ["o1"],
+                        "failed": [{"orderId": "o2",
+                                    "reason": "already filled"}]}
+            return {}
+
+        c._request = fake_request
+        return c
+
+    def test_a_resting_order_reports_resting(self):
+        c = self._client(active=[{"orderId": "o1", "status": "OPEN",
+                                  "filledUsdtAmount": "0"}])
+        state = c.order_state("o1")
+        self.assertEqual(state.status, "RESTING")
+        self.assertEqual(state.filled_usdt, 0.0)
+
+    def test_a_partly_filled_order_reports_partial_with_its_fill(self):
+        c = self._client(active=[{"orderId": "o1", "status": "OPEN",
+                                  "filledUsdtAmount": "2.5",
+                                  "filledShareQty": "6.25",
+                                  "price": "0.40"}])
+        state = c.order_state("o1")
+        self.assertEqual(state.status, "PARTIAL")
+        self.assertEqual(state.filled_usdt, 2.5)
+        self.assertEqual(state.filled_shares, 6.25)
+        self.assertEqual(state.price, 0.40)
+
+    def test_a_filled_order_reports_filled(self):
+        c = self._client(history=[{"orderId": "o1", "status": "FILLED",
+                                   "filledUsdtAmount": "5.0"}])
+        self.assertEqual(c.order_state("o1").status, "FILLED")
+
+    def test_a_cancelled_order_keeps_the_fill_it_got(self):
+        """
+        A cancel after a partial fill is DEAD with money in it. Dropping the
+        fill because the status is terminal strands a real position.
+        """
+        c = self._client(history=[{"orderId": "o1", "status": "CANCELLED",
+                                   "filledUsdtAmount": "1.5",
+                                   "filledShareQty": "3.75"}])
+        state = c.order_state("o1")
+        self.assertEqual(state.status, "DEAD")
+        self.assertEqual(state.filled_usdt, 1.5)
+
+    def test_an_unknown_order_is_none_not_dead(self):
+        """
+        The history lagging the placement is the absence of knowledge. Read
+        as DEAD it abandons an order that is still out there.
+        """
+        self.assertIsNone(self._client().order_state("o9"))
+
+    def test_cancel_reports_failures_without_interpreting_them(self):
+        c = self._client()
+        cancelled, failed = c.cancel_orders(["o1", "o2"])
+        self.assertEqual(cancelled, ["o1"])
+        self.assertEqual(failed, {"o2": "already filled"})
+
+    def test_cancel_sends_the_connector_s_shape(self):
+        c = self._client()
+        c.cancel_orders(["o1", "o2"])
+        sent = dict(c.sent)["batch_cancel"]
+        self.assertEqual(sent["cancelInfoList"],
+                         [{"orderId": "o1"}, {"orderId": "o2"}])
+        self.assertEqual(sent["walletAddress"], "0xabc")
+        self.assertEqual(sent["walletId"], "w1")
+
+    def test_cancelling_nothing_makes_no_request(self):
+        c = self._client()
+        self.assertEqual(c.cancel_orders([]), ([], {}))
+        self.assertEqual(c.sent, [])
+
+
 class TestReturnFloor(unittest.TestCase):
     """
     A win must be large enough to be worth the loss it risks. Enforced
