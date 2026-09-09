@@ -212,6 +212,28 @@ class Config:
     assumed_spread_pct: float = 0.05
     max_price_impact: float = 0.05      # reject quotes that move the book far
 
+    # --- Execution ---------------------------------------------------------
+    # How an entry reaches the book. MARKET crosses the spread and is
+    # fill-or-kill; LIMIT rests at the model's own reservation price and may
+    # fill in pieces or not at all.
+    #
+    # Per profile, because it is a strategy decision and not plumbing: a
+    # profile that lives on thin longshots and one that buys favourites late
+    # want opposite answers, and one global setting would be wrong for one of
+    # them whichever way it was set.
+    entry_order_type: str = "MARKET"
+    # Whether to leave a position before it settles, and how.
+    #
+    # NONE is what this bot has always done: hold to settlement and redeem
+    # the winning token. Stated rather than implied, so a profile that wants
+    # exits has to say so and a profile that does not cannot acquire them by
+    # a default changing underneath it.
+    exit_order_type: str = "NONE"
+    # RESTING posts the sell when the entry fills and lets the venue wait.
+    # POLLED recomputes the reservation price each loop and sends only once
+    # the bid crosses it. Inert while exit_order_type is NONE.
+    exit_trigger: str = "RESTING"
+
     # --- Timing ------------------------------------------------------------
     entry_window_start_s: int = 150
     entry_window_end_s: int = 25
@@ -669,6 +691,26 @@ class Config:
                     f"price could ever satisfy both")
         if not 0 < self.assumed_spread_pct < 1.0:
             raise ValueError("assumed_spread_pct must be in (0, 1)")
+        if self.entry_order_type not in ("MARKET", "LIMIT"):
+            raise ValueError(
+                f"entry_order_type must be MARKET or LIMIT, got "
+                f"{self.entry_order_type!r}")
+        if self.exit_order_type not in ("NONE", "MARKET", "LIMIT"):
+            raise ValueError(
+                f"exit_order_type must be NONE, MARKET or LIMIT, got "
+                f"{self.exit_order_type!r}")
+        if self.exit_trigger not in ("RESTING", "POLLED"):
+            raise ValueError(
+                f"exit_trigger must be RESTING or POLLED, got "
+                f"{self.exit_trigger!r}")
+        if self.exit_order_type == "MARKET" and self.exit_trigger == "RESTING":
+            # A market order cannot rest on the book, so this pairing asks
+            # for something the venue will not do. Coercing it to POLLED
+            # would mean the config says one thing and the bot does another,
+            # which is the failure that is found months later in a journal.
+            raise ValueError(
+                "exit_trigger RESTING requires exit_order_type LIMIT: a "
+                "MARKET order cannot rest on the book")
         # Empty is valid: it means "no restriction, discover every market".
         if len(set(self.symbols)) != len(self.symbols):
             raise ValueError("symbols must not contain duplicates")
@@ -939,6 +981,31 @@ PROFILES: dict[str, dict] = {
                      # Inert here unless scale_in is enabled; sized to this
                      # profile's own band (0.55-0.80), not buffer's.
                      "max_blended_price": 0.72},
+    # Post a resting bid instead of crossing the spread. Every risk number
+    # here already exists on the other profiles; what differs is only how the
+    # order reaches the book -- and therefore whether the spread is paid.
+    #
+    # The window is wide and closes early on purpose. A resting order needs
+    # time to be hit, and it is cancelled when the window shuts, so a narrow
+    # window posts an order and retracts it before anyone could take it.
+    #
+    # Whether this actually earns more than it misses is an open question.
+    # The journal records order_type, so --calibration-report can be asked
+    # whether limit fills calibrate differently from market fills, and until
+    # that data exists this profile is an experiment rather than a claim.
+    "maker": {"max_entry_price": 0.85, "min_entry_price": 0.10,
+              "min_edge": 0.04, "min_edge_ratio": 0.15,
+              "max_stake_pct": 0.05, "entry_window_start_s": 240,
+              "entry_window_end_s": 45, "max_consecutive_losses": 15,
+              "daily_loss_limit_pct": 0.20, "assumed_spread_pct": 0.04,
+              "kelly_fraction": 0.25,
+              "min_liquidity": 0.0, "max_rounds_per_day": 200,
+              "paper_start_bankroll": 100.0,
+              "min_win_return": 0.0,
+              "max_blended_price": 0.80,
+              "entry_order_type": "LIMIT",
+              "exit_order_type": "NONE",
+              "exit_trigger": "RESTING"},
     # YOUR METHOD, encoded. Wait for a buffer to open up, back the side it
     # favours, press it while the market has inertia -- and refuse any price
     # whose win is too small to be worth the loss it risks.

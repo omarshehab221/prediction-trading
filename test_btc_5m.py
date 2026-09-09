@@ -5972,6 +5972,73 @@ class TestOrderStateAndCancel(unittest.TestCase):
         self.assertEqual(c.sent, [])
 
 
+class TestLimitConfig(unittest.TestCase):
+    """Three enums, and the one pairing that describes an impossible order."""
+
+    def test_defaults_are_todays_behaviour(self):
+        c = cfg()
+        self.assertEqual(c.entry_order_type, "MARKET")
+        self.assertEqual(c.exit_order_type, "NONE")
+
+    def test_every_existing_profile_still_sends_market_and_never_exits(self):
+        for name, prof in m.PROFILES.items():
+            if name == "maker":
+                continue
+            c = Config(api_key="k", api_secret="s", **prof)
+            self.assertEqual(c.entry_order_type, "MARKET", name)
+            self.assertEqual(c.exit_order_type, "NONE", name)
+
+    def test_unknown_order_types_are_rejected(self):
+        for field, bad in (("entry_order_type", "STOP"),
+                           ("exit_order_type", "MAYBE"),
+                           ("exit_trigger", "SOMETIMES")):
+            with self.assertRaises(ValueError, msg=field):
+                cfg(**{field: bad})
+
+    def test_a_market_order_cannot_rest(self):
+        """
+        Coercing this pairing would mean the config says one thing and the
+        bot does another, which is worse than refusing to start.
+        """
+        with self.assertRaises(ValueError):
+            cfg(exit_order_type="MARKET", exit_trigger="RESTING")
+
+    def test_a_polled_market_exit_is_allowed(self):
+        c = cfg(exit_order_type="MARKET", exit_trigger="POLLED")
+        self.assertEqual(c.exit_order_type, "MARKET")
+
+    def test_a_resting_limit_exit_is_allowed(self):
+        c = cfg(exit_order_type="LIMIT", exit_trigger="RESTING")
+        self.assertEqual(c.exit_trigger, "RESTING")
+
+    def test_the_generated_config_document_carries_the_new_fields(self):
+        doc = m.default_config_document()
+        for field in ("entry_order_type", "exit_order_type", "exit_trigger"):
+            self.assertIn(field, doc["defaults"], field)
+
+
+class TestMakerProfile(unittest.TestCase):
+    """The profile that actually uses limit entry."""
+
+    def test_maker_posts_limit_entries(self):
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["maker"])
+        self.assertEqual(c.entry_order_type, "LIMIT")
+
+    def test_maker_leaves_room_for_a_resting_order_to_fill(self):
+        """A window that closes immediately posts an order and cancels it."""
+        c = Config(api_key="k", api_secret="s", **m.PROFILES["maker"])
+        self.assertGreaterEqual(c.entry_window_start_s
+                                - c.entry_window_end_s, 120)
+
+    def test_maker_survives_the_shared_profile_checks(self):
+        prof = m.PROFILES["maker"]
+        for required in ("paper_start_bankroll", "daily_loss_limit_pct",
+                         "assumed_spread_pct"):
+            self.assertIn(required, prof, required)
+        c = Config(api_key="k", api_secret="s", **prof)
+        self.assertGreaterEqual(c.daily_loss_limit_pct / c.max_stake_pct, 2.5)
+
+
 class TestReturnFloor(unittest.TestCase):
     """
     A win must be large enough to be worth the loss it risks. Enforced
