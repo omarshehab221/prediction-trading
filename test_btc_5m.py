@@ -5601,6 +5601,59 @@ class TestWinReturn(unittest.TestCase):
         self.assertEqual(m.max_price_for_return(-1.0, 200), 1.0)
 
 
+class TestReservationPrice(unittest.TestCase):
+    """The limit price is derived from the gates, never written down."""
+
+    def test_price_for_breakeven_inverts_breakeven_probability(self):
+        for price in (0.05, 0.25, 0.5, 0.75, 0.95):
+            for fee in (0, 50, 200, 1000):
+                b = m.breakeven_probability(price, fee)
+                self.assertAlmostEqual(m.price_for_breakeven(b, fee), price,
+                                       places=9, msg=f"{price} @ {fee}bps")
+
+    def test_price_for_breakeven_rejects_impossible_input(self):
+        for bad in (0.0, 1.0, -0.1, 1.5):
+            with self.assertRaises(ValueError):
+                m.price_for_breakeven(bad, 200)
+
+    def test_buy_reservation_price_clears_every_gate(self):
+        c = cfg(min_edge=0.04, min_edge_ratio=0.15, min_win_return=0.0,
+                max_entry_price=0.90, min_entry_price=0.05)
+        p = m.buy_reservation_price(0.70, c, 200)
+        self.assertIsNotNone(p)
+        self.assertTrue(m.clears_edge(0.70, p - 1e-9, c, 200))
+        self.assertLessEqual(p, c.max_entry_price)
+
+    def test_buy_reservation_price_is_the_highest_such_price(self):
+        """One tick above it must fail the gate, or it is not a ceiling."""
+        c = cfg(min_edge=0.04, min_edge_ratio=0.15, min_win_return=0.0,
+                max_entry_price=0.99, min_entry_price=0.05)
+        p = m.buy_reservation_price(0.70, c, 200)
+        self.assertFalse(m.clears_edge(0.70, p + 1e-4, c, 200))
+
+    def test_buy_reservation_price_respects_the_return_floor(self):
+        c = cfg(min_edge=0.001, min_edge_ratio=0.0, min_win_return=0.50,
+                max_entry_price=0.99, min_entry_price=0.05)
+        p = m.buy_reservation_price(0.95, c, 200)
+        self.assertTrue(m.clears_return(p, 200, c))
+
+    def test_buy_reservation_price_is_none_below_the_band(self):
+        c = cfg(min_edge=0.04, min_edge_ratio=0.15, min_entry_price=0.60,
+                max_entry_price=0.90, max_blended_price=0.80)
+        self.assertIsNone(m.buy_reservation_price(0.20, c, 200))
+
+    def test_sell_reservation_price_demands_the_market_overpays(self):
+        c = cfg(min_edge=0.04, min_edge_ratio=0.15)
+        p = m.sell_reservation_price(0.50, c, 200)
+        self.assertIsNotNone(p)
+        # Proceeds net of fee must beat holding by the profile's own bar.
+        self.assertGreaterEqual(p * 0.98 - 0.50, c.min_edge - 1e-9)
+
+    def test_sell_reservation_price_is_none_when_no_price_can_clear(self):
+        c = cfg(min_edge=0.04, min_edge_ratio=0.15)
+        self.assertIsNone(m.sell_reservation_price(0.97, c, 200))
+
+
 class TestReturnFloor(unittest.TestCase):
     """
     A win must be large enough to be worth the loss it risks. Enforced

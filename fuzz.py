@@ -95,6 +95,30 @@ def fuzz_breakeven(rng: random.Random, trials: int) -> None:
         check("breakeven zero EV", abs(ev) < 1e-9, f"ev={ev}")
 
 
+def fuzz_reservation(rng: random.Random, trials: int) -> None:
+    """A reservation price that fails its own gate is worse than no price."""
+    for _ in range(trials):
+        prob = rng.uniform(0.02, 0.98)
+        fee = rng.choice([0, 50, 200, 500, 1000])
+        c = cfg(min_edge=rng.uniform(0.005, 0.10),
+                min_edge_ratio=rng.uniform(0.0, 0.5),
+                min_entry_price=0.02, max_entry_price=0.98,
+                max_blended_price=0.90,
+                min_win_return=rng.choice([0.0, 0.10, 0.25]))
+        buy = m.buy_reservation_price(prob, c, fee)
+        if buy is not None:
+            check("buy reservation in band",
+                  c.min_entry_price <= buy <= c.max_entry_price,
+                  f"{buy} outside [{c.min_entry_price}, {c.max_entry_price}]")
+            check("buy reservation clears the return floor",
+                  m.clears_return(buy, fee, c), f"{buy} at {fee}bps")
+        sell = m.sell_reservation_price(prob, c, fee)
+        if sell is not None:
+            check("sell reservation beats holding",
+                  sell * (1.0 - fee / 10_000.0) > prob,
+                  f"{sell} nets less than holding {prob}")
+
+
 def fuzz_kelly(rng: random.Random, trials: int) -> None:
     for _ in range(trials):
         c = cfg(kelly_fraction=rng.uniform(0.01, 1.0),
@@ -404,6 +428,7 @@ def main() -> int:
     suites = [
         ("digital pricing", fuzz_digital),
         ("breakeven", fuzz_breakeven),
+        ("reservation price", fuzz_reservation),
         ("kelly sizing", fuzz_kelly),
         ("order book walking", fuzz_walk_book),
         ("derived ladder", fuzz_derived_ladder),

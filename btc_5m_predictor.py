@@ -1973,6 +1973,85 @@ def max_price_for_return(min_return: float, fee_bps: int) -> float:
     return net / (net + min_return)
 
 
+def price_for_breakeven(breakeven: float, fee_bps: int) -> float:
+    """
+    The fill price whose breakeven probability is exactly `breakeven`.
+
+    Exact inverse of breakeven_probability, which is strictly increasing in
+    price, so this is a solve and not a search. It exists so the limit price
+    can be DERIVED from the edge gates rather than written into a profile: a
+    written-down price stops agreeing with min_edge the first time min_edge
+    is tuned, and nothing reports the disagreement -- the bot simply starts
+    bidding at a price its own gates would have refused.
+    """
+    if not 0.0 < breakeven < 1.0:
+        raise ValueError("breakeven must be in (0, 1)")
+    net = 1.0 - fee_bps / 10_000.0
+    if net <= 0:
+        return 0.0                      # fee eats the entire payout
+    return breakeven * net / (1.0 - breakeven + breakeven * net)
+
+
+def buy_reservation_price(model_prob: float, cfg: Config,
+                          fee_bps: int) -> float | None:
+    """
+    Highest price at which every entry gate still clears. None if there is none.
+
+    This is what a limit BUY posts at, and it is the whole reason the design
+    needs no "passive or marketable" setting: p* sits below the ask when the
+    market is priced fairly and above it when the market is priced wrong our
+    way, so one formula produces both behaviours from the state of the book.
+
+    None means no price in the entry band clears, which is the same answer as
+    "do not trade this round". It is NOT 0.0, and a caller that treats it as
+    a number posts a bid at zero.
+    """
+    # Invert both halves of clears_edge: model_prob - be >= min_edge, and
+    # model_prob >= be * (1 + min_edge_ratio). Whichever binds first wins.
+    ceiling = min(model_prob - cfg.min_edge,
+                  model_prob / (1.0 + cfg.min_edge_ratio))
+    if ceiling <= 0.0:
+        return None
+    if ceiling >= 1.0:
+        # Every price in (0,1) clears the edge test, so only the band and the
+        # return floor bind. Calling price_for_breakeven here would raise.
+        price = cfg.max_entry_price
+    else:
+        price = price_for_breakeven(ceiling, fee_bps)
+    price = min(price,
+                max_price_for_return(cfg.min_win_return, fee_bps),
+                cfg.max_entry_price)
+    if price < cfg.min_entry_price:
+        return None
+    return price
+
+
+def sell_reservation_price(model_prob: float, cfg: Config,
+                           fee_bps: int) -> float | None:
+    """
+    Lowest price at which selling beats holding. None if no such price exists.
+
+    The mirror of buy_reservation_price. Holding a share is worth model_prob,
+    because it pays 1 with that probability; selling at p nets p(1-f). So the
+    bar is "the market overpays by the same edge we demand when buying",
+    which reuses min_edge and min_edge_ratio deliberately -- a second set of
+    thresholds could be tuned apart from the first, and then the bot would
+    buy on one definition of edge and sell on another.
+
+    None when the bar lands at or above 1.0: no price can clear it, so no
+    exit order is posted and the position runs to settlement as before.
+    """
+    net = 1.0 - fee_bps / 10_000.0
+    if net <= 0:
+        return None
+    floor = max(model_prob + cfg.min_edge,
+                model_prob * (1.0 + cfg.min_edge_ratio))
+    price = floor / net
+    if not 0.0 < price < 1.0:
+        return None
+    return price
+
+
 def kelly_stake(bankroll: float, model_prob: float, price: float,
                 cfg: Config, fee_bps: int | None = None) -> float:
     """
