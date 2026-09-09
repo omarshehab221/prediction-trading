@@ -50,10 +50,40 @@ class Findings:
 
 SOURCE_PATH = "btc_5m_predictor.py"
 
+# Every analysed file, concatenated and merged. Definitions are still judged
+# one file at a time -- that is what keeps line numbers meaningful -- but
+# "is this read anywhere", "is this called anywhere" and "does this name
+# still exist" are questions about the project, not about a file. Asking
+# them per-file is what turns a config field read from the other module into
+# a reported dead setting, which is an ERROR and fails the build for code
+# that is working.
+CORPUS_SRC = ""
+CORPUS_TREE: ast.Module = ast.Module(body=[], type_ignores=[])
+MULTI_FILE = False
+
 
 def load(path: str) -> tuple[str, ast.Module]:
     src = open(path, encoding="utf-8").read()
     return src, ast.parse(src)
+
+
+def set_corpus(paths: list[str]) -> list[tuple[str, str, ast.Module]]:
+    """Load every path, build the merged corpus, and return the parts."""
+    global CORPUS_SRC, CORPUS_TREE, MULTI_FILE
+    loaded = [(p, *load(p)) for p in paths]
+    CORPUS_SRC = "\n".join(src for _, src, _ in loaded)
+    CORPUS_TREE = ast.Module(
+        body=[node for _, _, tree in loaded for node in tree.body],
+        type_ignores=[])
+    MULTI_FILE = len(loaded) > 1
+    return loaded
+
+
+def where(msg: str) -> str:
+    """Prefix a finding with its file, but only when that is ambiguous."""
+    if not MULTI_FILE:
+        return msg
+    return f"{os.path.basename(SOURCE_PATH)}: {msg}"
 
 
 def class_def(tree: ast.Module, name: str) -> ast.ClassDef | None:
@@ -80,19 +110,22 @@ def check_config(src: str, tree: ast.Module, f: Findings) -> None:
             declared[node.target.id] = (ast.unparse(node.value)
                                         if node.value else "?")
 
-    # Which are read anywhere as cfg.X / self._cfg.X / c.X?
+    # Which are read anywhere as cfg.X / self._cfg.X / c.X? Asked of the
+    # whole corpus: a setting read only from the transport module is read.
     read: set[str] = set()
-    for node in ast.walk(tree):
+    for node in ast.walk(CORPUS_TREE):
         if isinstance(node, ast.Attribute) and node.attr in declared:
             read.add(node.attr)
     # Fields consumed via **PROFILES entries count as used.
     for name in declared:
-        if re.search(rf"\b{name}\s*=", src.split("PROFILES")[-1] if "PROFILES" in src else ""):
+        if re.search(rf"\b{name}\s*=", CORPUS_SRC.split("PROFILES")[-1]
+                     if "PROFILES" in CORPUS_SRC else ""):
             read.add(name)
 
     internal = {"api_key", "api_secret", "endpoints", "profile_name"}
     for name in sorted(set(declared) - read - internal):
-        f.error(f"Config.{name} is declared but never read -- dead setting")
+        f.error(where(f"Config.{name} is declared but never read "
+                      f"-- dead setting"))
 
     # Which strategy fields does no profile override?
     profiles = re.search(r"PROFILES:.*?\n\}", src, re.S)
@@ -110,7 +143,7 @@ def check_config(src: str, tree: ast.Module, f: Findings) -> None:
     # plumbing legitimately shares one default.
     plumbing = re.compile(r"(recv_window|http_|poll_|db_path|sigma_window|"
                           r"vol_lookback|max_consecutive_errors|"
-                          r"calibration_|tail_df_|round_seconds)")
+                          r"calibration_|tail_df_|round_seconds|ws_)")
     strategyish = re.compile(
         r"(edge|price|stake|buffer|loss|spread|impact|kelly|"
         r"liquidity|rounds_per_day|bankroll|scale_in|consecutive_losses)")
@@ -137,8 +170,10 @@ def check_dead_functions(src: str, tree: ast.Module, f: Findings) -> None:
                 continue
             defined[node.name] = node.lineno
 
+    # Asked of the corpus: a helper defined here and called from the other
+    # module is called.
     called: set[str] = set()
-    for node in ast.walk(tree):
+    for node in ast.walk(CORPUS_TREE):
         if isinstance(node, ast.Call):
             fn = node.func
             if isinstance(fn, ast.Name):
@@ -154,7 +189,8 @@ def check_dead_functions(src: str, tree: ast.Module, f: Findings) -> None:
     for name, line in sorted(defined.items(), key=lambda kv: kv[1]):
         if name in entry or name in called:
             continue
-        f.error(f"L{line}: {name}() is defined but never called -- dead code")
+        f.error(where(f"L{line}: {name}() is defined but never called "
+                      f"-- dead code"))
 
 
 # --------------------------------------------------------------------------
@@ -228,8 +264,10 @@ def check_cli(src: str, tree: ast.Module, f: Findings) -> None:
 
 
 def check_stale_prose(src: str, tree: ast.Module, f: Findings) -> None:
+    # Asked of the corpus: prose in one module may legitimately name a class
+    # or field defined in the other.
     live: set[str] = {"self", "cls"}
-    for node in ast.walk(tree):
+    for node in ast.walk(CORPUS_TREE):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             live.add(node.name)
         elif isinstance(node, ast.Name):
@@ -273,8 +311,8 @@ def check_stale_prose(src: str, tree: ast.Module, f: Findings) -> None:
                 continue
             if "_" not in name:
                 continue        # only flag snake_case, which reads as code
-            f.warn(f"L{line_no}: prose mentions '{name}', which no longer "
-                   f"exists in the module")
+            f.warn(where(f"L{line_no}: prose mentions '{name}', which no "
+                         f"longer exists in the project"))
 
 
 # --------------------------------------------------------------------------
@@ -364,21 +402,33 @@ def check_mode_flags(src: str, tree: ast.Module, f: Findings) -> None:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--source", default="btc_5m_predictor.py")
+    ap.add_argument("--source", action="append", default=None,
+                    help="analyse this file; repeat for a multi-file corpus")
     ap.add_argument("--strict", action="store_true",
                     help="treat warnings as failures")
     args = ap.parse_args()
 
-    global SOURCE_PATH
-    SOURCE_PATH = args.source
-    src, tree = load(args.source)
+    sources = args.source or ["btc_5m_predictor.py"]
+    loaded = set_corpus(sources)
     f = Findings()
-    for check in (check_config, check_dead_functions, check_attributes,
-                  check_cli, check_stale_prose, check_magic_numbers,
-                  check_default_profile, check_mode_flags):
-        check(src, tree, f)
 
-    print(f"=== COHERENCE: {args.source} ===\n")
+    global SOURCE_PATH
+    # These describe the main module specifically. Config is declared once
+    # and lives there, and the other three read the argument parser and the
+    # profile table -- running any of them over the transport module would
+    # report its lack of those as findings.
+    main_only = (check_config, check_cli, check_default_profile,
+                 check_mode_flags)
+    for path, src, tree in loaded:
+        SOURCE_PATH = path
+        for check in (check_dead_functions, check_attributes,
+                      check_stale_prose, check_magic_numbers):
+            check(src, tree, f)
+        if path == sources[0]:
+            for check in main_only:
+                check(src, tree, f)
+
+    print(f"=== COHERENCE: {', '.join(sources)} ===\n")
     if f.errors:
         print(f"  {len(f.errors)} ERROR(S) -- stale artifacts:\n")
         for e in f.errors:

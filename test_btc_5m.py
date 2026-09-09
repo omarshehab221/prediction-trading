@@ -8058,3 +8058,91 @@ class TestLastMinuteEntry(unittest.TestCase):
         t._client.kill_fills = True
         t._maybe_enter(100.0, "PAPER")
         self.assertEqual(t._positions, {})
+
+
+class TestCoherenceCorpus(unittest.TestCase):
+    """
+    coherence.py must judge "used anywhere" across every analysed file.
+
+    Single-file analysis was correct while the project was one module. A
+    second module makes it actively wrong: a config field read only from
+    ws_feeds.py reads as a dead setting, which is an ERROR, which fails the
+    build for code that is working.
+    """
+
+    def setUp(self):
+        import coherence
+        self.coherence = coherence
+
+    def _write(self, body):
+        import os as _os
+        import tempfile as _tf
+        fd, path = _tf.mkstemp(suffix=".py")
+        with _os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        self.addCleanup(_os.unlink, path)
+        return path
+
+    def test_set_corpus_merges_every_file(self):
+        a = self._write("def alpha():\n    return 1\n")
+        b = self._write("def beta():\n    return 2\n")
+        loaded = self.coherence.set_corpus([a, b])
+        self.assertEqual([p for p, _, _ in loaded], [a, b])
+        names = {n.name for n in self.coherence.CORPUS_TREE.body}
+        self.assertEqual(names, {"alpha", "beta"})
+        self.assertIn("alpha", self.coherence.CORPUS_SRC)
+        self.assertIn("beta", self.coherence.CORPUS_SRC)
+
+    def test_a_function_called_only_from_another_file_is_not_dead(self):
+        a = self._write("def helper():\n    return 1\n")
+        b = self._write("def caller():\n    return helper()\n")
+        loaded = self.coherence.set_corpus([a, b])
+        f = self.coherence.Findings()
+        for path, src, tree in loaded:
+            self.coherence.SOURCE_PATH = path
+            self.coherence.check_dead_functions(src, tree, f)
+        self.assertEqual(
+            [e for e in f.errors if "helper" in e], [],
+            f"helper() is called from the other file; errors were {f.errors}")
+
+    def test_findings_name_the_file_when_there_is_more_than_one(self):
+        a = self._write("def only_here():\n    return 1\n")
+        b = self._write("def other():\n    return 2\n")
+        loaded = self.coherence.set_corpus([a, b])
+        f = self.coherence.Findings()
+        for path, src, tree in loaded:
+            self.coherence.SOURCE_PATH = path
+            self.coherence.check_dead_functions(src, tree, f)
+        dead = [e for e in f.errors if "only_here" in e]
+        self.assertEqual(len(dead), 1, f.errors)
+        import os as _os
+        self.assertIn(_os.path.basename(a), dead[0],
+                      "a finding must say which file it came from")
+
+    def test_prose_may_name_an_identifier_defined_in_another_file(self):
+        a = self._write("class Config:\n    ws_stale_s: float = 5.0\n")
+        b = self._write("# reads cfg.ws_stale_s to decide staleness\n"
+                        "def reader():\n    return 1\n")
+        loaded = self.coherence.set_corpus([a, b])
+        f = self.coherence.Findings()
+        for path, src, tree in loaded:
+            self.coherence.SOURCE_PATH = path
+            self.coherence.check_stale_prose(src, tree, f)
+        self.assertEqual(
+            [w for w in f.warnings if "ws_stale_s" in w], [],
+            f"ws_stale_s exists in the corpus; warnings were {f.warnings}")
+
+    def test_the_real_project_is_still_coherent(self):
+        """The change must not make the actual codebase report new findings."""
+        import subprocess as _sp
+        import sys as _sys
+        import os as _os
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        sources = ["btc_5m_predictor.py"]
+        if _os.path.exists(_os.path.join(here, "ws_feeds.py")):
+            sources.append("ws_feeds.py")
+        argv = [_sys.executable, "coherence.py"]
+        for s in sources:
+            argv += ["--source", s]
+        proc = _sp.run(argv, cwd=here, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)

@@ -58,7 +58,12 @@ else
 fi
 
 if [ -f coherence.py ]; then
-  run "coherence" "$PY" coherence.py
+  # Both modules are analysed as one corpus. A config field read only from
+  # ws_feeds.py is not a dead setting, and single-file analysis would call it
+  # one and fail the build for working code.
+  coh_args=(--source btc_5m_predictor.py)
+  [ -f ws_feeds.py ] && coh_args+=(--source ws_feeds.py)
+  run "coherence" "$PY" coherence.py "${coh_args[@]}"
 else
   printf '  %-22s SKIP\n' "coherence"; skipped=$((skipped + 1))
 fi
