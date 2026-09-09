@@ -345,6 +345,28 @@ def derive_asks(asks: list[tuple[float, float]],
     return sorted((round(1.0 - price, 10), size) for price, size in bids)
 
 
+def derive_bids(asks: list[tuple[float, float]],
+                bids: list[tuple[float, float]],
+                side) -> list[tuple[float, float]]:
+    """
+    Per-side BID ladder from one market-level book.
+
+    The mirror of derive_asks, and it inverts the OTHER half of the book. The
+    push carries one book oriented on the UP token, so UP's bids are the bids
+    as sent, while a DOWN bid of 0.31 is an UP ask of 0.69 -- DOWN's bids
+    therefore come from the asks.
+
+    Best first, so [0] is the touch. Reading a bid ladder cheapest-first
+    would make the worst price in the book look like the best one available,
+    which on an exit is money given away rather than an error raised.
+    """
+    from btc_5m_predictor import Side
+    if side is Side.UP:
+        return sorted(bids, reverse=True)
+    return sorted(((round(1.0 - price, 10), size) for price, size in asks),
+                  reverse=True)
+
+
 class _Book:
     """One market's last known ladder, with the stamp that orders updates."""
 
@@ -489,6 +511,28 @@ class BookFeed:
         if not validated and not self.validate(rnd):
             return None
         return derive_asks(book.asks, book.bids, side) or None
+
+    def bids(self, rnd, side) -> list[tuple[float, float]] | None:
+        """
+        The bid ladder, or None to say "ask REST".
+
+        Gated on exactly what asks() is gated on -- connection health and the
+        once-per-market side-mapping check -- because the bid side is derived
+        from the same inference and is wrong in the same way if the mapping
+        is transposed.
+        """
+        if not self._conn.healthy:
+            return None
+        with self._lock:
+            if rnd.market_id in self._rejected:
+                return None
+            validated = rnd.market_id in self._validated
+            book = self._books.get(rnd.market_id)
+        if book is None:
+            return None
+        if not validated and not self.validate(rnd):
+            return None
+        return derive_bids(book.asks, book.bids, side) or None
 
 
 def parse_spot_frame(raw: str) -> tuple[str, str, dict] | None:
@@ -747,6 +791,13 @@ class MarketData:
             if levels:
                 return levels
         return self._client.asks_for(rnd, side)
+
+    def bids(self, rnd, side) -> list[tuple[float, float]] | None:
+        if self._cfg.ws_enabled:
+            levels = self._book.bids(rnd, side)
+            if levels:
+                return levels
+        return self._client.bids_for(rnd, side)
 
     def status(self) -> dict[str, str]:
         """One word per feed, for preflight and the log line at startup."""

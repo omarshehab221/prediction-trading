@@ -29,6 +29,7 @@ from dataclasses import replace
 from decimal import Decimal
 
 import btc_5m_predictor as m
+import ws_feeds
 from btc_5m_predictor import (
     Config, Journal, Position, PredictionClient, RiskManager, Round, Side,
     Signal, TradingHalted, Trader, breakeven_probability,
@@ -455,6 +456,44 @@ class TestParseAsks(unittest.TestCase):
         self.assertIsNone(PredictionClient._parse_asks({}))
         self.assertIsNone(PredictionClient._parse_asks({"asks": []}))
         self.assertIsNone(PredictionClient._parse_asks({"asks": [["x", "y"]]}))
+
+
+class TestParseBids(unittest.TestCase):
+    """Selling needs the price a sale would get, which is not the ask."""
+
+    def test_bids_parse_with_the_same_rules_as_asks(self):
+        payload = {"bids": [{"price": "0.40", "size": "10"},
+                            {"price": "0.35", "size": "5"}]}
+        levels = m.PredictionClient._parse_levels(payload, "bids")
+        self.assertEqual(levels[0], (0.40, 10.0))     # best bid first
+
+    def test_bids_skip_the_same_malformed_levels(self):
+        payload = {"bids": [{"price": "0.40", "size": "10"},
+                            {"price": "1.5", "size": "5"},
+                            {"price": "nope", "size": "5"}]}
+        levels = m.PredictionClient._parse_levels(payload, "bids")
+        self.assertEqual(levels, [(0.40, 10.0)])
+
+    def test_asks_still_come_back_ascending(self):
+        payload = {"asks": [{"price": "0.45", "size": "5"},
+                            {"price": "0.40", "size": "10"}]}
+        self.assertEqual(m.PredictionClient._parse_asks(payload)[0],
+                         (0.40, 10.0))
+
+    def test_derive_bids_mirrors_derive_asks(self):
+        """A DOWN bid of 0.31 is an UP ask of 0.69, so DOWN bids come from asks."""
+        asks = [(0.69, 4.0), (0.72, 1.0)]
+        bids = [(0.60, 3.0), (0.55, 2.0)]
+        up = ws_feeds.derive_bids(asks, bids, Side.UP)
+        self.assertEqual(up[0], (0.60, 3.0))
+        down = ws_feeds.derive_bids(asks, bids, Side.DOWN)
+        self.assertAlmostEqual(down[0][0], 0.31)
+        self.assertEqual(down[0][1], 4.0)
+
+    def test_bids_are_best_first(self):
+        bids = [(0.55, 2.0), (0.60, 3.0)]
+        out = ws_feeds.derive_bids([], bids, Side.UP)
+        self.assertEqual([p for p, _ in out], [0.60, 0.55])
 
 
 class TestEvaluate(unittest.TestCase):

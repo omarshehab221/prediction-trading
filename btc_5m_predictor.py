@@ -3427,19 +3427,44 @@ class PredictionClient:
             return None
         return self._parse_asks(payload)
 
+    def bids_for(self, rnd: Round, side: Side
+                 ) -> list[tuple[float, float]] | None:
+        """
+        Bid ladder for one outcome -- the price a SALE would actually get.
+
+        Pricing an exit off the ask reads the price someone is asking, not
+        the price anyone is offering, and on a thin book those are not close.
+        """
+        try:
+            payload = self._request("order_book", {
+                "vendor": rnd.vendor, "marketId": rnd.market_id,
+                "tokenId": rnd.token_for(side)})
+        except ApiError as exc:
+            LOG.debug("order book unavailable: %s", exc)
+            return None
+        return self._parse_levels(payload, "bids")
+
     @staticmethod
-    def _parse_asks(payload: dict) -> list[tuple[float, float]] | None:
-        """Levels are {price, size} strings per the connector schema."""
-        raw = payload.get("asks")
+    def _parse_levels(payload: dict,
+                      key: str) -> list[tuple[float, float]] | None:
+        """
+        One side of the book. Levels are {price, size} strings per the schema.
+
+        Takes the key rather than assuming "asks", because selling prices off
+        bids and the two sides are parsed by identical rules -- a second copy
+        of this would be a second place for the skipped-level accounting to
+        drift.
+        """
+        raw = payload.get(key)
         if raw is None:
             nested = payload.get("orderBook") or payload.get("data") or {}
-            raw = nested.get("asks") if isinstance(nested, dict) else None
+            raw = nested.get(key) if isinstance(nested, dict) else None
         if not raw:
             return None
         if not isinstance(raw, (list, tuple)):
             # A scalar here is malformed; iterating it raises TypeError.
-            LOG.warning("Order book 'asks' is %s, not a list",
-                        type(raw).__name__)
+            LOG.warning("Order book %r is %s, not a list",
+                        key, type(raw).__name__)
             return None
 
         levels: list[tuple[float, float]] = []
@@ -3470,9 +3495,19 @@ class PredictionClient:
         if skipped:
             # Silently dropping levels would understate depth and make the
             # book look thinner than it is.
-            LOG.warning("Order book: skipped %d unparseable level(s) of %d",
-                        skipped, len(raw))
-        return sorted(levels) or None
+            LOG.warning("Order book %r: skipped %d unparseable level(s) "
+                        "of %d", key, skipped, len(raw))
+        ordered = sorted(levels)
+        # Asks read cheapest-first and bids read dearest-first, so [0] is the
+        # touch on either side and no caller has to remember which is which.
+        if key == "bids":
+            ordered.reverse()
+        return ordered or None
+
+    @staticmethod
+    def _parse_asks(payload: dict) -> list[tuple[float, float]] | None:
+        """Ask ladder. Kept by name: TestParseAsks and fuzz.py both call it."""
+        return PredictionClient._parse_levels(payload, "asks")
 
     # -- trading ------------------------------------------------------------
 
