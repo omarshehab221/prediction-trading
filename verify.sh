@@ -48,7 +48,11 @@ run() {
 
 echo "=== Verification ==="
 
-run "byte-compile" "$PY" -m py_compile btc_5m_predictor.py
+if [ -f ws_feeds.py ]; then
+  run "byte-compile" "$PY" -m py_compile btc_5m_predictor.py ws_feeds.py
+else
+  run "byte-compile" "$PY" -m py_compile btc_5m_predictor.py
+fi
 
 if [ -f test_btc_5m.py ]; then
   run "unit tests" "$PY" -m unittest test_btc_5m

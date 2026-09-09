@@ -45,7 +45,14 @@ place-order-bundle. Run --preflight first; it probes everything else.
 
 REQUIREMENTS
 ------------
-    pip install requests
+    pip install requests websocket-client
+
+FEEDS
+-----
+Order book, spot price and the volatility window arrive on persistent
+sockets; see ws_feeds.py. Everything signed and mutating stays on REST.
+Set `ws_enabled` to false in the config to go back to REST for everything,
+which is what this did before the sockets existed.
 """
 
 from __future__ import annotations

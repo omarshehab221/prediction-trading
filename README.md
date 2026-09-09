@@ -60,6 +60,7 @@ Two refinements matter:
 | File | Lines | What it is |
 |---|---|---|
 | `btc_5m_predictor.py` | 4068 | The bot: client, pricing, risk, journal, CLI |
+| `ws_feeds.py` | 763 | Persistent WebSocket feeds behind one `MarketData` seam |
 | `test_btc_5m.py` | 4694 | 512 tests across 78 classes |
 | `conformance.py` | 403 | Validates every API call against Binance's own schema |
 | `fuzz.py` | 363 | Property-based testing with hostile inputs |
@@ -365,6 +366,67 @@ The journal records the **market's** implied probability, not a forecast —
 there is none. That is what lets the calibration breaker ask this profile's one
 health question: *are the favourites I am buying winning as often as I paid for
 them to?* It halts if they are not.
+
+---
+
+## 6b. Feeds
+
+Three reads used to sit inside the poll loop as blocking round trips: the
+order book (twice per candidate round, every tick), spot price (once per
+candidate round), and the 1m klines behind the volatility estimate. All
+three now arrive on persistent sockets.
+
+  * **Order book** -- one signed connection on the venue's aggregated topic,
+    which carries every market. Replaces 2N REST calls per tick with one
+    socket, and covers a newly listed round before the bot discovers it.
+  * **Spot price** -- the public `@trade` stream. Not `@bookTicker`: the model
+    was always fed the last traded price, and best bid/ask is a different
+    quantity.
+  * **Klines** -- the public `@kline_1m` stream, appended to a window seeded
+    from one REST fetch. The window is 500 closes, so building it from the
+    stream alone would leave volatility unusable for 8.3 hours after every
+    restart.
+
+Everything signed and mutating -- quotes, orders, redemptions, balances,
+market discovery -- stays on REST. That is not a gap to be closed later;
+request/response is the right shape for a call that moves money.
+
+### How the bot decides a feed is dead
+
+An order book that is not changing sends no messages. So a quiet market and
+a dead socket look identical if you measure freshness per market: a socket
+that died at 14:02 would keep handing 14:02 ladders to the sizing model and
+report itself healthy the whole time.
+
+Freshness is therefore measured on the CONNECTION -- time since any frame
+arrived, plus pong receipt -- and that is the only thing that decides
+socket-versus-REST. The per-market `updateTimestampMs` is used to throw away
+out-of-order updates and for nothing else.
+
+Every read falls back to the REST call that was already there. That keeps
+the REST path exercised on every gap, rather than letting it rot into
+untested code discovered broken the first time it is needed.
+
+### The mapping the venue does not document
+
+The order-book push carries one book per market with no token id, while the
+REST endpoint is per token. One side therefore has to be derived from the
+other: UP and DOWN each pay 1 and are mutually exclusive, so their prices
+sum to 1, and a bid of 0.31 for UP is an offer of 0.69 for DOWN.
+
+That is an inference, not a documented fact, so it is checked rather than
+trusted. The first push for each market is compared against one REST fetch
+of both sides; agreement inside 0.02 at top of book trusts that market's
+stream from then on, and disagreement pins that market to REST and says so
+in the log. One REST call per market, against the 2N per tick it replaces.
+
+### Turning it off
+
+Set `ws_enabled` to `false` in the config on the mounted disk. It resolves
+through the config store, so the running bot drops to REST-only on its next
+hot reload -- no redeploy, no restart, no interrupted round. That is the
+rollback path, and it restores exactly the behaviour the bot had before any
+of this existed.
 
 ## 7. Risk controls
 
