@@ -4083,7 +4083,8 @@ class Journal:
                 profile TEXT, buffer_z REAL, fee_bps INTEGER,
                 symbol TEXT, trend_z REAL,
                 resolved INTEGER DEFAULT 0, won INTEGER, pnl REAL,
-                settle_source TEXT)""")
+                settle_source TEXT, order_type TEXT, price_limit REAL,
+                exit_price REAL, exit_order_id TEXT)""")
         # Journals predating the profile column stay readable.
         existing = {r[1] for r in
                     self._conn.execute("PRAGMA table_info(trades)")}
@@ -4097,22 +4098,29 @@ class Journal:
             self._conn.execute("ALTER TABLE trades ADD COLUMN symbol TEXT")
         if "trend_z" not in existing:
             self._conn.execute("ALTER TABLE trades ADD COLUMN trend_z REAL")
+        for col, decl in (("order_type", "TEXT"), ("price_limit", "REAL"),
+                          ("exit_price", "REAL"), ("exit_order_id", "TEXT")):
+            if col not in existing:
+                self._conn.execute(
+                    f"ALTER TABLE trades ADD COLUMN {col} {decl}")
         self._conn.commit()
 
     def record(self, mode: str, rnd: Round, sig: Signal, spot: float,
                sigma: float, bankroll: float,
-               order_id: str | None = None) -> int:
+               order_id: str | None = None,
+               order_type: str = "MARKET",
+               price_limit: float | None = None) -> int:
         cur = self._conn.execute(
             "INSERT INTO trades (ts, mode, slug, topic_id, side, strike, spot,"
             " sigma, seconds_left, end_ms, model_prob, fill_price, edge, stake,"
             " bankroll_before, order_id, profile, buffer_z, fee_bps, symbol,"
-            " trend_z)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " trend_z, order_type, price_limit)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (int(time.time()), mode, rnd.slug, rnd.topic_id, sig.side.value,
              rnd.strike, spot, sigma, sig.seconds_left, rnd.end_ms,
              sig.model_prob, sig.fill_price, sig.edge, sig.stake_usdt,
              bankroll, order_id, self._profile, sig.buffer_z, rnd.fee_bps,
-             rnd.symbol, sig.trend_z))
+             rnd.symbol, sig.trend_z, order_type, price_limit))
         self._conn.commit()
         return int(cur.lastrowid)
 
@@ -4121,6 +4129,35 @@ class Journal:
         self._conn.execute(
             "UPDATE trades SET resolved=1, won=?, pnl=?, settle_source=?"
             " WHERE id=?", (1 if won else 0, pnl, source, trade_id))
+        self._conn.commit()
+
+    def close(self) -> None:
+        """
+        Release the SQLite handle.
+
+        The connection was never closed, which on Windows means the file
+        cannot be unlinked while the process lives -- every test that removes
+        its temp journal fails on the unlink, and the real failure is hidden
+        behind a cleanup error. A long-running process leaks one handle per
+        Journal, which is small but no more correct.
+        """
+        self._conn.close()
+
+    def resolve_sold(self, trade_id: int, proceeds_usdt: float,
+                     exit_price: float, exit_order_id: str,
+                     stake: float) -> None:
+        """
+        Close a row that was sold rather than settled.
+
+        P&L is proceeds minus stake, and `won` is deliberately left NULL: the
+        round's outcome never applied to this position, and writing 0 or 1
+        would answer a question the trade did not ask. settle_source records
+        which kind of ending this was, so diagnose() can keep the two apart.
+        """
+        self._conn.execute(
+            "UPDATE trades SET resolved=1, pnl=?, settle_source='sold',"
+            " exit_price=?, exit_order_id=? WHERE id=?",
+            (proceeds_usdt - stake, exit_price, exit_order_id, trade_id))
         self._conn.commit()
 
     def diagnose(self, profile: str | None = None,
@@ -4134,7 +4171,12 @@ class Journal:
         at a poor one look identical over a few dozen trades, so the shortfall
         is reported with a standard error rather than as a bare number.
         """
-        where = "WHERE resolved=1"
+        # Sold rows are resolved but have no outcome to be calibrated
+        # against: the position was closed before the round decided
+        # anything. Pooling them with settled rows would let an exit taken at
+        # a good price look like a correct prediction, which is exactly the
+        # inference this report exists to make impossible.
+        where = "WHERE resolved=1 AND COALESCE(settle_source, '') != 'sold'"
         args: tuple = ()
         if profile:
             where += " AND COALESCE(profile, 'unknown') = ?"
@@ -4145,6 +4187,9 @@ class Journal:
         rows = self._conn.execute(
             f"SELECT fill_price, won, pnl, stake, fee_bps FROM trades {where}",
             args).fetchall()
+        sold = self._conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(pnl), 0) FROM trades"
+            " WHERE resolved=1 AND settle_source='sold'").fetchone()
         if not rows:
             return "No resolved trades yet."
 
@@ -4154,7 +4199,11 @@ class Journal:
                 (price, won, pnl or 0.0, stake or 0.0, fee))
 
         scope = symbol or "all markets"
-        out = [f"Trades analysed : {len(rows)}  ({scope})", "",
+        out = [f"Trades analysed : {len(rows)}  ({scope})"]
+        if sold and sold[0]:
+            out.append(f"Excluded        : {sold[0]} sold before settlement "
+                       f"({sold[1]:+.2f} USDT)")
+        out += ["",
                "Realised win rate vs the breakeven for the price paid",
                "(breakeven uses each market's own published fee):",
                "  price band      n   needed   actual     gap      P&L  verdict"]

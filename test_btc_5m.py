@@ -149,6 +149,42 @@ def convex_cfg(**kw) -> Config:
     return Config(**base)
 
 
+def _close_journals(case=None) -> None:
+    """
+    Close every open Journal before a test unlinks its file.
+
+    Windows refuses to unlink a file that still has an open handle, so a
+    Journal left open turns every teardown into a PermissionError and buries
+    whatever the test actually did under a cleanup error.
+
+    It sweeps live instances rather than named attributes because a journal
+    is reached three different ways across this suite -- as self.j, through a
+    Trader, and as a local inside a helper that has already returned. Naming
+    them would fix the first two and leave the third failing exactly as
+    before.
+    """
+    import gc
+    # Collect first. A Journal built as a temporary -- Journal(db).diagnose()
+    # -- can still be sitting in an uncollected cycle, in which case the
+    # sweep below finds nothing AND the connection has not been finalised,
+    # which is the confusing case where closing everything visible still
+    # leaves the file locked.
+    gc.collect()
+    for obj in gc.get_objects():
+        if isinstance(obj, Journal):
+            try:
+                obj.close()
+            except Exception:            # noqa: BLE001 - cleanup only
+                pass
+
+
+def make_signal(**kw) -> Signal:
+    base = dict(side=Side.UP, model_prob=0.72, fill_price=0.55, edge=0.16,
+                stake_usdt=5.0, seconds_left=60.0)
+    base.update(kw)
+    return Signal(**base)
+
+
 def make_round(**kw) -> Round:
     base = dict(topic_id=1, market_id=9, vendor="PREDICT_FUN", slug="btc-5m",
                 symbol="BTCUSDT",
@@ -979,6 +1015,7 @@ class TestSimulatedSession(unittest.TestCase):
         os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _trader(self, client, **kw):
@@ -1247,6 +1284,7 @@ class TestLiveQuoteGate(unittest.TestCase):
         os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _trader(self, client, **kw):
@@ -1387,6 +1425,7 @@ class TestRedemption(unittest.TestCase):
         os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _live_trader(self, client, **over):
@@ -2586,6 +2625,7 @@ class TestBiasReport(unittest.TestCase):
         self.j = Journal(self.db)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _add(self, price, won, n=1, model=None):
@@ -3016,6 +3056,7 @@ class TestTieSettlement(unittest.TestCase):
         fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _trader(self, client):
@@ -3281,6 +3322,7 @@ class TestPerProfileReport(unittest.TestCase):
         fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _fill(self, profile, price, wins, losses):
@@ -3492,6 +3534,7 @@ class TestBufferReport(unittest.TestCase):
         fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def test_report_buckets_by_buffer(self):
@@ -3689,6 +3732,7 @@ class TestDiagnose(unittest.TestCase):
         fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _fill(self, price, true_rate, n, seed=1):
@@ -3771,6 +3815,7 @@ class TestScaleIn(unittest.TestCase):
         fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _setup(self, spot_now, **over):
@@ -3940,6 +3985,7 @@ class TestPerMarketFeeInDiagnostics(unittest.TestCase):
         fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _fill(self, fee_bps, n=60, price=0.714, win_rate=0.75):
@@ -4968,6 +5014,7 @@ class TestScaleInSizing(unittest.TestCase):
         fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _setup(self, spot_now, **over):
@@ -5228,6 +5275,7 @@ class TestMultiMarket(unittest.TestCase):
         fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _cfg(self, **over):
@@ -5602,10 +5650,62 @@ class TestJournal(unittest.TestCase):
         self.j = Journal(self.db)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def test_empty_report(self):
         self.assertIn("No resolved trades", self.j.calibration_report())
+
+    def test_new_columns_exist(self):
+        cols = {r[1] for r in
+                self.j._conn.execute("PRAGMA table_info(trades)")}
+        for col in ("order_type", "price_limit", "exit_price",
+                    "exit_order_id"):
+            self.assertIn(col, cols, col)
+
+    def test_a_journal_without_the_columns_is_still_readable(self):
+        """A migration that drops old journals discards the calibration record."""
+        import sqlite3 as _s
+        fd, path = tempfile.mkstemp(suffix=".db"); os.close(fd)
+        conn = _s.connect(path)
+        conn.execute("CREATE TABLE trades (id INTEGER PRIMARY KEY, ts INTEGER)")
+        conn.commit()
+        conn.close()
+        j = Journal(path, "p")
+        cols = {r[1] for r in j._conn.execute("PRAGMA table_info(trades)")}
+        self.assertIn("order_type", cols)
+
+    def test_resolve_sold_records_proceeds_and_its_own_source(self):
+        tid = self.j.record("LIVE", make_round(), make_signal(), 100.0, 0.5,
+                            50.0, "o1")
+        self.j.resolve_sold(tid, proceeds_usdt=6.0, exit_price=0.60,
+                            exit_order_id="o2", stake=5.0)
+        row = self.j._conn.execute(
+            "SELECT resolved, pnl, settle_source, exit_price, exit_order_id"
+            " FROM trades WHERE id=?", (tid,)).fetchone()
+        self.assertEqual(row[0], 1)
+        self.assertAlmostEqual(row[1], 1.0)      # 6.0 proceeds - 5.0 stake
+        self.assertEqual(row[2], "sold")
+        self.assertAlmostEqual(row[3], 0.60)
+        self.assertEqual(row[4], "o2")
+
+    def test_sold_trades_are_excluded_from_the_calibration_buckets(self):
+        """
+        The buckets ask whether the price paid predicted the outcome. A trade
+        closed before the outcome existed has no answer, and counting it as
+        one corrupts the only number this bot exists to produce.
+        """
+        for _ in range(30):
+            tid = self.j.record("LIVE", make_round(), make_signal(), 100.0,
+                                0.5, 50.0, "o")
+            self.j.resolve(tid, True, 1.0, "venue")
+        sold = self.j.record("LIVE", make_round(), make_signal(), 100.0, 0.5,
+                             50.0, "o")
+        self.j.resolve_sold(sold, proceeds_usdt=99.0, exit_price=0.99,
+                            exit_order_id="x", stake=1.0)
+        report = self.j.diagnose()
+        self.assertIn("Trades analysed : 30", report)
+        self.assertIn("sold before settlement", report)
 
     def test_records_and_resolves(self):
         rnd = make_round()
@@ -6841,6 +6941,7 @@ class TestMissedRoundReporting(unittest.TestCase):
                               self.db)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def test_a_live_round_is_not_counted_yet(self):
@@ -6994,6 +7095,7 @@ class TestLoopSurvivesUnexpectedFailures(unittest.TestCase):
         os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _stub_trader(self, boom):
@@ -7337,6 +7439,7 @@ class TestStraddleEntry(unittest.TestCase):
         os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _trader(self, client, **kw):
@@ -8027,6 +8130,7 @@ class TestStraddleCompletionBar(unittest.TestCase):
         self.t = build_trader(client, straddle_cfg(db_path=self.db), self.db)
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.db)
 
     def _wait(self, be_open, be_other, seconds_left):
