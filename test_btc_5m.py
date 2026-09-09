@@ -1820,6 +1820,41 @@ class TestRequestSigning(unittest.TestCase):
         expected = hmac.new(b"s", sent.encode(), hashlib.sha256).hexdigest()
         self.assertEqual(sig, expected)
 
+    def test_a_list_of_objects_is_sent_as_json(self):
+        """
+        doseq would send each element's Python repr, which the venue rejects.
+
+        @binance/common serialises every array and object parameter as JSON,
+        and cancelInfoList is an array of objects, so this is the connector's
+        format rather than a preference.
+        """
+        import json as _json, urllib.parse as _up
+        c = self._client()
+        query = c._signed_query({"cancelInfoList": [{"orderId": "a"},
+                                                    {"orderId": "b"}]})
+        parsed = _up.parse_qs(query)
+        self.assertEqual(len(parsed["cancelInfoList"]), 1,
+                         "sent as repeated parameters, not one JSON value")
+        self.assertEqual(_json.loads(parsed["cancelInfoList"][0]),
+                         [{"orderId": "a"}, {"orderId": "b"}])
+
+    def test_a_flat_list_still_uses_doseq(self):
+        """
+        batch_redeem's tokenIds has always gone this way and is not changed
+        here. Whether it SHOULD be JSON is a real question about a working
+        money path, and it is not this change's question to answer.
+        """
+        c = self._client()
+        query = c._signed_query({"tokenIds": ["a", "b"]})
+        self.assertIn("tokenIds=a&tokenIds=b", query)
+
+    def test_a_dict_value_is_sent_as_json(self):
+        import json as _json, urllib.parse as _up
+        c = self._client()
+        query = c._signed_query({"meta": {"k": "v"}})
+        self.assertEqual(
+            _json.loads(_up.parse_qs(query)["meta"][0]), {"k": "v"})
+
     def test_parameters_are_sorted_in_the_sent_string(self):
         c = self._client()
         sent = c._signed_query({"zeta": 1, "alpha": 2}).rsplit("&signature=", 1)[0]

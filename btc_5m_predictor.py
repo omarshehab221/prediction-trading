@@ -2901,6 +2901,22 @@ class PredictionClient:
         without it a list serialises as its Python repr.
         """
         p = {k: v for k, v in params.items() if v is not None}
+        # A parameter that is an object, or a list of objects, has no
+        # urlencode form: doseq sends each element's Python repr, and
+        # "cancelInfoList={'orderId': 'x'}" is a request the venue will
+        # always reject. @binance/common serialises every array and object
+        # parameter as JSON, so structured values go that way.
+        #
+        # Flat lists keep doseq. tokenIds has always been sent that way by
+        # batch_redeem, and whether it should also be JSON is a live question
+        # about a working money path -- not one to answer as a side effect of
+        # adding cancellation.
+        p = {k: (json.dumps(v, separators=(",", ":"))
+                 if isinstance(v, dict)
+                 or (isinstance(v, (list, tuple))
+                     and any(isinstance(x, dict) for x in v))
+                 else v)
+             for k, v in p.items()}
         p["timestamp"] = self.now_ms()
         p["recvWindow"] = self._cfg.recv_window_ms
         query = urllib.parse.urlencode(sorted(p.items()), doseq=True)
