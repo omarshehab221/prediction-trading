@@ -89,13 +89,23 @@ BINANCE_API_KEY=build BINANCE_API_SECRET=build python -m unittest test_btc_5m.Te
 
 Expected: 6 tests, all PASS.
 
-- [ ] **Step 4: Run the full gate to confirm the tree is green**
+- [ ] **Step 4: Run the safe parts of the gate**
 
 ```bash
-BINANCE_API_KEY=build BINANCE_API_SECRET=build ./verify.sh
+BINANCE_API_KEY=build BINANCE_API_SECRET=build python coherence.py --source btc_5m_predictor.py && BINANCE_API_KEY=build BINANCE_API_SECRET=build python fuzz.py --trials 400
 ```
 
-Expected: all checks OK or SKIP. This is the one place the full suite runs locally — it is the gate itself, and it must be green before building on it. If it is slow, that is expected; do not repeat it in later tasks.
+Expected: both exit 0.
+
+**Do NOT run `./verify.sh` or the full unit suite on this machine.** It was tried once on 2026-09-09 and took 22 minutes to report 148 errors and 2 failures, every one of them a Windows artifact:
+
+- `PermissionError [WinError 32]` unlinking an open sqlite file in `tearDown` — legal on POSIX, impossible on Windows. That is the 148.
+- `TestVerificationGate.test_missing_connector_skips_rather_than_fails` — the test rewrites `verify.sh` through Python text mode, turning all 101 LF into CRLF; bash then dies with a syntax error and returns 2.
+- `TestVerificationGate.test_skip_verify_bypasses_everything` — `bash` on this box resolves to WSL, and Windows environment variables do not cross into WSL without `WSLENV`, so `SKIP_VERIFY=1` never arrives and the script runs the checks it was told to skip.
+
+`verify.sh` is also self-recursive here: it runs the unit suite, which contains `TestVerificationGate`, which spawns nested `verify.sh` runs that each run the whole suite again. That is where the 22 minutes goes.
+
+The real gate is the Render build, or a local `docker build` when Docker Desktop's daemon is actually running — it usually is not on this box.
 
 - [ ] **Step 5: Commit**
 
@@ -2599,6 +2609,70 @@ and inside the poll loop, immediately after the `self._settle_open()` call, add:
                                               for p in self._positions.values()])
 ```
 
+- [ ] **Step 5a: Migrate preflight's own estimator**
+
+Found during execution, not during planning. `preflight` builds its own `VolatilityEstimator` at `btc_5m_predictor.py:6383` and the signature just changed under it. Replace:
+
+```python
+        est = VolatilityEstimator(cfg, client.session)
+```
+
+with:
+
+```python
+        est = VolatilityEstimator(cfg, ws_feeds.MarketData(client, cfg))
+```
+
+A `MarketData` with `ws_enabled` true starts no feeds until `.start()` is called, so this reads straight through to `client.kline_closes` -- which is the same REST fetch preflight was making before.
+
+- [ ] **Step 5b: Migrate the four estimator test fakes**
+
+Also found during execution. Four tests build the estimator with a fake `requests.Session` returning kline rows, and the second argument is no longer a session. `test_btc_5m.py:1625` passes `None` and only calls `_estimate_df`, so it is unaffected.
+
+At `test_btc_5m.py:1326` (`test_separate_symbols_do_not_share_a_cache`), replace the `class S` fake and its use:
+
+```python
+        class Feed:
+            def closes(self, symbol):
+                seen.append(symbol)
+                # Distinct, small-amplitude series so neither hits the
+                # volatility ceiling and gets clamped to the same value.
+                amp = 0.0005 if symbol == "BTCUSDT" else 0.0020
+                return [100.0 * (1 + amp * (i % 2)) for i in range(30)]
+
+        v = m.VolatilityEstimator(cfg(), Feed())
+```
+
+At `test_btc_5m.py:1951` (`test_malformed_closes_do_not_crash`):
+
+```python
+        closes = [float(v) for v in
+                  ["100", "0", "101", "-5", "102", "103"] * 40]
+
+        class Feed:
+            def closes(self, symbol):
+                return list(closes)
+
+        est = m.VolatilityEstimator(cfg(), Feed())
+```
+
+At `test_btc_5m.py:1967` (`TestClampedSigmaGuard._est`) and `test_btc_5m.py:2114` (`TestRawSigmaDiagnostic._est`), both build a random walk into `rows`. Replace each `rows.append([0, 0, 0, 0, str(px)])` with `rows.append(px)` and each `class S` fake with:
+
+```python
+        class Feed:
+            def closes(self, symbol):
+                return list(rows)
+        return m.VolatilityEstimator(cfg(), Feed())
+```
+
+Then run them:
+
+```bash
+BINANCE_API_KEY=build BINANCE_API_SECRET=build python -m unittest test_btc_5m.TestSigmaCache test_btc_5m.TestClampedSigmaGuard test_btc_5m.TestRawSigmaDiagnostic test_btc_5m.TestTailEstimation -v
+```
+
+Expected: all PASS. Confirm the exact class names with `grep -n "^class Test" test_btc_5m.py` around those line numbers before running.
+
 - [ ] **Step 6: Add the preflight check**
 
 In `preflight`, after the existing `check("public spot", ...)` line:
@@ -2806,21 +2880,36 @@ rollback path, and it restores exactly the behaviour the bot had before any
 of this existed.
 ```
 
-- [ ] **Step 4: Run the full gate**
+- [ ] **Step 4: Run every safe local check**
 
 ```bash
-BINANCE_API_KEY=build BINANCE_API_SECRET=build ./verify.sh
+BINANCE_API_KEY=build BINANCE_API_SECRET=build python -m py_compile btc_5m_predictor.py ws_feeds.py && BINANCE_API_KEY=build BINANCE_API_SECRET=build python coherence.py --source btc_5m_predictor.py --source ws_feeds.py && BINANCE_API_KEY=build BINANCE_API_SECRET=build python fuzz.py --trials 400
 ```
 
-Expected: all OK or SKIP. This is the second and last full-suite run in the plan — it is the gate itself.
+Then every test class this plan created or touched:
 
-- [ ] **Step 5: Build the image**
+```bash
+BINANCE_API_KEY=build BINANCE_API_SECRET=build python -m unittest \
+  test_btc_5m.TestDeploymentManifests test_btc_5m.TestCoherenceCorpus \
+  test_btc_5m.TestWsConfig test_btc_5m.TestWsConnection \
+  test_btc_5m.TestBookFeed test_btc_5m.TestSpotFeed \
+  test_btc_5m.TestMarketData test_btc_5m.TestVolatilityReadsMarketData \
+  test_btc_5m.TestNoSilentFailures
+```
+
+Expected: all PASS. `TestNoSilentFailures` is included deliberately — its AST meta-rules over the source catch things ordinary tests do not, such as an `except` that returns without logging or re-raising in the handler itself. The new module has several broad handlers and this is what checks each one explains itself.
+
+**Not** `./verify.sh` — see Task 0 Step 4 for why it is unusable on this machine.
+
+- [ ] **Step 5: Build the image, if the daemon is up**
 
 ```bash
 docker build -t btc5m:ws .
 ```
 
-Expected: success. The build runs `verify.sh` internally, so this is the real gate.
+Expected: success. The build runs `verify.sh` on Linux, where none of the Windows artifacts exist, so this is the real gate.
+
+If `docker info` reports the daemon is unreachable, say so and stop rather than pushing blind. The Render build will run the same gate, but discovering a failure there means discovering it after the worker has already restarted.
 
 - [ ] **Step 6: Commit and push**
 
