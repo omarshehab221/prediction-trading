@@ -5055,8 +5055,26 @@ class TestDeploymentManifests(unittest.TestCase):
     def test_render_uses_the_entrypoint(self):
         self.assertIn("entrypoint.sh", self._read("render.yaml"))
 
-    def test_render_disables_autodeploy(self):
-        self.assertIn("autoDeploy: false", self._read("render.yaml"))
+    def test_render_states_autodeploy_explicitly(self):
+        """
+        Whichever way autoDeploy is set, it must be set on purpose.
+
+        This test used to demand `false`. It was not updated when the setting
+        was deliberately flipped to `true`, so it sat red and took the build
+        gate down with it -- a test asserting a decision that had already been
+        revisited. What is worth pinning is not the value but that the value
+        is chosen: an absent autoDeploy silently inherits Render's default,
+        and a `true` with no explanation is how a push lands mid-round with
+        nobody having decided that it should.
+        """
+        import re as _re
+        text = self._read("render.yaml")
+        match = _re.search(r"autoDeploy:\s*(true|false)", text)
+        self.assertIsNotNone(match, "render.yaml does not set autoDeploy")
+        if match.group(1) == "true":
+            self.assertIn("AUTODEPLOY IS ON", text,
+                          "autoDeploy: true must carry the note explaining "
+                          "that a push can restart the worker mid-round")
 
     def test_dockerfile_uses_entrypoint_not_cmd_python(self):
         text = self._read("Dockerfile")
