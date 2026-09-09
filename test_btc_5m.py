@@ -892,8 +892,10 @@ class FakeClient:
     def balance_usdt(self):
         return self.balance
 
-    def get_quote(self, rnd, side, stake):
-        return m.Quote("q1", 0.51, stake / 0.51, 0.001, 0.0)
+    def get_quote(self, rnd, plan):
+        return m.Quote("q1", 0.51, plan.amount / 0.51, 0.001, 0.0,
+                       action=plan.action, order_type=plan.order_type,
+                       price_limit=plan.price_limit, amount_in=plan.amount)
 
     def batch_redeem(self, token_ids, chain_id="56"):
         self.redeemed.extend(token_ids)
@@ -1218,7 +1220,7 @@ class TestLiveQuoteGate(unittest.TestCase):
         path = [(start, 100_000.0), (start + 240_000, 100_400.0)]
         books = {(1, Side.UP): [(0.55, 10_000)]}
         client = FakeClient([rnd], path, books, {})
-        client.get_quote = lambda r, s, st: m.Quote("q", 0.93, 1.0, 0.0, 0.0)
+        client.get_quote = lambda r, p: m.Quote("q", 0.93, 1.0, 0.0, 0.0)
         # 0.93 is above max_entry_price (0.90): must never execute, even
         # though at this spot the model still nominally shows an edge.
 
@@ -1234,7 +1236,7 @@ class TestLiveQuoteGate(unittest.TestCase):
         path = [(start, 100_000.0), (start + 240_000, 100_050.0)]
         books = {(1, Side.UP): [(0.55, 10_000)]}
         client = FakeClient([rnd], path, books, {})
-        client.get_quote = lambda r, s, st: m.Quote("q", 0.88, 1.0, 0.0, 0.0)
+        client.get_quote = lambda r, p: m.Quote("q", 0.88, 1.0, 0.0, 0.0)
 
         t = self._trader(client)
         client.t = 1
@@ -1248,7 +1250,7 @@ class TestLiveQuoteGate(unittest.TestCase):
         path = [(start, 100_000.0), (start + 240_000, 100_400.0)]
         books = {(1, Side.UP): [(0.55, 10_000)]}
         client = FakeClient([rnd], path, books, {})
-        client.get_quote = lambda r, s, st: m.Quote("q", 0.55, 1.0, 0.40, 0.0)
+        client.get_quote = lambda r, p: m.Quote("q", 0.55, 1.0, 0.40, 0.0)
 
         t = self._trader(client)
         client.t = 1
@@ -2296,7 +2298,8 @@ class TestMinimumDiscovery(unittest.TestCase):
         c.calls = []
         c.balance_usdt = lambda: balance
 
-        def fake_quote(rnd, side, amount):
+        def fake_quote(rnd, plan):
+            amount = plan.amount
             c.calls.append(amount)
             if amount > balance:
                 raise m.ApiError("Please ensure your account has enough USDT.",
@@ -2456,7 +2459,8 @@ class TestQuoteErrorClassification(unittest.TestCase):
         return c
 
     def test_size_rejection_is_treated_as_below_minimum(self):
-        def q(rnd, side, amount):
+        def q(rnd, plan):
+            amount = plan.amount
             if amount < 2.0:
                 raise m.ApiError("amount below minimum order size")
             return m.Quote("q", 0.5, 1.0, 0.0, 0.0)
@@ -2466,26 +2470,27 @@ class TestQuoteErrorClassification(unittest.TestCase):
 
     def test_signature_error_is_raised_not_swallowed(self):
         """Regression: any error used to look like 'amount too small'."""
-        def q(rnd, side, amount):
+        def q(rnd, plan):
             raise m.ApiError("HTTP 400: Signature invalid", code=-1022)
         with self.assertRaises(m.ApiError):
             self._client(q).discover_min_stake(make_round(), Side.UP)
 
     def test_method_not_supported_is_raised(self):
-        def q(rnd, side, amount):
+        def q(rnd, plan):
             raise m.ApiError("Request method 'GET' is not supported",
                              code=-1104)
         with self.assertRaises(m.ApiError):
             self._client(q).discover_min_stake(make_round(), Side.UP)
 
     def test_permission_error_is_raised(self):
-        def q(rnd, side, amount):
+        def q(rnd, plan):
             raise m.ApiError("invalid API key", code=-2015)
         with self.assertRaises(m.ApiError):
             self._client(q).discover_min_stake(make_round(), Side.UP)
 
     def test_liquidity_error_counts_as_a_size_problem(self):
-        def q(rnd, side, amount):
+        def q(rnd, plan):
+            amount = plan.amount
             if amount < 3.0:
                 raise m.ApiError("insufficient liquidity for this amount")
             return m.Quote("q", 0.5, 1.0, 0.0, 0.0)
@@ -2704,7 +2709,8 @@ class TestQuoteValidation(unittest.TestCase):
         return c
 
     def _quote(self, payload):
-        return self._client(payload).get_quote(make_round(), Side.UP, 5.0)
+        return self._client(payload).get_quote(
+            make_round(), m._market_buy(Side.UP, 5.0))
 
     def test_valid_quote_parses(self):
         q = self._quote({"quoteId": "q", "averagePrice": "0.6",
@@ -5738,6 +5744,110 @@ class TestOrderPlan(unittest.TestCase):
         self.assertIsNone(q.price_limit)
 
 
+class TestLimitQuoting(unittest.TestCase):
+    """The wire format for a limit order, checked against the connector."""
+
+    def _client(self, payload=None):
+        c = build_client(_wallet=m.WalletRef("0xabc", "w1"))
+        c.sent = []
+
+        def fake_request(name, params=None):
+            c.sent.append((name, dict(params or {})))
+            if name == "get_quote":
+                return payload or {"quoteId": "q1", "averagePrice": "0.40",
+                                   "amountOut": m.to_wei(12.5),
+                                   "priceImpact": 0.0,
+                                   "feeAmount": "0"}
+            return {"orderId": "o1"}
+
+        c._request = fake_request
+        c.funding_plan = lambda: ("SPOT", "MPC", None)
+        c.resolved_funding_source = lambda: "MPC"
+        return c
+
+    def test_limit_quote_sends_price_as_a_plain_decimal(self):
+        """
+        priceLimit is NOT wei. amountIn's doc comment says wei explicitly and
+        priceLimit's says only "must be > 0"; sending 18 decimals here is a
+        price of 1e18 on a market whose prices live in (0, 1).
+        """
+        c = self._client()
+        plan = m.OrderPlan(side=m.Side.UP, action=m.Action.BUY,
+                           order_type=m.OrderType.LIMIT, amount=5.0,
+                           price_limit=0.40)
+        c.get_quote(make_round(), plan)
+        sent = dict(c.sent)["get_quote"]
+        self.assertEqual(sent["orderType"], "LIMIT")
+        self.assertEqual(sent["side"], "BUY")
+        self.assertEqual(float(sent["priceLimit"]), 0.40)
+        self.assertLess(len(sent["priceLimit"]), 8)     # not 18 decimals
+        self.assertEqual(sent["amountIn"], m.to_wei(5.0))
+
+    def test_market_quote_sends_no_price_limit(self):
+        c = self._client()
+        c.get_quote(make_round(), m._market_buy(m.Side.UP, 5.0))
+        sent = dict(c.sent)["get_quote"]
+        self.assertEqual(sent["orderType"], "MARKET")
+        self.assertNotIn("priceLimit", sent)
+
+    def test_quote_carries_what_was_quoted(self):
+        c = self._client()
+        plan = m.OrderPlan(side=m.Side.UP, action=m.Action.BUY,
+                           order_type=m.OrderType.LIMIT, amount=5.0,
+                           price_limit=0.40)
+        q = c.get_quote(make_round(), plan)
+        self.assertIs(q.order_type, m.OrderType.LIMIT)
+        self.assertIs(q.action, m.Action.BUY)
+        self.assertEqual(q.price_limit, 0.40)
+        self.assertEqual(q.amount_in, 5.0)
+
+    def test_place_order_pairs_gtc_with_limit(self):
+        c = self._client()
+        q = m.Quote("q1", 0.40, 12.5, 0.0, 0.0, action=m.Action.BUY,
+                    order_type=m.OrderType.LIMIT, price_limit=0.40,
+                    amount_in=5.0)
+        c.place_order(make_round(), q, 5.0)
+        sent = dict(c.sent)["place_order"]
+        self.assertEqual((sent["orderType"], sent["timeInForce"]),
+                         ("LIMIT", "GTC"))
+        self.assertEqual(float(sent["priceLimit"]), 0.40)
+
+    def test_place_order_still_pairs_fok_with_market(self):
+        c = self._client()
+        c.place_order(make_round(), m.Quote("q1", 0.40, 12.5, 0.0, 0.0), 5.0)
+        sent = dict(c.sent)["place_order"]
+        self.assertEqual((sent["orderType"], sent["timeInForce"]),
+                         ("MARKET", "FOK"))
+        self.assertNotIn("priceLimit", sent)
+
+    def test_sell_consistency_check_inverts(self):
+        """
+        On a SELL the input is shares and the output is USDT. Checking
+        amountOut x price against amountIn -- the BUY reconciliation -- fails
+        for every well-formed sell quote.
+        """
+        # 10 shares in at 0.50 => 5 USDT out. Internally consistent.
+        c = self._client({"quoteId": "q1", "averagePrice": "0.50",
+                          "amountOut": m.to_wei(5.0), "priceImpact": 0.0,
+                          "feeAmount": "0"})
+        plan = m.OrderPlan(side=m.Side.UP, action=m.Action.SELL,
+                           order_type=m.OrderType.LIMIT, amount=10.0,
+                           price_limit=0.50)
+        q = c.get_quote(make_round(), plan)
+        self.assertEqual(q.amount_out, 5.0)
+
+    def test_an_inconsistent_sell_quote_is_still_rejected(self):
+        # 10 shares at 0.50 cannot produce 40 USDT.
+        c = self._client({"quoteId": "q1", "averagePrice": "0.50",
+                          "amountOut": m.to_wei(40.0), "priceImpact": 0.0,
+                          "feeAmount": "0"})
+        plan = m.OrderPlan(side=m.Side.UP, action=m.Action.SELL,
+                           order_type=m.OrderType.LIMIT, amount=10.0,
+                           price_limit=0.50)
+        with self.assertRaises(m.ApiError):
+            c.get_quote(make_round(), plan)
+
+
 class TestReturnFloor(unittest.TestCase):
     """
     A win must be large enough to be worth the loss it risks. Enforced
@@ -7007,9 +7117,12 @@ class QuotingClient(FakeClient):
         self.kill_fills = kill_fills
         self.confirm_unreachable = confirm_unreachable
 
-    def get_quote(self, rnd, side, stake):
-        price = self._quotes.get(side, 0.51)
-        return m.Quote("q-" + side.value, price, stake / price, 0.001, 0.0)
+    def get_quote(self, rnd, plan):
+        price = self._quotes.get(plan.side, 0.51)
+        return m.Quote("q-" + plan.side.value, price, plan.amount / price,
+                       0.001, 0.0, action=plan.action,
+                       order_type=plan.order_type,
+                       price_limit=plan.price_limit, amount_in=plan.amount)
 
     def place_order(self, rnd, quote, stake_usdt=None):
         if (self._fail_after is not None

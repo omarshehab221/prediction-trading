@@ -3467,23 +3467,41 @@ class PredictionClient:
             return self._cfg.max_slippage_bps
         return max(1, min(self._cfg.max_slippage_bps, venue))
 
-    def get_quote(self, rnd: Round, side: Side, stake_usdt: float) -> Quote:
+    def _price_param(self, rnd: Round, price: float) -> str:
+        """
+        A limit price formatted for the wire.
+
+        Plain decimal, snapped to the market's own precision. NOT wei:
+        amountIn's doc comment says wei explicitly and priceLimit's says only
+        "must be > 0", so passing it through to_wei sends a price of roughly
+        1e18 on a market whose prices live in (0, 1).
+        """
+        return f"{rnd.round_price(price):.{rnd.decimal_precision}f}"
+
+    def get_quote(self, rnd: Round, plan: OrderPlan) -> Quote:
         """
         Phase 1 of trading: ask the venue to price the trade.
 
         Returns the authoritative average fill price, so no local book-walking
         estimate is needed once we are live.
+
+        Takes a plan rather than loose arguments because the order type, the
+        side and the price have to agree, and only a value that carries all
+        three can be checked for that.
         """
-        payload = self._request("get_quote", {
+        params = {
             "walletAddress": self.wallet().address,
-            "tokenId": rnd.token_for(side),
-            "side": "BUY",
-            "amountIn": to_wei(stake_usdt),
-            "orderType": "MARKET",
+            "tokenId": rnd.token_for(plan.side),
+            "side": plan.action.value,
+            "amountIn": to_wei(plan.amount),
+            "orderType": plan.order_type.value,
             "slippageBps": self.effective_slippage_bps(rnd),
             "chainId": rnd.chain_id,
             "feeRateBps": rnd.fee_bps,
-            "fundingSource": self.resolved_funding_source()})
+            "fundingSource": self.resolved_funding_source()}
+        if plan.price_limit is not None:
+            params["priceLimit"] = self._price_param(rnd, plan.price_limit)
+        payload = self._request("get_quote", params)
 
         quote_id = payload.get("quoteId")
         avg = payload.get("averagePrice")
@@ -3494,35 +3512,48 @@ class PredictionClient:
         if not 0.0 < avg_f < 1.0:
             raise ApiError(f"quote returned implausible price {avg_f}")
 
-        shares_raw = payload.get("amountOut")
-        if shares_raw is None:
+        out_raw = payload.get("amountOut")
+        if out_raw is None:
             raise ApiError(f"quote omits amountOut: {payload}")
-        shares = float(from_wei(shares_raw))
-        if shares <= 0:
-            raise ApiError(f"quote returned {shares} shares for "
-                           f"{stake_usdt:.2f} USDT")
+        amount_out = float(from_wei(out_raw))
+        if amount_out <= 0:
+            raise ApiError(f"quote returned {amount_out} out for "
+                           f"{plan.amount:.2f} in")
 
-        # Cross-check: shares x average price should reconcile with the
-        # amount spent. A mismatch means averagePrice and amountOut describe
-        # different things, and every downstream calculation would be wrong.
-        implied = shares * avg_f
+        # Cross-check: the two amounts and the price must reconcile, or
+        # averagePrice and amountOut describe different things and every
+        # downstream calculation is wrong.
+        #
+        # The direction matters. A BUY puts USDT in and takes shares out, so
+        # shares x price should equal the USDT. A SELL puts shares in and
+        # takes USDT out, so the same product should equal the amount OUT.
+        # Checking a sell the buy way rejects every well-formed sell quote.
+        if plan.action is Action.BUY:
+            implied, reference = amount_out * avg_f, plan.amount
+        else:
+            implied, reference = plan.amount * avg_f, amount_out
         tol = self._cfg.quote_consistency_tolerance
-        if implied > 0 and abs(implied - stake_usdt) / stake_usdt > tol:
+        if reference > 0 and abs(implied - reference) / reference > tol:
             raise ApiError(
-                f"quote is internally inconsistent: {shares:.4f} shares at "
-                f"{avg_f:.4f} implies {implied:.2f} USDT, not {stake_usdt:.2f}")
+                f"quote is internally inconsistent: {plan.action.value} of "
+                f"{plan.amount:.4f} at {avg_f:.4f} implies {implied:.4f}, "
+                f"not {reference:.4f}")
 
         impact_raw = payload.get("priceImpact")
         fee_raw = payload.get("feeAmount")
         return Quote(
             quote_id=str(quote_id),
             average_price=avg_f,
-            amount_out=shares,
+            amount_out=amount_out,
             # A missing impact is unknown, not zero; treat it as the worst
             # case so the caller's impact guard cannot be bypassed.
             price_impact=(float("inf") if impact_raw is None
                           else float(impact_raw)),
-            fee_usdt=0.0 if fee_raw is None else float(from_wei(fee_raw)))
+            fee_usdt=0.0 if fee_raw is None else float(from_wei(fee_raw)),
+            action=plan.action,
+            order_type=plan.order_type,
+            price_limit=plan.price_limit,
+            amount_in=plan.amount)
 
     def discover_min_stake(self, rnd: Round, side: Side,
                            low: float = 0.25, high: float | None = None,
@@ -3564,7 +3595,7 @@ class PredictionClient:
             minimum" turns a broken request into a confident wrong conclusion.
             """
             try:
-                self.get_quote(rnd, side, amount)
+                self.get_quote(rnd, _market_buy(side, amount))
                 return True
             except ApiError as exc:
                 if exc.kind is ErrorKind.SIZE:
@@ -3602,8 +3633,14 @@ class PredictionClient:
     def place_order(self, rnd: Round, quote: Quote,
                     stake_usdt: float | None = None) -> str:
         """
-        Phase 2: execute a quote. MARKET orders are FOK -- fill-or-kill, so
-        there are no partial fills at prices the model never approved.
+        Phase 2: execute a quote.
+
+        MARKET orders are FOK -- fill-or-kill, so there are no partial fills
+        at prices the model never approved. LIMIT orders are GTC and REST:
+        the id returned describes an order that may sit on the book for
+        minutes, fill in pieces, or never fill at all. Confirming a limit
+        order with confirm_fill would raise on the ordinary case; use
+        order_state instead.
 
         Takes the round so chain and slippage come from the market rather
         than from a module-level assumption.
@@ -3617,12 +3654,16 @@ class PredictionClient:
             "walletAddress": wallet.address,
             "walletId": wallet.wallet_id,
             "quoteId": quote.quote_id,
-            "timeInForce": "FOK",          # required pairing for MARKET
+            # Derived from the quote's own order type, so the pairing the
+            # venue enforces cannot be split across two call sites.
+            "timeInForce": quote.order_type.time_in_force,
             "accountType": account,
-            "orderType": "MARKET",
+            "orderType": quote.order_type.value,
             "slippageBps": self.effective_slippage_bps(rnd),
             "fundingSource": funding,
         }
+        if quote.price_limit is not None:
+            params["priceLimit"] = self._price_param(rnd, quote.price_limit)
         LOG.debug("Funding plan: accountType=%s fundingSource=%s holder=%s",
                   account, funding, holder)
         # A CEX-funded order needs the collateral moved to the prediction
@@ -5231,7 +5272,7 @@ class Trader:
         order_id = None
         if self._live:
             if quote is None:
-                quote = self._client.get_quote(raw, side, stake)
+                quote = self._client.get_quote(raw, _market_buy(side, stake))
             order_id = self._client.place_order(raw, quote, stake)
             price = quote.average_price
             if self._cfg.confirm_fills:
@@ -5336,7 +5377,7 @@ class Trader:
                             "an unreadable balance" if fresh is None
                             else "%.2f" % fresh)
                 return False
-            quote = self._client.get_quote(raw, side, stake)
+            quote = self._client.get_quote(raw, _market_buy(side, stake))
             if quote.average_price > ceiling:
                 LOG.info("Straddle %s: the %s quote at %.4f is dearer than "
                          "the %.2f first-leg ceiling the book suggested; "
@@ -5444,7 +5485,7 @@ class Trader:
                                 "an unreadable balance" if fresh is None
                                 else "%.2f" % fresh)
                     continue
-                quote = self._client.get_quote(raw, other, stake)
+                quote = self._client.get_quote(raw, _market_buy(other, stake))
                 # Re-tested, NOT re-sized. place_order executes this quote's
                 # id, which is bound to the size it was asked for, so the
                 # only honest question is whether THIS trade still locks the
@@ -5647,8 +5688,8 @@ class Trader:
                                 else "%.2f" % fresh)
                     continue
                 for side in (Side.UP, Side.DOWN):
-                    quotes[side] = self._client.get_quote(raw, side,
-                                                          stakes[side])
+                    quotes[side] = self._client.get_quote(
+                        raw, _market_buy(side, stakes[side]))
                 quoted = {side: q.average_price for side, q in quotes.items()}
                 ok, worst, reason = self._straddle_payouts_clear(
                     raw, quoted, stakes, total)
@@ -5825,7 +5866,7 @@ class Trader:
                     LOG.warning("Stake %.2f exceeds the live balance %.2f; "
                                 "skipping", sig.stake_usdt, fresh)
                     continue
-                quote = self._client.get_quote(rnd, sig.side, sig.stake_usdt)
+                quote = self._client.get_quote(rnd, _market_buy(sig.side, sig.stake_usdt))
 
                 # The quote is authoritative. Re-apply every price filter to it
                 # and walk away if the venue prices worse than our screen
@@ -6071,7 +6112,7 @@ class Trader:
                                 "minimum order; skipping", raw.slug, fresh,
                                 self._cfg.min_stake_usdt)
                     continue
-                quote = self._client.get_quote(raw, side, stake)
+                quote = self._client.get_quote(raw, _market_buy(side, stake))
                 # The quote is authoritative and the book was only a screen.
                 # Re-test the rule on the price that will actually execute,
                 # or the floor binds on a number nobody pays.
@@ -6242,7 +6283,7 @@ class Trader:
                 LOG.info("Skipping top-up: %.2f needed, %.2f available",
                          topup, fresh if fresh is not None else -1.0)
                 return
-            quote = self._client.get_quote(pos.rnd, pos.signal.side, topup)
+            quote = self._client.get_quote(pos.rnd, _market_buy(pos.signal.side, topup))
             if quote.average_price > self._cfg.max_entry_price:
                 return
             if not clears_return(quote.average_price, pos.rnd.fee_bps,
@@ -6782,7 +6823,7 @@ def preflight(cfg: Config) -> int:
               lambda: f"{client.redeem_status('0x0') or 'reachable'}")
         if hydrated:
             check("quote (no order)", lambda: (
-                f"avg {client.get_quote(hydrated[0], Side.UP, cfg.min_stake_usdt).average_price:.4f}"))
+                f"avg {client.get_quote(hydrated[0], _market_buy(Side.UP, cfg.min_stake_usdt)).average_price:.4f}"))
     else:
         print("  (no live rounds -- detail/book/quote checks skipped)")
 
@@ -6885,7 +6926,7 @@ def discover_min(cfg: Config) -> int:
     verdicts: list[tuple[float, bool, str]] = []
     for amount in sizes:
         try:
-            q = client.get_quote(rnd, Side.UP, amount)
+            q = client.get_quote(rnd, _market_buy(Side.UP, amount))
             verdicts.append((amount, True, (f"avg {q.average_price:.4f} "
                                            f"impact {q.price_impact:.4f}")))
         except ApiError as exc:
