@@ -1504,6 +1504,70 @@ class Side(str, Enum):
         return Side.DOWN if self is Side.UP else Side.UP
 
 
+class Action(str, Enum):
+    """What the order does to the book. The venue calls this `side`."""
+
+    BUY = "BUY"
+    SELL = "SELL"
+
+
+class OrderType(str, Enum):
+    MARKET = "MARKET"
+    LIMIT = "LIMIT"
+
+    @property
+    def time_in_force(self) -> str:
+        """
+        The venue's required pairing, derived rather than written twice.
+
+        place-order rejects MARKET with anything but FOK and LIMIT with
+        anything but GTC. Those two strings used to sit as separate literals
+        next to the order type, one edit away from disagreeing -- and the
+        failure arrives as a signed request the bot believed was correct.
+        Deriving one from the other makes the mismatch unrepresentable.
+        """
+        return "FOK" if self is OrderType.MARKET else "GTC"
+
+
+@dataclass(frozen=True)
+class OrderPlan:
+    """
+    One order, described completely. Built by strategy, consumed by I/O.
+
+    Exists so the five things that define an order travel together. Passed as
+    loose arguments they drift: a caller that computed a limit price and then
+    called a MARKET path sends the price nowhere and crosses the spread, and
+    nothing in the type system objects.
+    """
+
+    side: Side                       # which outcome token
+    action: Action
+    order_type: OrderType
+    amount: float                    # BUY: USDT in.  SELL: shares in.
+    price_limit: float | None = None
+
+    def __post_init__(self) -> None:
+        if not self.amount > 0:
+            raise ValueError(f"amount must be positive, got {self.amount}")
+        if self.order_type is OrderType.LIMIT:
+            if self.price_limit is None:
+                raise ValueError("a LIMIT order requires a price_limit")
+            if not 0.0 < self.price_limit < 1.0:
+                raise ValueError(
+                    f"price_limit must be in (0, 1), got {self.price_limit}")
+        elif self.price_limit is not None:
+            # Not harmless: it reads as though the price was applied, and the
+            # venue ignores it, so the order crosses the spread while the
+            # caller believes it is resting.
+            raise ValueError("a MARKET order must not carry a price_limit")
+
+
+def _market_buy(side: Side, amount: float) -> OrderPlan:
+    """A plain market buy -- what every call site sent before limit orders."""
+    return OrderPlan(side=side, action=Action.BUY,
+                     order_type=OrderType.MARKET, amount=amount)
+
+
 @dataclass(frozen=True)
 class Round:
     """A live BTC 5m up/down market. Only ever built by _parse_round."""
@@ -1556,9 +1620,20 @@ class Quote:
 
     quote_id: str
     average_price: float
-    amount_out_shares: float
+    # Shares on a BUY, USDT on a SELL -- the venue's amountOut means whichever
+    # asset the trade produces. Named for what it is rather than for the BUY
+    # case, because a field called `shares` holding USDT is exactly the kind
+    # of quiet wrongness that survives a green suite.
+    amount_out: float
     price_impact: float
     fee_usdt: float
+    # What was quoted. place_order reads the type from here rather than
+    # taking it as an argument, so a quote and the order executing it cannot
+    # describe two different trades.
+    action: Action = Action.BUY
+    order_type: OrderType = OrderType.MARKET
+    price_limit: float | None = None
+    amount_in: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -3426,7 +3501,7 @@ class PredictionClient:
         return Quote(
             quote_id=str(quote_id),
             average_price=avg_f,
-            amount_out_shares=shares,
+            amount_out=shares,
             # A missing impact is unknown, not zero; treat it as the worst
             # case so the caller's impact guard cannot be bypassed.
             price_impact=(float("inf") if impact_raw is None
@@ -5792,7 +5867,7 @@ class Trader:
                              quote.fee_usdt / sig.stake_usdt * 10_000)
                 sig = replace(sig, fill_price=quote.average_price, edge=edge)
                 LOG.info("Order %s filled at %.4f for %.4f shares", order_id,
-                         quote.average_price, quote.amount_out_shares)
+                         quote.average_price, quote.amount_out)
 
             mult = kelly_multiple(sig.stake_usdt, bankroll, sig.model_prob,
                                   sig.fill_price, rnd.fee_bps)

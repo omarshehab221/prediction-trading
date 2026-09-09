@@ -2676,7 +2676,7 @@ class TestQuoteValidation(unittest.TestCase):
                          "amountOut": "8333333333333333333",
                          "priceImpact": "0.01", "feeAmount": "0"})
         self.assertAlmostEqual(q.average_price, 0.6)
-        self.assertGreater(q.amount_out_shares, 8.0)
+        self.assertGreater(q.amount_out, 8.0)
 
     def test_missing_amount_out_raises(self):
         with self.assertRaises(m.ApiError):
@@ -5652,6 +5652,55 @@ class TestReservationPrice(unittest.TestCase):
     def test_sell_reservation_price_is_none_when_no_price_can_clear(self):
         c = cfg(min_edge=0.04, min_edge_ratio=0.15)
         self.assertIsNone(m.sell_reservation_price(0.97, c, 200))
+
+
+class TestOrderPlan(unittest.TestCase):
+    """An order that cannot be described correctly cannot be constructed."""
+
+    def test_time_in_force_is_derived_from_the_order_type(self):
+        self.assertEqual(m.OrderType.MARKET.time_in_force, "FOK")
+        self.assertEqual(m.OrderType.LIMIT.time_in_force, "GTC")
+
+    def test_limit_without_a_price_is_unconstructible(self):
+        with self.assertRaises(ValueError):
+            m.OrderPlan(side=m.Side.UP, action=m.Action.BUY,
+                        order_type=m.OrderType.LIMIT, amount=5.0)
+
+    def test_market_with_a_price_is_unconstructible(self):
+        """A priceLimit on a MARKET order is a contradiction, not a hint."""
+        with self.assertRaises(ValueError):
+            m.OrderPlan(side=m.Side.UP, action=m.Action.BUY,
+                        order_type=m.OrderType.MARKET, amount=5.0,
+                        price_limit=0.4)
+
+    def test_limit_price_must_be_a_probability(self):
+        for bad in (0.0, 1.0, -0.5, 1.5):
+            with self.assertRaises(ValueError):
+                m.OrderPlan(side=m.Side.UP, action=m.Action.BUY,
+                            order_type=m.OrderType.LIMIT, amount=5.0,
+                            price_limit=bad)
+
+    def test_amount_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            m.OrderPlan(side=m.Side.UP, action=m.Action.BUY,
+                        order_type=m.OrderType.MARKET, amount=0.0)
+
+    def test_a_valid_limit_plan_survives(self):
+        plan = m.OrderPlan(side=m.Side.DOWN, action=m.Action.SELL,
+                           order_type=m.OrderType.LIMIT, amount=12.0,
+                           price_limit=0.62)
+        self.assertEqual(plan.order_type.time_in_force, "GTC")
+        self.assertEqual(plan.action.value, "SELL")
+
+    def test_quote_keeps_its_positional_shape(self):
+        """Nine test sites build a Quote positionally; do not reorder it."""
+        q = m.Quote("q", 0.6, 8.0, 0.0, 0.0)
+        self.assertEqual(q.quote_id, "q")
+        self.assertEqual(q.average_price, 0.6)
+        self.assertEqual(q.amount_out, 8.0)
+        self.assertIs(q.order_type, m.OrderType.MARKET)
+        self.assertIs(q.action, m.Action.BUY)
+        self.assertIsNone(q.price_limit)
 
 
 class TestReturnFloor(unittest.TestCase):
