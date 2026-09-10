@@ -6499,6 +6499,57 @@ class TestLimitExits(unittest.TestCase):
                       "an impossible sale was netted instead of refused")
 
 
+class TestGatesSeeThePricePaid(unittest.TestCase):
+    """Every gate must be checked against the price that will actually fill."""
+
+    def _assess(self, ask, precision, min_edge=0.02):
+        c = cfg(min_edge=min_edge, min_edge_ratio=0.0, min_entry_price=0.05,
+                max_entry_price=0.95, max_blended_price=0.90,
+                min_win_return=0.0, entry_window_start_s=300,
+                entry_window_end_s=1)
+        rnd = make_round(decimal_precision=precision, fee_bps=0)
+        spot = rnd.strike * (1 - 0.0006)
+        verdict = m.assess(rnd, spot, 0.5, 100.0, rnd.end_ms - 60_000, c,
+                           {Side.UP: [(ask, 10_000.0)],
+                            Side.DOWN: [(ask, 10_000.0)]},
+                           None, m.Trend())
+        return c, rnd, verdict
+
+    def test_the_recorded_edge_clears_the_floor_it_was_gated_on(self):
+        """
+        Regression: the edge floor was checked BEFORE the price was snapped
+        to the market's precision, and the edge was recorded AFTER. Rounding
+        up raises breakeven, so a trade could be taken and journalled with a
+        real edge below min_edge -- the floor having been tested against a
+        price that was never going to be the fill.
+
+        These numbers are a real instance: at precision 1 an ask of 0.753
+        clears a 0.02 floor, fills at 0.80, and leaves an edge of 0.0079.
+        """
+        c, rnd, verdict = self._assess(0.753, precision=1)
+        if verdict.signal is None:
+            # The correct answer: at 0.80 the edge does not clear, so the
+            # round is refused rather than taken on a price nobody will pay.
+            self.assertEqual(verdict.blocked_by, "edge below the floor")
+            return
+        self.assertGreaterEqual(
+            verdict.signal.edge, c.min_edge - 1e-12,
+            "a signal was recorded with an edge under the floor that was "
+            "supposed to gate it")
+        self.assertTrue(
+            m.clears_edge(verdict.signal.model_prob,
+                          verdict.signal.fill_price, c, rnd.fee_bps),
+            "the recorded fill price does not clear the edge gate")
+
+    def test_a_coarse_market_can_still_trade_when_the_edge_survives(self):
+        """The fix must decline the bad case, not every case at precision 1."""
+        c, rnd, verdict = self._assess(0.753, precision=1, min_edge=0.001)
+        self.assertIsNotNone(verdict.signal)
+        self.assertEqual(verdict.signal.fill_price,
+                         round(verdict.signal.fill_price, 1))
+        self.assertGreaterEqual(verdict.signal.edge, c.min_edge - 1e-12)
+
+
 class TestReturnFloor(unittest.TestCase):
     """
     A win must be large enough to be worth the loss it risks. Enforced

@@ -4687,18 +4687,26 @@ def assess(rnd: Round, spot: float, sigma: float, bankroll: float,
         if avg is None:
             blocked = _worse(blocked, "book too thin to fill")
             continue
+        # The venue quotes to its own precision, so a fill price carrying
+        # more digits than that is fiction. Snap BEFORE any gate, not merely
+        # before the edge is priced.
+        #
+        # This used to snap between the edge gate and the edge calculation,
+        # so the floor was tested against a price that was never going to be
+        # the fill. Rounding up raises breakeven, and a market quoting to one
+        # decimal could clear a 0.02 floor at an ask of 0.753, fill at 0.80,
+        # and book a trade whose real edge was 0.008. The gate said yes to a
+        # price nobody was ever going to pay.
+        avg = rnd.round_price(avg)
+        if not 0.0 < avg < 1.0:
+            blocked = _worse(blocked, "price outside the entry band")
+            continue
         if not (cfg.min_entry_price <= avg <= cfg.max_entry_price):
             blocked = _worse(blocked, "price outside the entry band")
             continue
 
         if not clears_edge(model_prob, avg, cfg, fee_bps):
             blocked = _worse(blocked, "edge below the floor")
-            continue
-        # The venue quotes to its own precision, so a fill price carrying
-        # more digits than that is fiction. Snap before pricing the edge.
-        avg = rnd.round_price(avg)
-        if not 0.0 < avg < 1.0:
-            blocked = _worse(blocked, "price outside the entry band")
             continue
         # Re-check on the price actually paid, not the one at the top of the
         # book. Walking the ladder raises the average, and a return floor
