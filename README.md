@@ -687,6 +687,15 @@ Kept because they are the useful part of the history.
   rather than $0.65. The API reading is now authoritative, and every live
   settlement is reconciled against the actual balance change.
 
+- **Array parameters.** `tokenIds` was sent as repeated parameters
+  (`tokenIds=a&tokenIds=b`). Binance's own connector puts every array through
+  `JSON.stringify` and signs the string it built, so the venue expects
+  `tokenIds=["a","b"]` and checks the HMAC against that. The repeated form was
+  a guess from the first commit that no live call ever tested — `batch-redeem`
+  cannot run until a real position exists, and `place-order-bundle` has never
+  executed against a funded account, so neither array parameter had ever left
+  the machine.
+
 The pattern in all of them: **treating a specific signal as a generic one.** A
 numeric error code flattened to a string, a real balance replaced by a guessed
 constant, a distinct failure reported as "something went wrong". The meta-tests

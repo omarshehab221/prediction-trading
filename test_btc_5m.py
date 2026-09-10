@@ -1953,15 +1953,39 @@ class TestRequestSigning(unittest.TestCase):
         self.assertEqual(_json.loads(parsed["cancelInfoList"][0]),
                          [{"orderId": "a"}, {"orderId": "b"}])
 
-    def test_a_flat_list_still_uses_doseq(self):
+    def test_a_flat_list_is_sent_as_json(self):
         """
-        batch_redeem's tokenIds has always gone this way and is not changed
-        here. Whether it SHOULD be JSON is a real question about a working
-        money path, and it is not this change's question to answer.
+        tokenIds is a JSON array, not repeated parameters.
+
+        Verified by running the connector's own serialiser: @binance/common
+        puts every array parameter through JSON.stringify, and signs the
+        string it built, so the venue both receives and HMACs the JSON form.
+        Repeated parameters are not a Binance array convention anywhere.
+
+        This was a guess from the initial commit that no live call ever
+        tested -- batch_redeem cannot run until a real position exists, and
+        place-order-bundle has never been executed against a funded account.
         """
+        import json as _json, urllib.parse as _up
         c = self._client()
         query = c._signed_query({"tokenIds": ["a", "b"]})
-        self.assertIn("tokenIds=a&tokenIds=b", query)
+        self.assertNotIn("tokenIds=a&tokenIds=b", query)
+        parsed = _up.parse_qs(query)
+        self.assertEqual(len(parsed["tokenIds"]), 1,
+                         "sent as repeated parameters, not one JSON value")
+        self.assertEqual(_json.loads(parsed["tokenIds"][0]), ["a", "b"])
+
+    def test_the_signature_covers_the_json_form(self):
+        """
+        The signed bytes and the sent bytes must still be identical once a
+        list has become a JSON string, or every redemption returns -1022.
+        """
+        import hmac as _h, hashlib as _hl
+        c = self._client()
+        q = c._signed_query({"tokenIds": ["a", "b"], "chainId": "56"})
+        sent, sig = q.rsplit("&signature=", 1)
+        self.assertEqual(
+            sig, _h.new(b"s", sent.encode(), _hl.sha256).hexdigest())
 
     def test_a_dict_value_is_sent_as_json(self):
         import json as _json, urllib.parse as _up
@@ -1986,13 +2010,21 @@ class TestRequestSigning(unittest.TestCase):
         self.assertNotIn("skipme",
                          self._client()._signed_query({"skipme": None}))
 
-    def test_list_params_repeat_rather_than_stringify(self):
-        """Regression: tokenIds must not serialise as a Python repr."""
+    def test_list_params_never_serialise_as_a_python_repr(self):
+        """
+        Regression: tokenIds must not serialise as a Python repr.
+
+        That is what this test has always been for, and it still is. What it
+        used to ALSO assert -- repeated parameters, and no "[" in the query --
+        pinned a shape the venue never asked for, so a correct change to the
+        connector's JSON form read as a regression. The repr is the bug; the
+        JSON array is the format.
+        """
         c = self._client()
         q = c._signed_query({"tokenIds": ["111", "222"]})
-        self.assertIn("tokenIds=111", q)
-        self.assertIn("tokenIds=222", q)
-        self.assertNotIn("%5B", q)      # no "["
+        self.assertNotIn("%27", q)      # no "'" -- a Python repr
+        self.assertIn("111", q)
+        self.assertIn("222", q)
 
     def test_signature_changes_when_a_parameter_changes(self):
         c = self._client()

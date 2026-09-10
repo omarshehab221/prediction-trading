@@ -3024,29 +3024,34 @@ class PredictionClient:
         signature error. Returning a string rather than a dict makes that
         class of bug unrepresentable.
 
-        doseq=True is required for repeated parameters such as tokenIds;
-        without it a list serialises as its Python repr.
+        Every array and object parameter is a JSON string, which is what the
+        connector does and therefore what the venue expects. See below.
         """
         p = {k: v for k, v in params.items() if v is not None}
-        # A parameter that is an object, or a list of objects, has no
-        # urlencode form: doseq sends each element's Python repr, and
-        # "cancelInfoList={'orderId': 'x'}" is a request the venue will
-        # always reject. @binance/common serialises every array and object
-        # parameter as JSON, so structured values go that way.
+        # Arrays and objects go as JSON, because that is what the venue is
+        # given by its own connector. @binance/common routes every parameter
+        # through serializeValue, which JSON.stringify's anything that is not
+        # a scalar, and then HMACs the string it built -- so the JSON form is
+        # both what arrives and what the signature is checked against.
         #
-        # Flat lists keep doseq. tokenIds has always been sent that way by
-        # batch_redeem, and whether it should also be JSON is a live question
-        # about a working money path -- not one to answer as a side effect of
-        # adding cancellation.
+        # This used to send flat lists as repeated parameters
+        # (tokenIds=a&tokenIds=b) via urlencode's doseq. That was a guess
+        # carried from the first commit which no live call ever tested:
+        # batch_redeem cannot run until a real position exists, and
+        # place-order-bundle has never executed against a funded account, so
+        # the only two array parameters in the bot -- tokenIds and
+        # cancelInfoList -- had never left the machine. Repeated parameters
+        # are not a Binance array convention anywhere.
+        #
+        # doseq is therefore gone rather than left set: no list or tuple can
+        # reach urlencode any more, so a doseq=True here would describe a
+        # path that no longer exists.
         p = {k: (json.dumps(v, separators=(",", ":"))
-                 if isinstance(v, dict)
-                 or (isinstance(v, (list, tuple))
-                     and any(isinstance(x, dict) for x in v))
-                 else v)
+                 if isinstance(v, (dict, list, tuple)) else v)
              for k, v in p.items()}
         p["timestamp"] = self.now_ms()
         p["recvWindow"] = self._cfg.recv_window_ms
-        query = urllib.parse.urlencode(sorted(p.items()), doseq=True)
+        query = urllib.parse.urlencode(sorted(p.items()))
         signature = hmac.new(self._cfg.api_secret.encode(),
                              query.encode(), hashlib.sha256).hexdigest()
         return f"{query}&signature={signature}"
