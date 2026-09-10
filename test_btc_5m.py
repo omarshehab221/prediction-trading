@@ -81,6 +81,8 @@ def build_trader(client, config, db_path):
         spot=lambda symbol: client.spot_price(symbol),
         closes=lambda symbol: [],
         asks=lambda rnd, side: client.asks_for(rnd, side),
+        bids=lambda rnd, side: getattr(client, "bids_for", lambda r, x: None)(
+            rnd, side),
         track=lambda symbols: None,
         start=lambda: None,
         stop=lambda: None,
@@ -6310,6 +6312,89 @@ class TestCancelRacesFill(unittest.TestCase):
                          "a filled order was abandoned because the cancel "
                          "reported failure")
         self.assertNotIn("o1", t._pending)
+
+
+class TestPaperRestingOrders(unittest.TestCase):
+    """Paper and live share one lifecycle, or paper proves nothing."""
+
+    def tearDown(self):
+        _close_journals(self)
+
+    def _book(self, asks=(), bids=()):
+        class FakeMarketData:
+            def asks(self, rnd, side):
+                return list(asks) or None
+
+            def bids(self, rnd, side):
+                return list(bids) or None
+
+        return m.PaperBook(FakeMarketData())
+
+    def _buy(self, amount=5.0, price=0.40):
+        return m.OrderPlan(side=Side.UP, action=m.Action.BUY,
+                           order_type=m.OrderType.LIMIT, amount=amount,
+                           price_limit=price)
+
+    def _sell(self, amount=10.0, price=0.60):
+        return m.OrderPlan(side=Side.UP, action=m.Action.SELL,
+                           order_type=m.OrderType.LIMIT, amount=amount,
+                           price_limit=price)
+
+    def test_a_bid_below_the_ask_does_not_fill(self):
+        book = self._book(asks=[(0.50, 100.0)])
+        oid = book.place(self._buy(), make_round())
+        self.assertEqual(book.order_state(oid).status, "RESTING")
+
+    def test_a_bid_at_or_above_the_ask_fills(self):
+        book = self._book(asks=[(0.40, 100.0)])
+        oid = book.place(self._buy(), make_round())
+        state = book.order_state(oid)
+        self.assertEqual(state.status, "FILLED")
+        self.assertAlmostEqual(state.filled_usdt, 5.0)
+        self.assertAlmostEqual(state.price, 0.40)
+
+    def test_a_thin_book_fills_only_what_is_there(self):
+        """Depth is the whole point: a partial fill has to be reachable."""
+        book = self._book(asks=[(0.40, 5.0)])       # 5 shares = 2.0 USDT
+        oid = book.place(self._buy(), make_round())
+        state = book.order_state(oid)
+        self.assertEqual(state.status, "PARTIAL")
+        self.assertAlmostEqual(state.filled_usdt, 2.0)
+
+    def test_a_sell_fills_against_the_bid_not_the_ask(self):
+        book = self._book(asks=[(0.90, 100.0)], bids=[(0.60, 100.0)])
+        oid = book.place(self._sell(), make_round())
+        self.assertEqual(book.order_state(oid).status, "FILLED")
+
+    def test_a_sell_above_the_bid_rests(self):
+        book = self._book(bids=[(0.50, 100.0)])
+        oid = book.place(self._sell(), make_round())
+        self.assertEqual(book.order_state(oid).status, "RESTING")
+
+    def test_a_cancelled_paper_order_is_dead_and_keeps_its_fill(self):
+        book = self._book(asks=[(0.40, 5.0)])
+        oid = book.place(self._buy(), make_round())
+        book.cancel_orders([oid])
+        state = book.order_state(oid)
+        self.assertEqual(state.status, "DEAD")
+        self.assertAlmostEqual(state.filled_usdt, 2.0)
+
+    def test_an_unknown_paper_order_is_none(self):
+        self.assertIsNone(self._book().order_state("nope"))
+
+    def test_paper_mode_places_no_real_order(self):
+        t = make_trader(live=False, entry_order_type="LIMIT")
+
+        def boom(*a, **k):
+            raise AssertionError("paper mode reached the venue")
+
+        t._client.place_order = boom
+        t._client.get_quote = boom
+        rnd = make_round()
+        t._post_limit_entry(rnd, make_signal(), 100.0, 0.5, 50.0, "PAPER",
+                            rnd.end_ms)
+        self.assertEqual(len(t._pending), 1)
+        self.assertTrue(next(iter(t._pending)).startswith("paper-"))
 
 
 class TestReturnFloor(unittest.TestCase):
