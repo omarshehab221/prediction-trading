@@ -59,12 +59,12 @@ Two refinements matter:
 
 | File | Lines | What it is |
 |---|---|---|
-| `btc_5m_predictor.py` | 4068 | The bot: client, pricing, risk, journal, CLI |
-| `ws_feeds.py` | 763 | Persistent WebSocket feeds behind one `MarketData` seam |
-| `test_btc_5m.py` | 4694 | 512 tests across 78 classes |
-| `conformance.py` | 403 | Validates every API call against Binance's own schema |
-| `fuzz.py` | 363 | Property-based testing with hostile inputs |
-| `coherence.py` | 376 | Finds stale artifacts, dead code, config drift |
+| `btc_5m_predictor.py` | 8041 | The bot: client, pricing, risk, journal, CLI |
+| `ws_feeds.py` | 814 | Persistent WebSocket feeds behind one `MarketData` seam |
+| `test_btc_5m.py` | 9963 | 945 tests across 120 classes |
+| `conformance.py` | 406 | Validates every API call against Binance's own schema |
+| `fuzz.py` | 466 | Property-based testing with hostile inputs |
+| `coherence.py` | 460 | Finds stale artifacts, dead code, config drift |
 | `mutate.py` | 155 | Mutation testing — measures test quality |
 | `verify.sh` | 107 | The gate: runs before the bot is allowed to trade |
 | `checkup.sh` | 139 | Full isolated verification run |
@@ -171,7 +171,7 @@ to one.
 
 ## 6. Profiles
 
-Seven strategies, differing in which contracts they buy. The first five pick a
+Eight strategies, differing in which contracts they buy. The first six pick a
 side from the model; the last two do not consult it at all.
 
 | Profile | Entry band | Max stake | Buffer gate | Entry window | Paper |
@@ -182,6 +182,7 @@ side from the model; the last two do not consult it at all.
 | `balanced` | 0.10–0.90 | 5% | — | 150–25s | $100 |
 | `convex` | 0.05–0.35 | 2% | — | 280–30s | $100 |
 | `straddle` | both sides | 20% per leg | — | 60s from open | $100 |
+| `maker` | 0.10–0.85 | 5% | — | 240–45s | $100 |
 | `lastminute` *(default)* | any | 10% per round | — | 60–5s | $100 |
 
 **`buffer`** encodes "wait for a buffer to open, back the side it favours,
@@ -204,6 +205,12 @@ not chosen.
 **`straddle`** buys *both* sides of a round, at two different moments, and only
 when the pair's worst case still pays back more than it cost. No side is ever
 picked, so direction stops mattering.
+
+**`maker`** is the only profile that does not cross the spread. It posts a
+resting bid and waits to be hit, which is why its entry window is the widest
+here and closes earliest — a resting order is retracted when the window shuts,
+so a narrow window posts an order and takes it back before anyone could take
+it. See §6c.
 
 **`lastminute`** is described in §6.3. It is the only profile that reads
 nothing but the price.
@@ -427,6 +434,79 @@ through the config store, so the running bot drops to REST-only on its next
 hot reload -- no redeploy, no restart, no interrupted round. That is the
 rollback path, and it restores exactly the behaviour the bot had before any
 of this existed.
+
+## 6c. How orders reach the book
+
+Two order types, chosen per profile.
+
+**MARKET** crosses the spread. It is fill-or-kill: it fills completely at the
+quoted price or it is killed, so there is never a partial position at a price
+the model did not approve. Every profile except `maker` uses it, and it is
+what this bot did exclusively before limit orders existed.
+
+**LIMIT** rests on the book. The venue only accepts `GTC` for a limit order --
+there is no IOC -- so it sits there until it fills, or until the bot retracts
+it. Three consequences, all of which the bot has to handle and none of which
+apply to a market order:
+
+- **It may not fill.** A round can pass with a bid on the book and nothing
+  bought. That is counted as a missed round like any other.
+- **It may fill in pieces.** A partial fill is the ordinary outcome, not a
+  fault, and it cannot be refused: the shares are already yours. So any
+  non-zero fill is recorded at its real size and price. `min_fill_fraction`
+  does not apply — it is the fill-or-kill guard.
+- **It has to be cancelled.** An order is retracted when the entry window that
+  authorised it closes, when the round ends, or on shutdown. There is no
+  configurable deadline, and the bot never re-prices a resting order.
+
+A limit order is also exempt from the venue's ~1.5 USDT market-order minimum,
+which is stated explicitly in the connector schema.
+
+### The price it posts at
+
+Nothing configures the limit price. It is computed each round by inverting the
+entry gates: the highest price at which `min_edge`, `min_edge_ratio` and
+`min_win_return` all still clear, capped by the entry band.
+
+That is deliberate. A price written into a profile stops agreeing with
+`min_edge` the first time `min_edge` is tuned, and nothing reports the
+disagreement — the bot simply starts bidding at a price its own gates would
+refuse.
+
+It also removes a choice that would otherwise need making. The reservation
+price sits below the ask when the market is priced fairly and above it when the
+market is priced wrong our way, so the same formula posts a passive bid in the
+first case and a marketable one in the second. There is no "aggressive or
+patient" setting because there is nothing left for it to decide.
+
+### Selling
+
+`exit_order_type` is `NONE` by default, which is what this bot has always done:
+hold to settlement, then redeem the winning token.
+
+Set to `LIMIT` or `MARKET`, the bot will sell a position back to the market
+before the round resolves — but only when the market overpays by the same edge
+the entry demanded. `exit_trigger` picks how: `RESTING` posts the offer when
+the entry fills and lets the venue wait; `POLLED` watches the bid and sends
+only once it crosses. `RESTING` with `MARKET` is refused at startup, because a
+market order cannot rest.
+
+A sold position never settles and is never redeemed — the shares are gone. Its
+journal row closes from the sale proceeds and is marked `sold`, and
+`--calibration-report` **excludes sold trades from its price buckets**. Those
+buckets ask whether the price paid predicted the outcome, and a trade closed
+before the outcome existed has no answer to give. They are reported separately
+instead.
+
+### What this costs
+
+A resting bid fills when someone is willing to sell into it, and that
+correlates with the market moving against it. The edge here is measured against
+the model, not against the fill, so a maker strategy can show a good edge and a
+bad P&L at once. The journal records `order_type` on every trade, so
+`--calibration-report` can be asked whether limit fills calibrate differently
+from market fills. Until that data exists this is an open question, not a
+claim.
 
 ## 7. Risk controls
 
