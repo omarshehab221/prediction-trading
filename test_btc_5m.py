@@ -3722,6 +3722,7 @@ class TestPeriodicReport(unittest.TestCase):
             self.assertTrue(any(r.startswith("| ") for r in records),
                             "no calibration report emitted by _settle_open")
         finally:
+            _close_journals()
             os.unlink(db)
 
     def test_report_not_logged_when_disabled(self):
@@ -3757,6 +3758,7 @@ class TestPeriodicReport(unittest.TestCase):
                 m.LOG.setLevel(previous)
             self.assertFalse(any(r.startswith("| ") for r in records))
         finally:
+            _close_journals()
             os.unlink(db)
 
 
@@ -5552,6 +5554,7 @@ class TestBalanceReconciliation(unittest.TestCase):
                 m.LOG.removeHandler(handler); m.LOG.setLevel(prev)
             self.assertTrue(any("RECONCILE MISMATCH" in r for r in records))
         finally:
+            _close_journals()
             os.unlink(db)
 
     def test_a_settlement_mismatch_is_reported_and_not_booked(self):
@@ -5579,6 +5582,7 @@ class TestBalanceReconciliation(unittest.TestCase):
             self.assertAlmostEqual(
                 t._account_risk.pnl_correction, 0.0, places=9)
         finally:
+            _close_journals()
             os.unlink(db)
 
     def test_an_uncredited_win_is_never_charged_its_own_payout(self):
@@ -5611,6 +5615,7 @@ class TestBalanceReconciliation(unittest.TestCase):
             self.assertAlmostEqual(
                 t._account_risk.pnl_correction, 0.0, places=9)
         finally:
+            _close_journals()
             os.unlink(db)
 
     def test_a_settlement_that_agrees_corrects_nothing(self):
@@ -5629,6 +5634,7 @@ class TestBalanceReconciliation(unittest.TestCase):
             self.assertAlmostEqual(
                 t._risk_for(rnd.symbol).pnl_correction, 0.0, places=9)
         finally:
+            _close_journals()
             os.unlink(db)
 
     def test_an_uncredited_win_corrects_nothing_yet(self):
@@ -5654,6 +5660,7 @@ class TestBalanceReconciliation(unittest.TestCase):
             self.assertAlmostEqual(
                 t._risk_for(rnd.symbol).pnl_correction, 0.0, places=9)
         finally:
+            _close_journals()
             os.unlink(db)
 
     def test_reconcile_is_quiet_when_it_agrees(self):
@@ -5679,6 +5686,7 @@ class TestBalanceReconciliation(unittest.TestCase):
                 m.LOG.removeHandler(handler); m.LOG.setLevel(prev)
             self.assertFalse(any("MISMATCH" in r for r in records))
         finally:
+            _close_journals()
             os.unlink(db)
 
 
@@ -6397,6 +6405,100 @@ class TestPaperRestingOrders(unittest.TestCase):
         self.assertTrue(next(iter(t._pending)).startswith("paper-"))
 
 
+class TestLimitExits(unittest.TestCase):
+    """Selling is the only way out that does not wait for the oracle."""
+
+    def tearDown(self):
+        _close_journals(self)
+
+    def _trader(self, **overrides):
+        t = make_trader(live=False, **overrides)
+        rnd = make_round()
+        t._client.now_ms = lambda: rnd.end_ms - 120_000
+        t._market_data.spot = lambda symbol: 100_000.0
+        return t
+
+    @staticmethod
+    def _fills(trader, state):
+        """Script what the paper book reports for the resting sell."""
+        trader._paper_book.order_state = lambda oid: state
+
+    def test_no_exit_is_posted_when_exits_are_off(self):
+        t = self._trader(exit_order_type="NONE")
+        t._positions[("BTCUSDT", Side.UP)] = make_position()
+        t._maybe_exit_all()
+        self.assertEqual(t._pending, {})
+
+    def test_a_resting_exit_is_posted_once_the_position_exists(self):
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
+        t._positions[("BTCUSDT", Side.UP)] = make_position()
+        t._maybe_exit_all()
+        self.assertEqual(len(t._pending), 1)
+        pending = next(iter(t._pending.values()))
+        self.assertIs(pending.plan.action, m.Action.SELL)
+        self.assertIs(pending.plan.order_type, m.OrderType.LIMIT)
+
+    def test_a_resting_exit_is_posted_only_once(self):
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
+        t._positions[("BTCUSDT", Side.UP)] = make_position()
+        t._maybe_exit_all()
+        t._maybe_exit_all()
+        self.assertEqual(len(t._pending), 1)
+
+    def test_a_polled_exit_waits_for_the_bid_to_cross(self):
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="POLLED")
+        t._positions[("BTCUSDT", Side.UP)] = make_position()
+        t._market_data.bids = lambda rnd, side: [(0.01, 100.0)]
+        t._maybe_exit_all()
+        self.assertEqual(t._pending, {})
+        t._market_data.bids = lambda rnd, side: [(0.99, 100.0)]
+        t._maybe_exit_all()
+        self.assertEqual(len(t._pending), 1)
+
+    def test_a_filled_sell_closes_the_row_from_its_proceeds(self):
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
+        tid = t._journal.record("PAPER", make_round(), make_signal(), 100.0,
+                                0.5, 50.0, "o1")
+        pos = make_position(committed=5.0, trade_id=tid)
+        t._positions[("BTCUSDT", Side.UP)] = pos
+        t._maybe_exit_all()
+        shares = pos.committed_usdt / pos.signal.fill_price
+        self._fills(t, m.OrderState("FILLED", 6.0, shares, 0.60))
+        t._reap_pending()
+        self.assertEqual(t._positions, {})
+        row = t._journal._conn.execute(
+            "SELECT pnl, settle_source FROM trades WHERE id=?",
+            (tid,)).fetchone()
+        self.assertAlmostEqual(row[0], 1.0)
+        self.assertEqual(row[1], "sold")
+
+    def test_a_partial_sell_leaves_the_remainder_to_settle(self):
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
+        tid = t._journal.record("PAPER", make_round(), make_signal(), 100.0,
+                                0.5, 50.0, "o1")
+        pos = make_position(committed=5.0, trade_id=tid)
+        t._positions[("BTCUSDT", Side.UP)] = pos
+        t._maybe_exit_all()
+        shares = 0.4 * pos.committed_usdt / pos.signal.fill_price
+        self._fills(t, m.OrderState("PARTIAL", 2.0, shares, 0.60))
+        t._reap_pending()
+        remaining = t._positions[("BTCUSDT", Side.UP)]
+        self.assertAlmostEqual(remaining.committed_usdt, 3.0)
+
+    def test_selling_more_than_is_held_is_refused(self):
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
+        tid = t._journal.record("PAPER", make_round(), make_signal(), 100.0,
+                                0.5, 50.0, "o1")
+        t._positions[("BTCUSDT", Side.UP)] = make_position(committed=5.0,
+                                                           trade_id=tid)
+        t._maybe_exit_all()
+        self._fills(t, m.OrderState("FILLED", 99.0, 200.0, 0.60))
+        with self.assertLogs("btc5m", level="ERROR"):
+            t._reap_pending()
+        self.assertIn(("BTCUSDT", Side.UP), t._positions,
+                      "an impossible sale was netted instead of refused")
+
+
 class TestReturnFloor(unittest.TestCase):
     """
     A win must be large enough to be worth the loss it risks. Enforced
@@ -6839,6 +6941,7 @@ class TestTrendBoost(unittest.TestCase):
                 "SELECT trend_z FROM trades WHERE id=?", (tid,)).fetchone()
             self.assertAlmostEqual(row[0], 2.5)
         finally:
+            _close_journals()
             os.unlink(db)
 
     def test_the_prefilter_does_not_drop_early_rounds(self):

@@ -5464,6 +5464,7 @@ class Trader:
                     # position before its round is allowed to settle, or the
                     # position settles as though it had never been opened.
                     self._reap_pending()
+                    self._maybe_exit_all()
                     self._settle_open()
                     # Driven from the loop, not from _maybe_enter: that
                     # returns early while a position is open, and the rounds
@@ -5852,6 +5853,143 @@ class Trader:
                  rnd.slug, sig.side.value, price, sig.model_prob,
                  sig.stake_usdt, sig.seconds_left)
         return True
+
+    def _maybe_exit_all(self) -> None:
+        """Consider leaving each open position before the round decides it."""
+        if self._cfg.exit_order_type == "NONE":
+            return
+        offered = {(p.rnd.topic_id, p.plan.side)
+                   for p in self._pending.values()
+                   if p.plan.action is Action.SELL}
+        for pos in list(self._positions.values()):
+            if (pos.rnd.topic_id, pos.signal.side) in offered:
+                continue                  # already offered; do not stack
+            self._post_exit(pos)
+
+    def _model_prob(self, pos: Position) -> float | None:
+        """
+        The model's current probability for the side this position holds.
+
+        Follows _maybe_scale_in exactly, including the clamped-sigma refusal:
+        an overstated sigma inflates the tail probabilities, and pricing an
+        EXIT off an inflated probability holds out for a price the model only
+        believes because its volatility estimate is broken.
+        """
+        if pos.rnd.strike is None:
+            return None
+        symbol = self._client.market_symbol(pos.rnd.feed_symbol)
+        secs = pos.rnd.seconds_remaining(self._client.now_ms())
+        if secs <= 0:
+            return None
+        try:
+            spot = self._market_data.spot(symbol)
+            sigma = self._vol.sigma_annual(symbol)
+        except (ApiError, requests.RequestException) as exc:
+            LOG.debug("%s: cannot price an exit yet: %s", pos.rnd.slug, exc)
+            return None
+        if self._cfg.halt_on_clamped_sigma and self._vol.is_clamped(symbol):
+            return None
+        tail_df = self._vol.tail_df(symbol)
+        p_up = digital_up_probability(spot, pos.rnd.strike, sigma, secs,
+                                      tail_df)
+        return p_up if pos.signal.side is Side.UP else 1.0 - p_up
+
+    def _post_exit(self, pos: Position) -> bool:
+        """
+        Offer this position back to the market. True if an order went out.
+
+        The bar is the sell reservation price: the market must overpay by the
+        same edge the entry demanded. Selling for less than the position is
+        worth to the model is not an exit, it is a loss taken voluntarily.
+        """
+        prob = self._model_prob(pos)
+        if prob is None:
+            return False
+        target = sell_reservation_price(prob, self._cfg, pos.rnd.fee_bps)
+        if target is None:
+            return False
+
+        if self._cfg.exit_trigger == "POLLED":
+            bids = self._market_data.bids(pos.rnd, pos.signal.side)
+            if not bids or bids[0][0] < target:
+                return False
+            # The bid is already there, so cross it rather than queue behind.
+            target = bids[0][0]
+        target = pos.rnd.round_price(target)
+        if not 0.0 < target < 1.0:
+            return False
+
+        shares = pos.committed_usdt / max(pos.signal.fill_price, EPS)
+        order_type = (OrderType.LIMIT if self._cfg.exit_order_type == "LIMIT"
+                      else OrderType.MARKET)
+        plan = OrderPlan(side=pos.signal.side, action=Action.SELL,
+                         order_type=order_type, amount=shares,
+                         price_limit=(target if order_type is OrderType.LIMIT
+                                      else None))
+        if self._live:
+            try:
+                quote = self._client.get_quote(pos.rnd, plan)
+                order_id = self._client.place_order(pos.rnd, quote)
+            except (ApiError, requests.RequestException) as exc:
+                LOG.warning("%s: exit rejected: %s", pos.rnd.slug, exc)
+                return False
+        else:
+            order_id = self._paper_book.place(plan, pos.rnd)
+        self._pending[str(order_id)] = PendingOrder(
+            order_id=str(order_id), rnd=pos.rnd, plan=plan,
+            signal=pos.signal, expires_at_ms=pos.rnd.end_ms,
+            filled_usdt=0.0, filled_shares=0.0, trade_id=pos.trade_id)
+        LOG.info("OFFER %s %s | %.4f shares at %.4f (entry %.4f)",
+                 pos.rnd.slug, pos.signal.side.value, shares, target,
+                 pos.signal.fill_price)
+        return True
+
+    def _book_sale(self, order_id: str, pending: PendingOrder,
+                   state: OrderState) -> PendingOrder:
+        """
+        Reduce or close a position that has been sold back to the market.
+
+        A sold position never reaches settled_outcome and is never redeemed:
+        there is no winning token to claim, because the shares are gone. The
+        journal row therefore closes from PROCEEDS, and settle_source records
+        which kind of ending it was so the calibration buckets can exclude it.
+        """
+        new_usdt = state.filled_usdt - pending.filled_usdt
+        if new_usdt <= EPS:
+            return pending
+        key = (pending.rnd.symbol, pending.plan.side)
+        pos = self._positions.get(key)
+        if pos is None:
+            LOG.error("%s: a sale filled for %.4f USDT with no position on "
+                      "record; the shares are gone and nothing tracked them",
+                      pending.rnd.slug, new_usdt)
+            return replace(pending, filled_usdt=state.filled_usdt,
+                           filled_shares=state.filled_shares)
+        price = state.price or pending.plan.price_limit or 0.0
+        sold_cost = state.filled_shares * pos.signal.fill_price
+        if sold_cost > pos.committed_usdt + EPS:
+            # Impossible: more shares came back than the position ever held.
+            # Netting it silently would report a profit made from nothing.
+            LOG.error("%s: sale of %.4f shares exceeds the %.4f USDT held; "
+                      "refusing to net it", pending.rnd.slug,
+                      state.filled_shares, pos.committed_usdt)
+            return replace(pending, filled_usdt=state.filled_usdt,
+                           filled_shares=state.filled_shares)
+        remaining = pos.committed_usdt - sold_cost
+        if remaining <= EPS:
+            self._journal.resolve_sold(pos.trade_id, state.filled_usdt,
+                                       price, order_id, pos.committed_usdt)
+            self._positions.pop(key, None)
+            LOG.info("SOLD %s %s | %.4f USDT at %.4f (entry %.4f)",
+                     pending.rnd.slug, pending.plan.side.value,
+                     state.filled_usdt, price, pos.signal.fill_price)
+        else:
+            self._positions[key] = replace(pos, committed_usdt=remaining)
+            LOG.info("%s: sold %.4f of %.4f USDT at %.4f; %.4f left to settle",
+                     pending.rnd.slug, sold_cost, pos.committed_usdt, price,
+                     remaining)
+        return replace(pending, filled_usdt=state.filled_usdt,
+                       filled_shares=state.filled_shares)
 
     def _completion_is_worth_waiting_out(self, raw: Round, be_open: float,
                                          be_other: float,
