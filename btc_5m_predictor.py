@@ -1702,7 +1702,6 @@ class Quote:
     action: Action = Action.BUY
     order_type: OrderType = OrderType.MARKET
     price_limit: float | None = None
-    amount_in: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -1832,6 +1831,44 @@ class Position:
         shares = (self.committed_usdt / self.signal.fill_price
                   + extra_stake / extra_price)
         return total / shares if shares > 0 else extra_price
+
+
+@dataclass(frozen=True)
+class PendingOrder:
+    """
+    A limit order the venue has accepted and not yet finished with.
+
+    The bot has never had to hold this state. A MARKET FOK order is resolved
+    by the time place_order returns -- filled or killed -- so an order and a
+    position were the same thing. A GTC order can sit on the book for
+    minutes, fill in pieces, and still be live when the round ends.
+
+    expires_at_ms is set when the order is POSTED, from whichever window
+    authorised it. The straddle and last-minute strategies run their own
+    windows, and an order must expire against the rule that let it exist --
+    recomputing an expiry later from a global setting would apply the model
+    profile's window to an order the last-minute rule placed.
+    """
+
+    order_id: str
+    rnd: Round
+    plan: OrderPlan
+    # The signal this order was posted on. Carried rather than recomputed:
+    # by the time a fill arrives the round has moved, and rebuilding the
+    # signal then would journal the model's opinion at settlement rather
+    # than the opinion the trade was actually taken on.
+    signal: Signal
+    expires_at_ms: int
+    filled_usdt: float
+    filled_shares: float
+    trade_id: int | None
+
+    @property
+    def fill_price(self) -> float:
+        """Blended price actually paid so far, or the price we asked for."""
+        if self.filled_shares > 0:
+            return self.filled_usdt / self.filled_shares
+        return self.plan.price_limit or 0.0
 
 
 @dataclass(frozen=True)
@@ -3677,8 +3714,7 @@ class PredictionClient:
             fee_usdt=0.0 if fee_raw is None else float(from_wei(fee_raw)),
             action=plan.action,
             order_type=plan.order_type,
-            price_limit=plan.price_limit,
-            amount_in=plan.amount)
+            price_limit=plan.price_limit)
 
     def discover_min_stake(self, rnd: Round, side: Side,
                            low: float = 0.25, high: float | None = None,
@@ -4854,6 +4890,98 @@ def straddle_completion_stake(stake_open: float, price_open: float,
 # --------------------------------------------------------------------------
 
 
+class PaperBook:
+    """
+    A simulated venue for resting orders, so paper mode tests the real thing.
+
+    Paper mode used to be trivial because a MARKET FOK order either fills at
+    the quoted price or does not exist. A GTC order has a life: it rests, it
+    fills in pieces as depth appears, and it has to be cancelled. Simulating
+    that as an instant full fill would make paper a market order wearing a
+    different name, and it would report a fill rate the live bot can never
+    reach -- which is worse than not testing it, because it looks like
+    evidence.
+
+    Fills are read off the same ladders the live path prices against: a BUY
+    fills against asks at or below its limit, a SELL against bids at or above
+    it, and only for the depth actually shown. No queue position is modelled;
+    that would be a claim about the venue's matching engine that nothing here
+    can check.
+
+    order_state and cancel_orders are named exactly as PredictionClient's, so
+    the reaper has one body and paper cannot drift into a shortcut through
+    the lifecycle it exists to exercise.
+    """
+
+    def __init__(self, market_data) -> None:
+        self._market_data = market_data
+        self._orders: dict[str, tuple[OrderPlan, Round, bool]] = {}
+        self._counter = itertools.count(1)
+
+    def place(self, plan: OrderPlan, rnd: Round) -> str:
+        order_id = f"paper-{next(self._counter)}"
+        self._orders[order_id] = (plan, rnd, False)
+        return order_id
+
+    def cancel_orders(self, order_ids: list[str]
+                      ) -> tuple[list[str], dict[str, str]]:
+        cancelled = []
+        for order_id in order_ids:
+            entry = self._orders.get(order_id)
+            if entry is None:
+                continue
+            self._orders[order_id] = (entry[0], entry[1], True)
+            cancelled.append(order_id)
+        return cancelled, {}
+
+    def order_state(self, order_id: str) -> OrderState | None:
+        entry = self._orders.get(order_id)
+        if entry is None:
+            return None
+        plan, rnd, cancelled = entry
+        shares, usdt, price = self._matched(plan, rnd)
+        if cancelled:
+            # Terminal, and still holding whatever filled before the cancel.
+            return OrderState("DEAD", usdt, shares, price)
+        if plan.action is Action.BUY:
+            done = usdt >= plan.amount - EPS
+        else:
+            done = shares >= plan.amount - EPS
+        if done:
+            return OrderState("FILLED", usdt, shares, price)
+        if usdt > 0:
+            return OrderState("PARTIAL", usdt, shares, price)
+        return OrderState("RESTING", 0.0, 0.0, None)
+
+    def _matched(self, plan: OrderPlan,
+                 rnd: Round) -> tuple[float, float, float | None]:
+        """(shares, usdt, average price) this order would have taken by now."""
+        limit = plan.price_limit
+        if limit is None:
+            return 0.0, 0.0, None
+        if plan.action is Action.BUY:
+            levels = self._market_data.asks(rnd, plan.side) or []
+            crossing = [(pr, sz) for pr, sz in levels if pr <= limit + EPS]
+            shares, spent = 0.0, 0.0
+            for price, size in crossing:
+                take = min(size, (plan.amount - spent) / price)
+                if take <= 0:
+                    break
+                shares += take
+                spent += take * price
+            return shares, spent, (spent / shares if shares > 0 else None)
+        levels = self._market_data.bids(rnd, plan.side) or []
+        crossing = [(pr, sz) for pr, sz in levels if pr >= limit - EPS]
+        shares, proceeds = 0.0, 0.0
+        for price, size in crossing:
+            take = min(size, plan.amount - shares)
+            if take <= 0:
+                break
+            shares += take
+            proceeds += take * price
+        return shares, proceeds, (proceeds / shares if shares > 0 else None)
+
+
 class Trader:
     """
     The trading loop.
@@ -4880,6 +5008,9 @@ class Trader:
         self._market_data = ws_feeds.MarketData(
             self._client, self._store or self._static_cfg)
         self._vol = VolatilityEstimator(cfg, self._market_data)
+        # One seam for orders, so paper and live share the whole lifecycle
+        # rather than paper taking a shortcut through it.
+        self._paper_book = PaperBook(self._market_data)
         self._journal = Journal(config.db_path, config.profile_name)
         self._paper_bankroll = config.paper_start_bankroll
         # Per-symbol so one market's losing streak cannot gate another's
@@ -4902,6 +5033,11 @@ class Trader:
         # nothing for them, but it lets the straddle profile hold BOTH
         # sides of the same symbol/round as two independent entries.
         self._positions: dict[tuple[str, Side], Position] = {}
+        # order_id -> the resting order behind it. Separate from _positions
+        # because an order is not a position until something fills: counting
+        # one as the other books a trade that may never happen, and not
+        # tracking it at all abandons one that did.
+        self._pending: dict[str, PendingOrder] = {}
         self._hydrated: dict[int, Round] = {}
         self._errors = 0
         # token_id -> (expected payout USDT, tx hashes). Counted toward the
@@ -4928,6 +5064,11 @@ class Trader:
     @property
     def _cfg(self) -> Config:
         return self._static_cfg if self._store is None else self._store.current
+
+    @property
+    def _orders(self):
+        """The venue in live mode, the simulator in paper mode."""
+        return self._client if self._live else self._paper_book
 
     @property
     def _position(self) -> Position | None:
@@ -5319,6 +5460,10 @@ class Trader:
                     # every claim to confirmation on its own tight schedule,
                     # specifically so this loop never pauses on a chain
                     # confirmation before looking at the next round.
+                    # Before settlement, always. A fill has to become a
+                    # position before its round is allowed to settle, or the
+                    # position settles as though it had never been opened.
+                    self._reap_pending()
                     self._settle_open()
                     # Driven from the loop, not from _maybe_enter: that
                     # returns early while a position is open, and the rounds
@@ -5537,6 +5682,176 @@ class Trader:
                 LOG.debug("%s %s fee %.4f USDT", raw.slug,
                           side.value, quote.fee_usdt)
         return price, stake, order_id
+
+    def _cancel_all_pending(self) -> None:
+        """
+        Retract every resting order, then book whatever filled first.
+
+        Delegates the cancelling to the reaper rather than doing its own
+        pass. Cancelling here and then reaping sent every order to
+        batch-cancel twice, and a second cancel of an order that filled in
+        between reads as a fresh failure for a reason that no longer exists.
+        """
+        if not self._pending:
+            return
+        LOG.info("Cancelling %d resting order(s)", len(self._pending))
+        self._reap_pending(force_final=True)
+
+    def _reap_pending(self, force_final: bool = False) -> None:
+        """
+        Advance every resting order: book fills, retract what has run out.
+
+        Called at the top of the loop, before settlement, because a fill has
+        to become a position before its round settles.
+
+        The cancel is a request, not an answer. batch-cancel reports an order
+        under `failed` most often because it FILLED first, so nothing here
+        reads that list: after any cancel the order's state is read again and
+        whatever came back is booked. Treating a failed cancel as "still
+        resting" walks away from a real position, which then settles, wins,
+        and is never claimed because no journal row knows it exists.
+        """
+        if not self._pending:
+            return
+        now_ms = self._client.now_ms()
+        for pending in list(self._pending.values()):
+            # The order id travels ON the order rather than only as the dict
+            # key, so a helper that is handed a PendingOrder can name the
+            # order it is talking about without the caller passing it too.
+            order_id = pending.order_id
+            try:
+                state = self._orders.order_state(order_id)
+            except (ApiError, requests.RequestException) as exc:
+                LOG.warning("Could not read order %s: %s", order_id, exc)
+                continue
+            if state is None:
+                # The venue has no record yet. That is the absence of
+                # knowledge, not death: the order may well be live, and
+                # dropping it here strands it.
+                continue
+
+            pending = self._book_fill(order_id, pending, state)
+            if state.status in ("FILLED", "DEAD"):
+                self._pending.pop(order_id, None)
+                continue
+
+            expired = (now_ms >= pending.expires_at_ms
+                       or now_ms >= pending.rnd.end_ms
+                       or force_final)
+            if not expired:
+                continue
+
+            LOG.info("%s: retracting the %s order (%s)", pending.rnd.slug,
+                     pending.plan.side.value,
+                     "round over" if now_ms >= pending.rnd.end_ms
+                     else "entry window closed")
+            try:
+                self._orders.cancel_orders([order_id])
+            except (ApiError, requests.RequestException) as exc:
+                LOG.error("Cancel failed for %s: %s", order_id, exc)
+                continue
+            try:
+                final = self._orders.order_state(order_id)
+            except (ApiError, requests.RequestException) as exc:
+                LOG.error("Could not re-read %s after cancel: %s",
+                          order_id, exc)
+                continue
+            if final is not None:
+                self._book_fill(order_id, pending, final)
+            self._pending.pop(order_id, None)
+
+    def _book_fill(self, order_id: str, pending: PendingOrder,
+                   state: OrderState) -> PendingOrder:
+        """
+        Record whatever this order has filled that is not recorded yet.
+
+        min_fill_fraction is deliberately not consulted. It is the FOK guard,
+        where a short fill means something went wrong; on a GTC order a short
+        fill is the ordinary outcome, and refusing it strands shares the
+        account already holds. Any non-zero fill becomes a position.
+        """
+        if pending.plan.action is Action.SELL:
+            return self._book_sale(order_id, pending, state)
+        new_usdt = state.filled_usdt - pending.filled_usdt
+        if new_usdt <= EPS:
+            return pending
+        price = (state.price or pending.fill_price
+                 or pending.plan.price_limit or 0.0)
+        key = (pending.rnd.symbol, pending.plan.side)
+        existing = self._positions.get(key)
+        trade_id = pending.trade_id
+        if existing is None:
+            sig = replace(pending.signal, stake_usdt=state.filled_usdt,
+                          fill_price=price)
+            if trade_id is None:
+                trade_id = self._journal.record(
+                    "LIVE" if self._live else "PAPER", pending.rnd, sig,
+                    self._market_data.spot(pending.rnd.symbol),
+                    self._vol.sigma_annual(pending.rnd.symbol),
+                    self._bankroll(), order_id,
+                    order_type=pending.plan.order_type.value,
+                    price_limit=pending.plan.price_limit)
+            self._positions[key] = Position(trade_id, pending.rnd, sig,
+                                            state.filled_usdt, 1)
+        else:
+            blended = existing.average_price(new_usdt, price)
+            self._positions[key] = replace(
+                existing,
+                signal=replace(existing.signal, fill_price=blended,
+                               stake_usdt=state.filled_usdt),
+                committed_usdt=state.filled_usdt,
+                tranches=existing.tranches + 1)
+            trade_id = existing.trade_id
+        LOG.info("%s: %s order filled %.4f USDT at %.4f (%.4f of %.4f)",
+                 pending.rnd.slug, pending.plan.side.value, new_usdt, price,
+                 state.filled_usdt, pending.plan.amount)
+        updated = replace(pending, filled_usdt=state.filled_usdt,
+                          filled_shares=state.filled_shares,
+                          trade_id=trade_id)
+        self._pending[order_id] = updated
+        return updated
+
+    def _post_limit_entry(self, rnd: Round, sig: Signal, spot: float,
+                          sigma: float, bankroll: float, mode: str,
+                          expires_at_ms: int) -> bool:
+        """
+        Post a resting bid at the model's reservation price. True if accepted.
+
+        No position is recorded here. The order is on the book and nothing has
+        filled; recording one now books a trade that may never happen, which
+        then "settles" and reports a result that was never real.
+        """
+        price = buy_reservation_price(sig.model_prob, self._cfg, rnd.fee_bps)
+        if price is None:
+            LOG.info("%s: no price in the band clears the gates; not posting",
+                     rnd.slug)
+            return False
+        price = rnd.round_price(price)
+        if not 0.0 < price < 1.0:
+            return False
+        plan = OrderPlan(side=sig.side, action=Action.BUY,
+                         order_type=OrderType.LIMIT, amount=sig.stake_usdt,
+                         price_limit=price)
+        if self._live:
+            try:
+                quote = self._client.get_quote(rnd, plan)
+                order_id = self._client.place_order(rnd, quote,
+                                                    sig.stake_usdt)
+            except (OrderNotFilled, ApiError,
+                    requests.RequestException) as exc:
+                LOG.warning("%s: limit entry rejected: %s", rnd.slug, exc)
+                return False
+        else:
+            order_id = self._paper_book.place(plan, rnd)
+        self._pending[str(order_id)] = PendingOrder(
+            order_id=str(order_id), rnd=rnd, plan=plan,
+            signal=replace(sig, fill_price=price),
+            expires_at_ms=expires_at_ms,
+            filled_usdt=0.0, filled_shares=0.0, trade_id=None)
+        LOG.info("POST %s %s | limit %.4f model %.3f stake %.2f (%.0fs left)",
+                 rnd.slug, sig.side.value, price, sig.model_prob,
+                 sig.stake_usdt, sig.seconds_left)
+        return True
 
     def _completion_is_worth_waiting_out(self, raw: Round, be_open: float,
                                          be_other: float,
@@ -6091,6 +6406,20 @@ class Trader:
                 first = max(sig.stake_usdt * self._cfg.scale_in_initial_pct,
                             self._cfg.min_stake_usdt)
                 sig = replace(sig, stake_usdt=min(first, sig.stake_usdt))
+
+            if self._cfg.entry_order_type == "LIMIT":
+                # Expiry is fixed here, from the window that authorised THIS
+                # order, so a later config change or a different strategy's
+                # window cannot retroactively extend or shorten it.
+                window_end_ms = rnd.end_ms - int(
+                    self._cfg.entry_window_end_s * 1000)
+                if self._post_limit_entry(rnd, sig, spot, sigma, bankroll,
+                                          mode, window_end_ms):
+                    self._seen[rnd.topic_id] = rnd.end_ms
+                    available -= sig.stake_usdt
+                    if available < self._cfg.min_stake_usdt:
+                        return
+                continue
 
             order_id = None
             if self._live:
@@ -6777,6 +7106,12 @@ class Trader:
             pos.rnd.slug, expected_move, actual, drift, expected_pnl)
 
     def _drain(self, timeout_s: float | None = None) -> None:
+        # Cancel first, then wait. A resting order left behind on shutdown is
+        # live money with nothing tracking it: the process that placed it is
+        # gone, so nothing will settle it, claim it, or even record that it
+        # exists. Render sends SIGTERM on every deploy, so this is the
+        # ordinary path and not the exceptional one.
+        self._cancel_all_pending()
         deadline = time.time() + (timeout_s if timeout_s is not None
                                   else self._cfg.drain_timeout_s)
         while self._positions and time.time() < deadline:

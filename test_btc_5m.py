@@ -185,6 +185,39 @@ def make_signal(**kw) -> Signal:
     return Signal(**base)
 
 
+def make_trader(**overrides):
+    """A Trader wired to FakeClient, with no feeds and no network."""
+    fd, path = tempfile.mkstemp(suffix=".db"); os.close(fd)
+    base = dict(live=True, db_path=path, ws_enabled=False)
+    base.update(overrides)
+    c = cfg(**base)
+    rnd = make_round()
+    client = FakeClient([rnd], [(rnd.end_ms - 120_000, 100_000.0)], {}, {})
+    client.cancel_orders = lambda ids: (list(ids), {})
+    client.order_state = lambda oid: None
+    t = build_trader(client, c, path)
+    t._paper_book = m.PaperBook(t._market_data)
+    return t
+
+
+def make_pending(order_id, *, expires_in_ms, amount=5.0, round_ended=False,
+                 action=None, price_limit=0.40, trade_id=None):
+    rnd = make_round()
+    now = rnd.end_ms if round_ended else rnd.end_ms - 120_000
+    return m.PendingOrder(
+        order_id=order_id, rnd=rnd,
+        plan=m.OrderPlan(side=Side.UP, action=action or m.Action.BUY,
+                         order_type=m.OrderType.LIMIT, amount=amount,
+                         price_limit=price_limit),
+        signal=make_signal(),
+        expires_at_ms=now + expires_in_ms,
+        filled_usdt=0.0, filled_shares=0.0, trade_id=trade_id)
+
+
+def make_position(committed=5.0, trade_id=1):
+    return Position(trade_id, make_round(), make_signal(), committed, 1)
+
+
 def make_round(**kw) -> Round:
     base = dict(topic_id=1, market_id=9, vendor="PREDICT_FUN", slug="btc-5m",
                 symbol="BTCUSDT",
@@ -970,7 +1003,7 @@ class FakeClient:
     def get_quote(self, rnd, plan):
         return m.Quote("q1", 0.51, plan.amount / 0.51, 0.001, 0.0,
                        action=plan.action, order_type=plan.order_type,
-                       price_limit=plan.price_limit, amount_in=plan.amount)
+                       price_limit=plan.price_limit)
 
     def batch_redeem(self, token_ids, chain_id="56"):
         self.redeemed.extend(token_ids)
@@ -4040,6 +4073,7 @@ class TestMainEntryPoint(unittest.TestCase):
         os.environ["BINANCE_API_SECRET"] = "s"
 
     def tearDown(self):
+        _close_journals(self)
         os.environ.clear(); os.environ.update(self._env)
         if os.path.exists(self.db):
             os.unlink(self.db)
@@ -4125,6 +4159,7 @@ class TestConfigFile(unittest.TestCase):
         os.unlink(self.path)
 
     def tearDown(self):
+        _close_journals(self)
         if os.path.exists(self.path):
             os.unlink(self.path)
 
@@ -4234,6 +4269,7 @@ class TestHotReload(unittest.TestCase):
                                    profile="buffer")
 
     def tearDown(self):
+        _close_journals(self)
         os.unlink(self.path)
 
     def _save(self, doc):
@@ -4621,6 +4657,7 @@ class TestModeSwitching(unittest.TestCase):
         self._save(doc)
 
     def tearDown(self):
+        _close_journals(self)
         for p in (self.db, self.path):
             if os.path.exists(p):
                 os.unlink(p)
@@ -4745,6 +4782,7 @@ class TestTradingModeEnv(unittest.TestCase):
         fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.environ.clear(); os.environ.update(self._env)
         os.unlink(self.db)
 
@@ -5938,13 +5976,11 @@ class TestLimitQuoting(unittest.TestCase):
         self.assertIs(q.order_type, m.OrderType.LIMIT)
         self.assertIs(q.action, m.Action.BUY)
         self.assertEqual(q.price_limit, 0.40)
-        self.assertEqual(q.amount_in, 5.0)
 
     def test_place_order_pairs_gtc_with_limit(self):
         c = self._client()
         q = m.Quote("q1", 0.40, 12.5, 0.0, 0.0, action=m.Action.BUY,
-                    order_type=m.OrderType.LIMIT, price_limit=0.40,
-                    amount_in=5.0)
+                    order_type=m.OrderType.LIMIT, price_limit=0.40)
         c.place_order(make_round(), q, 5.0)
         sent = dict(c.sent)["place_order"]
         self.assertEqual((sent["orderType"], sent["timeInForce"]),
@@ -6137,6 +6173,143 @@ class TestMakerProfile(unittest.TestCase):
             self.assertIn(required, prof, required)
         c = Config(api_key="k", api_secret="s", **prof)
         self.assertGreaterEqual(c.daily_loss_limit_pct / c.max_stake_pct, 2.5)
+
+
+class TestPendingOrderLifecycle(unittest.TestCase):
+    """An order that is neither filled nor dead is a state, not an error."""
+
+    def tearDown(self):
+        _close_journals(self)
+
+    def _trader(self, states, **overrides):
+        t = make_trader(**overrides)
+        t._client.order_state = lambda oid: states.get(oid)
+        t.cancelled = []
+
+        def cancel(ids):
+            t.cancelled.extend(ids)
+            return list(ids), {}
+
+        t._client.cancel_orders = cancel
+        # The loop reads the clock; pin it two minutes before the round ends
+        # so "expired" is decided by the pending order, not by drift.
+        rnd = make_round()
+        t._client.now_ms = lambda: rnd.end_ms - 120_000
+        return t
+
+    def test_a_resting_order_survives_a_reap(self):
+        t = self._trader({"o1": m.OrderState("RESTING", 0.0, 0.0, None)})
+        t._pending["o1"] = make_pending("o1", expires_in_ms=60_000)
+        t._reap_pending()
+        self.assertIn("o1", t._pending)
+        self.assertEqual(t.cancelled, [])
+        self.assertEqual(t._positions, {})
+
+    def test_an_order_the_venue_has_never_heard_of_is_not_dropped(self):
+        """None means the history is lagging, not that the order died."""
+        t = self._trader({})
+        t._pending["o1"] = make_pending("o1", expires_in_ms=60_000)
+        t._reap_pending()
+        self.assertIn("o1", t._pending)
+
+    def test_a_filled_order_becomes_a_position_and_leaves_pending(self):
+        t = self._trader({"o1": m.OrderState("FILLED", 5.0, 12.5, 0.40)})
+        t._pending["o1"] = make_pending("o1", expires_in_ms=60_000)
+        t._reap_pending()
+        self.assertNotIn("o1", t._pending)
+        self.assertEqual(len(t._positions), 1)
+
+    def test_the_window_closing_cancels_the_order(self):
+        t = self._trader({"o1": m.OrderState("RESTING", 0.0, 0.0, None)})
+        t._pending["o1"] = make_pending("o1", expires_in_ms=-1)
+        t._reap_pending()
+        self.assertEqual(t.cancelled, ["o1"])
+        self.assertNotIn("o1", t._pending)
+
+    def test_round_end_cancels_even_inside_the_window(self):
+        t = self._trader({"o1": m.OrderState("RESTING", 0.0, 0.0, None)})
+        rnd = make_round()
+        t._client.now_ms = lambda: rnd.end_ms + 1
+        t._pending["o1"] = make_pending("o1", expires_in_ms=999_999)
+        t._reap_pending()
+        self.assertEqual(t.cancelled, ["o1"])
+
+    def test_drain_cancels_everything_resting(self):
+        t = self._trader({"o1": m.OrderState("RESTING", 0.0, 0.0, None)})
+        t._pending["o1"] = make_pending("o1", expires_in_ms=60_000)
+        t._drain(timeout_s=0.0)
+        self.assertEqual(t.cancelled, ["o1"])
+
+
+class TestPartialFills(unittest.TestCase):
+    """A partial fill cannot be refused: the shares are already ours."""
+
+    def tearDown(self):
+        _close_journals(self)
+
+    def _trader(self, state_or_iter, **overrides):
+        t = make_trader(**overrides)
+        if callable(state_or_iter):
+            t._client.order_state = state_or_iter
+        else:
+            t._client.order_state = lambda oid: state_or_iter
+        t._client.cancel_orders = lambda ids: (list(ids), {})
+        rnd = make_round()
+        t._client.now_ms = lambda: rnd.end_ms - 120_000
+        return t
+
+    def test_a_partial_fill_is_recorded_at_its_real_size(self):
+        t = self._trader(m.OrderState("PARTIAL", 2.0, 5.0, 0.40))
+        t._pending["o1"] = make_pending("o1", expires_in_ms=60_000, amount=5.0)
+        t._reap_pending()
+        pos = next(iter(t._positions.values()))
+        self.assertAlmostEqual(pos.committed_usdt, 2.0)
+        self.assertAlmostEqual(pos.signal.fill_price, 0.40)
+
+    def test_min_fill_fraction_is_not_consulted_for_a_limit_order(self):
+        """
+        It is the FOK guard, where a short fill means something went wrong.
+        On a GTC order a short fill is the ordinary outcome, and refusing it
+        strands shares the account already holds.
+        """
+        t = self._trader(m.OrderState("PARTIAL", 0.5, 1.25, 0.40),
+                         min_fill_fraction=0.90)
+        t._pending["o1"] = make_pending("o1", expires_in_ms=60_000, amount=5.0)
+        t._reap_pending()
+        self.assertEqual(len(t._positions), 1)
+
+    def test_a_further_fill_extends_rather_than_duplicates(self):
+        fills = iter([m.OrderState("PARTIAL", 2.0, 5.0, 0.40),
+                      m.OrderState("FILLED", 5.0, 12.5, 0.40)])
+        t = self._trader(lambda oid: next(fills))
+        t._pending["o1"] = make_pending("o1", expires_in_ms=60_000, amount=5.0)
+        t._reap_pending()
+        t._reap_pending()
+        self.assertEqual(len(t._positions), 1)
+        pos = next(iter(t._positions.values()))
+        self.assertAlmostEqual(pos.committed_usdt, 5.0)
+
+
+class TestCancelRacesFill(unittest.TestCase):
+    """The usual reason a cancel fails is that the order filled first."""
+
+    def tearDown(self):
+        _close_journals(self)
+
+    def test_a_failed_cancel_whose_order_filled_becomes_a_position(self):
+        t = make_trader()
+        states = iter([m.OrderState("RESTING", 0.0, 0.0, None),
+                       m.OrderState("FILLED", 5.0, 12.5, 0.40)])
+        t._client.order_state = lambda oid: next(states)
+        t._client.cancel_orders = lambda ids: ([], {"o1": "already filled"})
+        rnd = make_round()
+        t._client.now_ms = lambda: rnd.end_ms - 120_000
+        t._pending["o1"] = make_pending("o1", expires_in_ms=-1, amount=5.0)
+        t._reap_pending()
+        self.assertEqual(len(t._positions), 1,
+                         "a filled order was abandoned because the cancel "
+                         "reported failure")
+        self.assertNotIn("o1", t._pending)
 
 
 class TestReturnFloor(unittest.TestCase):
@@ -7031,6 +7204,7 @@ class TestNewCliSurface(unittest.TestCase):
         fd, self.db = tempfile.mkstemp(suffix=".db"); os.close(fd)
 
     def tearDown(self):
+        _close_journals(self)
         os.environ.clear(); os.environ.update(self._env)
         os.unlink(self.db)
 
@@ -7106,6 +7280,7 @@ class TestLoopSurvivesUnexpectedFailures(unittest.TestCase):
         t._static_cfg = c
         t._store = None
         t._positions = {}
+        t._pending = {}
         t._unredeemed = {}
         # _unredeemed is written from the claim worker thread, so anything
         # reading it -- _outstanding, _bankroll -- takes this lock.
@@ -7415,7 +7590,7 @@ class QuotingClient(FakeClient):
         return m.Quote("q-" + plan.side.value, price, plan.amount / price,
                        0.001, 0.0, action=plan.action,
                        order_type=plan.order_type,
-                       price_limit=plan.price_limit, amount_in=plan.amount)
+                       price_limit=plan.price_limit)
 
     def place_order(self, rnd, quote, stake_usdt=None):
         if (self._fail_after is not None
@@ -8313,6 +8488,7 @@ class TestLastMinuteEntry(unittest.TestCase):
         self._built = []
 
     def tearDown(self):
+        _close_journals(self)
         # Windows refuses to unlink a file sqlite still holds open, and a
         # Journal outlives the Trader that made it. Closing here keeps a
         # tearDown failure from masking the assertion the test actually made.
