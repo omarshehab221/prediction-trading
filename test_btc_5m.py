@@ -58,6 +58,11 @@ def build_client(config=None, **attrs):
     return c
 
 
+# Empty-container constructors build_trader's reflection must recognise,
+# because ast.literal_eval refuses a call however harmless it is.
+_EMPTY_CONTAINERS = {"set()": set, "dict()": dict, "list()": list}
+
+
 def build_trader(client, config, db_path):
     """
     Construct a Trader without running __init__ (which does network I/O).
@@ -83,11 +88,21 @@ def build_trader(client, config, db_path):
         asks=lambda rnd, side: client.asks_for(rnd, side),
         bids=lambda rnd, side: getattr(client, "bids_for", lambda r, x: None)(
             rnd, side),
+        # Silent by default, which is what an unsubscribed futures feed
+        # answers -- so a test that does not set these up gets "no signal"
+        # rather than an AttributeError from a strategy it is not testing.
+        futures_mid=lambda symbol: None,
+        futures_move_bps=lambda symbol, lookback_ms: None,
+        futures_tick_age_ms=lambda symbol: None,
         track=lambda symbols: None,
         start=lambda: None,
         stop=lambda: None,
-        status=lambda: {"spot": "off", "book": "off"})
+        status=lambda: {"spot": "off", "book": "off", "futures": "off"})
     t._journal = Journal(db_path, getattr(config, "profile_name", "test"))
+    # The reflection below cannot evaluate PaperBook(self._market_data), so
+    # without this every paper order path arrives at a None and fails deep
+    # inside whatever placed it.
+    t._paper_book = m.PaperBook(t._market_data)
     t._paper_bankroll = config.paper_start_bankroll
     t._risk = {}
     t._account_risk = RiskManager(config, config.paper_start_bankroll)
@@ -130,6 +145,11 @@ def build_trader(client, config, db_path):
                 setattr(t, tgt.attr, expr == "True")
             elif expr == "None":
                 setattr(t, tgt.attr, None)
+            elif expr in _EMPTY_CONTAINERS:
+                # literal_eval cannot evaluate a call, so `set()` used to land
+                # in the fallback below and arrive as None -- which does not
+                # fail here, it fails much later at the first `|=` on it.
+                setattr(t, tgt.attr, _EMPTY_CONTAINERS[expr]())
             else:
                 try:
                     setattr(t, tgt.attr, _ast.literal_eval(expr))
@@ -6159,8 +6179,13 @@ class TestLimitConfig(unittest.TestCase):
         self.assertEqual(c.exit_order_type, "NONE")
 
     def test_every_existing_profile_still_sends_market_and_never_exits(self):
+        """
+        `scalp` is the one profile that leaves before settlement, and it
+        leaves through BRACKET rather than through the model-priced exit --
+        so it is excluded by name here and covered by TestScalpProfile.
+        """
         for name, prof in m.PROFILES.items():
-            if name == "maker":
+            if name == "scalp":
                 continue
             c = Config(api_key="k", api_secret="s", **prof)
             self.assertEqual(c.entry_order_type, "MARKET", name)
@@ -6195,26 +6220,77 @@ class TestLimitConfig(unittest.TestCase):
             self.assertIn(field, doc["defaults"], field)
 
 
-class TestMakerProfile(unittest.TestCase):
-    """The profile that actually uses limit entry."""
+class TestScalpProfile(unittest.TestCase):
+    """The futures-lead profile, and the shape it commits to."""
 
-    def test_maker_posts_limit_entries(self):
-        c = Config(api_key="k", api_secret="s", **m.PROFILES["maker"])
-        self.assertEqual(c.entry_order_type, "LIMIT")
+    def _c(self):
+        return Config(api_key="k", api_secret="s", **m.PROFILES["scalp"])
 
-    def test_maker_leaves_room_for_a_resting_order_to_fill(self):
-        """A window that closes immediately posts an order and cancels it."""
-        c = Config(api_key="k", api_secret="s", **m.PROFILES["maker"])
-        self.assertGreaterEqual(c.entry_window_start_s
-                                - c.entry_window_end_s, 120)
+    def test_it_takes_on_entry_and_rests_on_exit(self):
+        """
+        The premise is being early to a move the book has not priced, which
+        a resting bid cannot be: it fills when someone wants to sell into it.
+        """
+        c = self._c()
+        self.assertTrue(c.scalp)
+        self.assertEqual(c.entry_order_type, "MARKET")
+        self.assertEqual(c.exit_order_type, "BRACKET")
 
-    def test_maker_survives_the_shared_profile_checks(self):
-        prof = m.PROFILES["maker"]
+    def test_entries_stop_before_the_flatten_not_on_it(self):
+        """A scalp opened at the deadline would be closed the same instant."""
+        c = self._c()
+        self.assertGreater(c.entry_window_end_s, c.scalp_flatten_s)
+
+    def test_nothing_is_placed_inside_the_last_minute(self):
+        """The whole reason the profile stops early."""
+        c = self._c()
+        self.assertLessEqual(c.scalp_flatten_s, 60.0)
+
+    def test_the_bracket_is_the_five_percent_that_was_asked_for(self):
+        c = self._c()
+        self.assertAlmostEqual(c.scalp_take_profit_pct, 0.05)
+        self.assertAlmostEqual(c.scalp_stop_loss_pct, 0.05)
+
+    def test_the_stake_cap_and_the_scalp_stake_agree(self):
+        """
+        Two names for one number. Letting them drift would mean the shared
+        risk checks reason about a size this profile never commits.
+        """
+        c = self._c()
+        self.assertAlmostEqual(c.scalp_stake_pct, c.max_stake_pct)
+
+    def test_the_round_trip_ceiling_survives_a_full_day(self):
+        """
+        rounds_today counts round TRIPS here, so a per-round ceiling of 20
+        at twelve rounds an hour must not halt the bot before lunch.
+        """
+        c = self._c()
+        per_hour = c.scalp_max_entries_per_round * 12
+        self.assertGreaterEqual(c.max_rounds_per_day, per_hour * 8)
+
+    def test_it_survives_the_shared_profile_checks(self):
+        prof = m.PROFILES["scalp"]
         for required in ("paper_start_bankroll", "daily_loss_limit_pct",
                          "assumed_spread_pct"):
             self.assertIn(required, prof, required)
-        c = Config(api_key="k", api_secret="s", **prof)
+        c = self._c()
         self.assertGreaterEqual(c.daily_loss_limit_pct / c.max_stake_pct, 2.5)
+
+    def test_the_band_leaves_room_for_a_take_profit_to_exist(self):
+        """
+        At the top of the book a 5% gain prices above 1.00 and no bracket
+        fits, so the band has to stop below wherever that happens.
+        """
+        c = self._c()
+        self.assertIsNotNone(
+            m.bracket_prices(c.max_entry_price, 0, c.scalp_take_profit_pct,
+                             c.scalp_stop_loss_pct))
+
+    def test_no_other_profile_scalps(self):
+        for name, prof in m.PROFILES.items():
+            if name == "scalp":
+                continue
+            self.assertFalse(prof.get("scalp", False), name)
 
 
 class TestPendingOrderLifecycle(unittest.TestCase):
@@ -7584,7 +7660,7 @@ class TestLoopSurvivesUnexpectedFailures(unittest.TestCase):
             start=lambda: None,
             stop=lambda: None,
             track=lambda symbols: None,
-            status=lambda: {"spot": "off", "book": "off"})
+            status=lambda: {"spot": "off", "book": "off", "futures": "off"})
         t._bankroll = lambda: 1000.0
         t._install_signal_handlers = lambda: None
         t._settle_open = lambda: None
@@ -9110,6 +9186,907 @@ class TestLastMinuteEntry(unittest.TestCase):
         self.assertEqual(t._positions, {})
 
 
+def scalp_cfg(**kw) -> Config:
+    base = dict(api_key="k", api_secret="s", live=False,
+                **m.PROFILES["scalp"])
+    base.update(kw)
+    return Config(**base)
+
+
+class ScalpClient(FakeClient):
+    """
+    FakeClient with a bid side and distinguishable order ids.
+
+    The scalp path reads bids (the stop watches one, and a forced sale prices
+    through one) and places several orders per round, so ids that all come
+    back as "order-1" would make a resting take-profit and the sale that
+    replaces it indistinguishable.
+    """
+
+    def __init__(self, *args, **kw):
+        self.bids = kw.pop("bids", {})
+        super().__init__(*args, **kw)
+        self._next_id = 0
+        self.cancelled = []
+        self.states = {}
+
+    def bids_for(self, rnd, side):
+        return self.bids.get((rnd.topic_id, side))
+
+    def place_order(self, rnd, quote, stake_usdt=None):
+        self._next_id += 1
+        order_id = f"o{self._next_id}"
+        self.orders.append((order_id, quote.action, quote.average_price,
+                            quote.price_limit, stake_usdt))
+        return order_id
+
+    def cancel_orders(self, order_ids):
+        self.cancelled.extend(order_ids)
+        return list(order_ids), {}
+
+    def order_state(self, order_id):
+        return self.states.get(order_id)
+
+
+class TestBracketArithmetic(unittest.TestCase):
+    """
+    The two prices are P&L targets inverted, so the round trip must land on
+    exactly the numbers that were asked for.
+    """
+
+    def _pnl(self, stake, fill, exit_price, fee_bps):
+        shares = stake / fill
+        return shares * exit_price * (1 - fee_bps / 10_000.0) - stake
+
+    def test_the_round_trip_returns_exactly_the_target(self):
+        for fee in (0, 50, 200):
+            for fill in (0.20, 0.50, 0.75):
+                tp, stop = m.bracket_prices(fill, fee, 0.05, 0.05)
+                self.assertAlmostEqual(
+                    self._pnl(10.0, fill, tp, fee), 0.50, places=9,
+                    msg=f"fee={fee} fill={fill}")
+                self.assertAlmostEqual(
+                    self._pnl(10.0, fill, stop, fee), -0.50, places=9,
+                    msg=f"fee={fee} fill={fill}")
+
+    def test_a_zero_fee_bracket_is_symmetric_in_price(self):
+        tp, stop = m.bracket_prices(0.50, 0, 0.05, 0.05)
+        self.assertAlmostEqual(tp - 0.50, 0.50 - stop, places=12)
+
+    def test_the_fee_pushes_both_prices_up(self):
+        """
+        Which is what makes a bracket symmetric in money asymmetric in price
+        -- the target moves further away and the stop moves closer.
+        """
+        free_tp, free_stop = m.bracket_prices(0.50, 0, 0.05, 0.05)
+        paid_tp, paid_stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        self.assertGreater(paid_tp, free_tp)
+        self.assertGreater(paid_stop, free_stop)
+        self.assertGreater(paid_tp - 0.50, 0.50 - paid_stop)
+
+    def test_no_bracket_where_the_target_would_price_above_one(self):
+        """A contract cannot pay more than 1, so nobody is bidding there."""
+        self.assertIsNone(m.bracket_prices(0.95, 200, 0.05, 0.05))
+
+    def test_no_bracket_where_the_fee_exceeds_the_loss_being_capped(self):
+        """
+        The stop would sit at or above the fill, so the position is cut on
+        the tick it opens, for more than the loss it was meant to cap.
+        """
+        self.assertIsNone(m.bracket_prices(0.50, 600, 0.05, 0.05))
+
+    def test_an_untradable_fill_is_refused_rather_than_clamped(self):
+        for bad in (0.0, 1.0, -0.1, 1.5):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                m.bracket_prices(bad, 200, 0.05, 0.05)
+
+
+class TestSignalEdgeRequired(unittest.TestCase):
+    """The number that decides whether this profile can work at all."""
+
+    def test_a_free_market_asks_for_nothing_beyond_a_coin_flip(self):
+        self.assertAlmostEqual(m.signal_edge_required(0, 0.05, 0.05), 0.0,
+                               places=12)
+
+    def test_two_percent_asks_for_twenty_points(self):
+        self.assertAlmostEqual(m.signal_edge_required(200, 0.05, 0.05), 0.20,
+                               places=2)
+
+    def test_it_rises_with_the_fee(self):
+        previous = -1.0
+        for fee in (0, 25, 50, 100, 200, 300):
+            required = m.signal_edge_required(fee, 0.05, 0.05)
+            self.assertGreater(required, previous, f"fee={fee}")
+            previous = required
+
+    def test_a_fee_that_swallows_the_stop_has_no_answer(self):
+        self.assertIsNone(m.signal_edge_required(600, 0.05, 0.05))
+
+    def test_it_agrees_with_bracket_prices_about_what_is_tradable(self):
+        """
+        Two functions, one claim. A fee where one says "no bracket" and the
+        other quotes a number would let the gate pass a position that cannot
+        be bracketed.
+        """
+        for fee in (0, 100, 200, 400, 490, 500, 600, 900):
+            required = m.signal_edge_required(fee, 0.05, 0.05)
+            bracket = m.bracket_prices(0.30, fee, 0.05, 0.05)
+            self.assertEqual(required is None, bracket is None, f"fee={fee}")
+
+
+class TestScalpConfig(unittest.TestCase):
+
+    def test_the_profile_is_internally_valid(self):
+        scalp_cfg()                        # must not raise
+
+    def test_the_switch_is_off_everywhere_else(self):
+        self.assertFalse(cfg().scalp)
+
+    def test_it_cannot_run_alongside_another_entry_strategy(self):
+        for other in ("straddle", "last_minute"):
+            with self.assertRaises(ValueError, msg=other):
+                scalp_cfg(**{other: True})
+
+    def test_it_cannot_scale_in(self):
+        """A top-up moves the fill price the bracket was computed from."""
+        with self.assertRaises(ValueError):
+            scalp_cfg(scale_in=True)
+
+    def test_bracket_and_scalp_are_one_decision(self):
+        """Neither is allowed without the other, in both directions."""
+        with self.assertRaises(ValueError):
+            scalp_cfg(exit_order_type="LIMIT")
+        with self.assertRaises(ValueError):
+            cfg(exit_order_type="BRACKET")
+
+    def test_entries_must_stop_before_the_flatten_deadline(self):
+        with self.assertRaises(ValueError):
+            scalp_cfg(entry_window_end_s=60, scalp_flatten_s=60.0)
+        with self.assertRaises(ValueError):
+            scalp_cfg(entry_window_end_s=45, scalp_flatten_s=60.0)
+
+    def test_a_tick_must_be_able_to_span_the_window_it_is_measured_over(self):
+        with self.assertRaises(ValueError):
+            scalp_cfg(scalp_lookback_ms=3000.0, scalp_max_tick_age_ms=1000.0)
+
+    def test_bounds_on_the_new_numbers(self):
+        for field, bad in (("scalp_stake_pct", 0.0),
+                           ("scalp_stake_pct", 0.3),
+                           ("scalp_take_profit_pct", 0.0),
+                           ("scalp_take_profit_pct", 1.0),
+                           ("scalp_stop_loss_pct", 0.0),
+                           ("scalp_stop_loss_pct", 1.0),
+                           ("scalp_lookback_ms", 0.0),
+                           ("scalp_min_move_bps", 0.0),
+                           ("scalp_min_basis_bps", -1.0),
+                           ("scalp_max_tick_age_ms", 0.0),
+                           ("scalp_cooldown_s", -1.0),
+                           ("scalp_max_entries_per_round", 0),
+                           ("scalp_flatten_s", -1.0),
+                           ("scalp_max_edge_required", 0.5),
+                           ("scalp_max_edge_required", -0.1)):
+            with self.assertRaises(ValueError, msg=f"{field}={bad}"):
+                scalp_cfg(**{field: bad})
+
+    def test_the_generated_config_document_carries_the_new_fields(self):
+        doc = m.default_config_document()
+        for field in ("scalp", "scalp_stake_pct", "scalp_take_profit_pct",
+                      "scalp_stop_loss_pct", "scalp_flatten_s",
+                      "scalp_max_edge_required", "ws_futures_url"):
+            self.assertIn(field, doc["defaults"], field)
+        self.assertIn("scalp", doc["profiles"])
+
+
+class TestFuturesFeed(unittest.TestCase):
+    """The one feed with no REST fallback, and why that is not a gap."""
+
+    def _feed(self, **kw):
+        c = scalp_cfg(**kw)
+        return ws_feeds.FuturesFeed(client=None, cfg_source=c)
+
+    def _live(self, feed):
+        feed._conn.last_frame_ts = time.time()
+        return feed
+
+    @staticmethod
+    def _frame(symbol, bid, ask):
+        return json.dumps({"stream": f"{symbol.lower()}@bookTicker",
+                           "data": {"s": symbol, "b": str(bid),
+                                    "a": str(ask), "B": "1", "A": "1"}})
+
+    def test_a_book_ticker_frame_parses_to_a_mid(self):
+        parsed = ws_feeds.parse_futures_frame(
+            self._frame("BTCUSDT", 100_000.0, 100_002.0))
+        self.assertEqual(parsed, ("BTCUSDT", 100_000.0, 100_002.0))
+
+    def test_a_control_reply_is_not_a_tick(self):
+        self.assertIsNone(ws_feeds.parse_futures_frame(
+            json.dumps({"result": None, "id": 1})))
+
+    def test_a_crossed_or_empty_book_is_refused(self):
+        for bid, ask in ((0.0, 100.0), (100.0, 0.0), (100.0, 99.0)):
+            self.assertIsNone(ws_feeds.parse_futures_frame(
+                self._frame("BTCUSDT", bid, ask)), f"{bid}/{ask}")
+
+    def test_garbage_is_not_a_tick(self):
+        for raw in ("", "not json", "[]", json.dumps({"data": "x"})):
+            self.assertIsNone(ws_feeds.parse_futures_frame(raw))
+
+    def test_an_unhealthy_socket_answers_nothing_rather_than_stale_data(self):
+        feed = self._feed()
+        feed._on_frame(self._frame("BTCUSDT", 100_000.0, 100_002.0))
+        self.assertIsNone(feed.mid("BTCUSDT"))
+        self.assertIsNone(feed.move_bps("BTCUSDT", 1500.0))
+        self.assertIsNone(feed.tick_age_ms("BTCUSDT"))
+
+    def test_the_mid_is_the_midpoint(self):
+        feed = self._live(self._feed())
+        feed._on_frame(self._frame("BTCUSDT", 100_000.0, 100_002.0))
+        self.assertAlmostEqual(feed.mid("BTCUSDT"), 100_001.0)
+
+    def test_a_window_that_is_not_covered_yet_is_None_not_zero(self):
+        """
+        "No move" and "no data" must not read alike: one is a market with
+        nothing happening, the other is a feed that has just come up.
+        """
+        feed = self._live(self._feed())
+        feed._on_frame(self._frame("BTCUSDT", 100_000.0, 100_002.0))
+        self.assertIsNone(feed.move_bps("BTCUSDT", 1500.0))
+
+    def test_a_covered_window_measures_the_move(self):
+        feed = self._live(self._feed())
+        with self._lock_free(feed):
+            feed._ticks["BTCUSDT"] = ws_feeds.deque([
+                (1_000.0, 100_000.0), (2_600.0, 100_050.0)])
+        # 5 bps up over the window, and the older sample spans it.
+        self.assertAlmostEqual(feed.move_bps("BTCUSDT", 1500.0), 5.0, places=6)
+
+    def test_the_sign_is_the_direction(self):
+        feed = self._live(self._feed())
+        with self._lock_free(feed):
+            feed._ticks["BTCUSDT"] = ws_feeds.deque([
+                (1_000.0, 100_050.0), (2_600.0, 100_000.0)])
+        self.assertLess(feed.move_bps("BTCUSDT", 1500.0), 0.0)
+
+    def test_samples_older_than_the_window_are_dropped_but_one_is_kept(self):
+        """
+        The one behind the horizon is load-bearing: without it the oldest
+        sample drifts inside the window and every measurement shortens.
+        """
+        feed = self._feed()
+        ring = ws_feeds.deque([(0.0, 1.0), (1.0, 1.0), (2.0, 1.0),
+                               (100_000.0, 1.0)])
+        feed._trim(ring, 100_000.0)
+        self.assertEqual(len(ring), 2)
+        self.assertLess(ring[0][0], 100_000.0 - feed._window_ms())
+
+    def test_a_reconnect_throws_the_history_away(self):
+        """
+        A gap is not a thing to measure across: a move spanning it describes
+        a jump the perp never made in the time this thinks it did.
+        """
+        feed = self._live(self._feed())
+        feed._on_frame(self._frame("BTCUSDT", 100_000.0, 100_002.0))
+        feed._tracked = {"BTCUSDT"}
+        sent = []
+        feed._conn.send = lambda payload: sent.append(payload) or True
+        feed.on_reconnect(feed._conn)
+        self.assertEqual(feed._ticks, {})
+        self.assertIn("btcusdt@bookTicker", sent[0])
+        self.assertIn("SUBSCRIBE", sent[0])
+
+    def test_dropping_a_symbol_forgets_its_history(self):
+        feed = self._live(self._feed())
+        feed._conn.send = lambda payload: True
+        feed.track(["BTCUSDT"])
+        feed._on_frame(self._frame("BTCUSDT", 100_000.0, 100_002.0))
+        feed.track(["ETHUSDT"])
+        self.assertNotIn("BTCUSDT", feed._ticks)
+
+    @staticmethod
+    def _lock_free(feed):
+        """A no-op context manager: these tests mutate the ring directly."""
+        import contextlib
+        return contextlib.nullcontext()
+
+
+class TestScalpSignal(unittest.TestCase):
+    """Both conditions, or no trade."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self._built = []
+
+    def tearDown(self):
+        _close_journals(self)
+        for trader in self._built:
+            trader._journal._conn.close()
+        os.unlink(self.db)
+
+    def _trader(self, *, move=None, age=0.0, perp=None, spot=100_000.0,
+                **cfgkw):
+        rnd = make_round()
+        client = ScalpClient([rnd], [(rnd.end_ms - 200_000, spot)], {}, {})
+        t = build_trader(client, scalp_cfg(db_path=self.db, **cfgkw), self.db)
+        self._built.append(t)
+        t._market_data.futures_move_bps = lambda symbol, lookback: move
+        t._market_data.futures_tick_age_ms = lambda symbol: age
+        t._market_data.futures_mid = lambda symbol: perp
+        return t
+
+    def _warm(self, t, symbol="BTCUSDT", basis_bps=0.0):
+        """Fill the basis EWMA so a dislocation can be measured off it."""
+        t._basis_ewma[symbol] = (basis_bps, m.BASIS_EWMA_MIN_SAMPLES)
+
+    def test_no_feed_is_no_signal(self):
+        t = self._trader(move=None)
+        self.assertIsNone(t._scalp_signal("BTCUSDT"))
+
+    def test_a_stale_tick_is_not_a_signal(self):
+        """
+        Per symbol, because the socket's own health flag asks about ANY
+        frame across every subscription -- a busy market keeps it green
+        while a quiet one's newest tick is a minute old.
+        """
+        t = self._trader(move=50.0, age=9_000.0)
+        self.assertIsNone(t._scalp_signal("BTCUSDT"))
+
+    def test_a_move_under_the_floor_is_not_a_signal(self):
+        t = self._trader(move=0.5, scalp_min_basis_bps=0.0)
+        self.assertIsNone(t._scalp_signal("BTCUSDT"))
+
+    def test_momentum_alone_trades_when_the_basis_gate_is_off(self):
+        t = self._trader(move=5.0, scalp_min_basis_bps=0.0)
+        side, move, dislocation = t._scalp_signal("BTCUSDT")
+        self.assertIs(side, Side.UP)
+        self.assertEqual(move, 5.0)
+        self.assertEqual(dislocation, 0.0)
+
+    def test_a_falling_perp_points_down(self):
+        t = self._trader(move=-5.0, scalp_min_basis_bps=0.0)
+        side, _, _ = t._scalp_signal("BTCUSDT")
+        self.assertIs(side, Side.DOWN)
+
+    def test_a_move_spot_has_already_followed_is_refused(self):
+        """
+        The perp is up but the basis has not richened, so spot is level with
+        it -- there is nothing left to be early to.
+        """
+        t = self._trader(move=5.0, perp=100_000.0, spot=100_000.0)
+        self._warm(t)
+        self.assertIsNone(t._scalp_signal("BTCUSDT"))
+
+    def test_a_move_spot_has_not_followed_is_taken(self):
+        # Perp 2 bps above spot against an EWMA mean of 0: a 2 bps
+        # dislocation, over the 0.5 bps floor.
+        t = self._trader(move=5.0, perp=100_020.0, spot=100_000.0)
+        self._warm(t)
+        signal = t._scalp_signal("BTCUSDT")
+        self.assertIsNotNone(signal)
+        side, _, dislocation = signal
+        self.assertIs(side, Side.UP)
+        self.assertAlmostEqual(dislocation, 2.0, places=6)
+
+    def test_a_dislocation_pointing_the_other_way_is_refused(self):
+        """Perp up, basis cheapening: spot has already overtaken it."""
+        t = self._trader(move=5.0, perp=99_980.0, spot=100_000.0)
+        self._warm(t)
+        self.assertIsNone(t._scalp_signal("BTCUSDT"))
+
+    def test_the_basis_level_is_not_the_signal(self):
+        """
+        A persistent 30 bps basis is funding, not information, so once the
+        mean has learned it a reading of 30 bps says nothing.
+        """
+        t = self._trader(move=5.0, perp=100_300.0, spot=100_000.0)
+        self._warm(t, basis_bps=30.0)
+        self.assertIsNone(t._scalp_signal("BTCUSDT"))
+
+    def test_the_first_observations_are_not_compared_against_themselves(self):
+        t = self._trader(move=5.0, perp=100_020.0, spot=100_000.0)
+        self.assertIsNone(t._scalp_signal("BTCUSDT"))
+        self.assertEqual(t._basis_ewma["BTCUSDT"][1], 1)
+
+    def test_the_mean_is_advanced_but_not_used_on_the_same_sample(self):
+        t = self._trader(move=5.0, perp=100_020.0, spot=100_000.0)
+        self._warm(t)
+        t._scalp_signal("BTCUSDT")
+        mean, seen = t._basis_ewma["BTCUSDT"]
+        self.assertEqual(seen, m.BASIS_EWMA_MIN_SAMPLES + 1)
+        self.assertAlmostEqual(mean, 2.0 * m.BASIS_EWMA_ALPHA, places=9)
+
+
+class TestScalpEntry(unittest.TestCase):
+    """Entry, the bracket it arms, and the three bounds on repeating."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self._built = []
+
+    def tearDown(self):
+        _close_journals(self)
+        for trader in self._built:
+            trader._journal._conn.close()
+        os.unlink(self.db)
+
+    def _trader(self, *, secs_left=200.0, ask=0.50, bid=0.49, live=False,
+                **cfgkw):
+        rnd = make_round()
+        now = rnd.end_ms - int(secs_left * 1000)
+        books = {(1, Side.UP): [(ask, 10_000)], (1, Side.DOWN): [(ask, 10_000)]}
+        client = ScalpClient([rnd], [(now, 100_000.0)], books, {},
+                             bids={(1, Side.UP): [(bid, 10_000)],
+                                   (1, Side.DOWN): [(bid, 10_000)]})
+        c = scalp_cfg(db_path=self.db, live=live, **cfgkw)
+        t = build_trader(client, c, self.db)
+        self._built.append(t)
+        # A clean, confirmed signal unless a test says otherwise.
+        t._market_data.futures_move_bps = lambda symbol, lookback: 5.0
+        t._market_data.futures_tick_age_ms = lambda symbol: 0.0
+        t._market_data.futures_mid = lambda symbol: 100_020.0
+        t._basis_ewma["BTCUSDT"] = (0.0, m.BASIS_EWMA_MIN_SAMPLES)
+        return t, client
+
+    def test_dispatch_uses_the_scalp_path_when_enabled(self):
+        t, _ = self._trader()
+        called = {"scalp": False, "model": False, "last": False}
+        t._maybe_enter_scalp = lambda *a: called.__setitem__("scalp", True)
+        t._maybe_enter_model = lambda *a: called.__setitem__("model", True)
+        t._maybe_enter_last_minute = lambda *a: called.__setitem__("last", True)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(called, {"scalp": True, "model": False,
+                                  "last": False})
+
+    def test_a_confirmed_lead_opens_a_position(self):
+        t, _ = self._trader()
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
+    def test_the_side_follows_the_perp(self):
+        t, _ = self._trader()
+        t._market_data.futures_move_bps = lambda s, l: -5.0
+        t._market_data.futures_mid = lambda s: 99_980.0
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.DOWN), t._positions)
+
+    def test_no_signal_opens_nothing(self):
+        t, _ = self._trader()
+        t._market_data.futures_move_bps = lambda s, l: None
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+
+    def test_the_bracket_is_armed_at_the_prices_the_fill_implies(self):
+        t, _ = self._trader()
+        t._maybe_enter(100.0, "PAPER")
+        bracket = t._brackets[("BTCUSDT", Side.UP)]
+        expected = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        self.assertAlmostEqual(bracket.tp_price, round(expected[0], 4))
+        self.assertAlmostEqual(bracket.stop_price, expected[1])
+        self.assertAlmostEqual(bracket.entry_price, 0.50)
+
+    def test_the_take_profit_is_a_resting_limit_sell(self):
+        t, _ = self._trader()
+        t._maybe_enter(100.0, "PAPER")
+        bracket = t._brackets[("BTCUSDT", Side.UP)]
+        pending = t._pending[bracket.tp_order_id]
+        self.assertIs(pending.plan.action, m.Action.SELL)
+        self.assertIs(pending.plan.order_type, m.OrderType.LIMIT)
+        self.assertAlmostEqual(pending.plan.price_limit, bracket.tp_price)
+
+    def test_the_stop_is_never_an_order(self):
+        """
+        A SELL limit below the bid is marketable: posting one would close the
+        position at once rather than wait for the price to fall to it.
+        """
+        t, _ = self._trader()
+        t._maybe_enter(100.0, "PAPER")
+        bracket = t._brackets[("BTCUSDT", Side.UP)]
+        resting = [p.plan.price_limit for p in t._pending.values()]
+        self.assertEqual(resting, [bracket.tp_price])
+
+    def test_the_entry_crosses_rather_than_rests(self):
+        t, client = self._trader(live=True)
+        t._maybe_enter(100.0, "PAPER")
+        entry = client.orders[0]
+        self.assertIs(entry[1], m.Action.BUY)
+        self.assertIsNone(entry[3])        # no price limit: it is a taker
+
+    def test_the_round_is_never_marked_seen(self):
+        """
+        Writing _seen is what caps every other strategy at one entry per
+        round, and repeating inside one round is the whole profile.
+        """
+        t, _ = self._trader()
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._seen, {})
+        self.assertEqual(t._scalp_entries[1][1], 1)
+
+    def test_a_symbol_that_is_not_flat_is_left_alone(self):
+        t, _ = self._trader()
+        t._maybe_enter(100.0, "PAPER")
+        before = dict(t._positions)
+        t._scalp_last_entry.clear()
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions.keys(), before.keys())
+        self.assertEqual(t._scalp_entries[1][1], 1)
+
+    def test_a_resting_order_also_blocks_a_new_entry(self):
+        t, _ = self._trader()
+        t._pending["x"] = make_pending("x", expires_in_ms=60_000)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+
+    def test_the_cooldown_stops_one_signal_becoming_three_positions(self):
+        t, _ = self._trader()
+        t._maybe_enter(100.0, "PAPER")
+        t._positions.clear()
+        t._pending.clear()
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+
+    def test_the_round_ceiling_binds(self):
+        t, _ = self._trader(scalp_max_entries_per_round=2)
+        for _ in range(4):
+            t._positions.clear()
+            t._pending.clear()
+            t._scalp_last_entry.clear()
+            t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._scalp_entries[1][1], 2)
+
+    def test_entries_stop_at_the_window_edge(self):
+        t, _ = self._trader(secs_left=70.0)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+
+    def test_a_fee_that_demands_too_much_signal_is_refused(self):
+        """The gate the whole profile's economics hang on."""
+        rnd = make_round(fee_bps=400)
+        now = rnd.end_ms - 200_000
+        client = ScalpClient([rnd], [(now, 100_000.0)],
+                             {(1, Side.UP): [(0.50, 10_000)]}, {})
+        t = build_trader(client, scalp_cfg(db_path=self.db), self.db)
+        self._built.append(t)
+        t._market_data.futures_move_bps = lambda s, l: 5.0
+        t._market_data.futures_tick_age_ms = lambda s: 0.0
+        t._basis_ewma["BTCUSDT"] = (0.0, m.BASIS_EWMA_MIN_SAMPLES)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        self.assertIn("fee", t._watching[1][1])
+
+    def test_a_price_with_no_room_for_a_target_is_refused(self):
+        """
+        The band already stops short of here, so this widens it on purpose:
+        the gate has to be the bracket's own arithmetic, not the band that
+        happens to sit in front of it.
+        """
+        t, _ = self._trader(ask=0.94, max_entry_price=0.95)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        self.assertIn("bracket", t._watching[1][1])
+
+    def test_the_profiles_own_band_never_reaches_that_price(self):
+        """The gate above is a backstop; the band is what usually binds."""
+        c = scalp_cfg()
+        self.assertIsNotNone(
+            m.bracket_prices(c.max_entry_price, 200,
+                             c.scalp_take_profit_pct, c.scalp_stop_loss_pct))
+
+    def test_a_thin_book_is_refused(self):
+        rnd = make_round(liquidity=10.0)
+        now = rnd.end_ms - 200_000
+        client = ScalpClient([rnd], [(now, 100_000.0)],
+                             {(1, Side.UP): [(0.50, 10_000)]}, {})
+        t = build_trader(client, scalp_cfg(db_path=self.db), self.db)
+        self._built.append(t)
+        t._market_data.futures_move_bps = lambda s, l: 5.0
+        t._market_data.futures_tick_age_ms = lambda s: 0.0
+        t._basis_ewma["BTCUSDT"] = (0.0, m.BASIS_EWMA_MIN_SAMPLES)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+
+    def test_the_journal_records_the_price_paid_not_a_forecast(self):
+        t, _ = self._trader()
+        t._maybe_enter(100.0, "PAPER")
+        pos = t._positions[("BTCUSDT", Side.UP)]
+        self.assertAlmostEqual(pos.signal.model_prob,
+                               breakeven_probability(0.50, 200))
+        self.assertEqual(pos.signal.edge, 0.0)
+
+    def test_scale_in_never_runs_on_a_scalp(self):
+        t, _ = self._trader()
+        t._maybe_enter(100.0, "PAPER")
+        t._maybe_scale_in = lambda *a, **k: self.fail("scaled into a scalp")
+        t._maybe_scale_in_all(100.0)
+
+    def test_the_model_priced_exit_never_runs_on_a_scalp(self):
+        """BRACKET is not a flavour of LIMIT; stacking would double-offer."""
+        t, _ = self._trader()
+        t._maybe_enter(100.0, "PAPER")
+        t._post_exit = lambda pos: self.fail("offered a bracketed position")
+        t._maybe_exit_all()
+
+
+class TestScalpStops(unittest.TestCase):
+    """The leg that is a trigger rather than an order."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self._built = []
+
+    def tearDown(self):
+        _close_journals(self)
+        for trader in self._built:
+            trader._journal._conn.close()
+        os.unlink(self.db)
+
+    def _armed(self, bid, **cfgkw):
+        """A trader holding one bracketed position, with `bid` on the book."""
+        rnd = make_round()
+        now = rnd.end_ms - 200_000
+        client = ScalpClient([rnd], [(now, 100_000.0)],
+                             {(1, Side.UP): [(0.50, 10_000)]}, {},
+                             bids={(1, Side.UP): [(bid, 10_000)]})
+        # LIVE, so the orders go to the client rather than to the paper
+        # book: these tests are about which orders reach the venue and in
+        # what order, which paper mode answers about itself.
+        c = scalp_cfg(db_path=self.db, live=True, **cfgkw)
+        t = build_trader(client, c, self.db)
+        self._built.append(t)
+        sig = Signal(Side.UP, 0.5, 0.50, 0.0, 10.0, 200.0)
+        tid = t._journal.record("PAPER", rnd, sig, 0.0, 0.0, 100.0)
+        key = ("BTCUSDT", Side.UP)
+        t._positions[key] = Position(tid, rnd, sig, 10.0, 1)
+        tp, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t._arm_bracket(key, 0.50, tp, stop)
+        return t, client, key
+
+    def test_a_bid_above_the_stop_does_nothing(self):
+        t, client, key = self._armed(0.50)
+        t._check_stops()
+        self.assertIn(key, t._brackets)
+        self.assertEqual(client.cancelled, [])
+
+    def test_a_bid_at_the_stop_cancels_the_take_profit(self):
+        _, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t, client, key = self._armed(stop)
+        tp_id = t._brackets[key].tp_order_id
+        t._check_stops()
+        self.assertEqual(client.cancelled, [tp_id])
+        self.assertNotIn(key, t._brackets)
+
+    def test_the_stop_sells_through_the_bid_rather_than_resting(self):
+        """
+        A SELL priced AT the bid queues behind it. The point of a stop is to
+        be out, so it reaches through by the profile's own slippage cap.
+        """
+        t, client, key = self._armed(0.40)
+        t._check_stops()
+        sale = [p for p in t._pending.values()
+                if p.plan.action is m.Action.SELL]
+        self.assertEqual(len(sale), 1)
+        self.assertLess(sale[0].plan.price_limit, 0.40)
+
+    def test_the_stop_uses_a_limit_not_a_fill_or_kill_market_order(self):
+        """
+        A MARKET order is FOK here: on the thin book that triggered the stop
+        it fills entirely or not at all, and "not at all" is the capped
+        position running to settlement uncapped.
+        """
+        t, _, key = self._armed(0.40)
+        t._check_stops()
+        sale = next(p for p in t._pending.values()
+                    if p.plan.action is m.Action.SELL)
+        self.assertIs(sale.plan.order_type, m.OrderType.LIMIT)
+
+    def test_a_cancel_that_raced_a_fill_is_booked_not_double_sold(self):
+        """
+        batch-cancel reports an order under `failed` most often because it
+        FILLED first. The state after the cancel is the answer.
+        """
+        t, client, key = self._armed(0.40)
+        tp_id = t._brackets[key].tp_order_id
+        shares = 10.0 / 0.50
+        client.states[tp_id] = m.OrderState("FILLED", 10.50, shares, 0.5357)
+        t._check_stops()
+        self.assertNotIn(key, t._positions)
+        self.assertFalse([p for p in t._pending.values()
+                          if p.plan.action is m.Action.SELL
+                          and p.order_id != tp_id])
+
+    def test_an_unreachable_cancel_leaves_the_stop_armed(self):
+        """
+        Selling before the take-profit is retracted would offer more shares
+        than the position holds, and the venue would fill both.
+        """
+        t, client, key = self._armed(0.40)
+
+        def refuse(_ids):
+            raise m.ApiError("cancel unavailable")
+
+        t._client.cancel_orders = refuse
+        t._check_stops()
+        self.assertIn(key, t._brackets)
+        self.assertIn(key, t._positions)
+        self.assertFalse([p for p in t._pending.values()
+                          if p.plan.action is m.Action.SELL
+                          and p.order_id != t._brackets[key].tp_order_id])
+
+    def test_a_bracket_whose_position_is_gone_is_forgotten(self):
+        t, _, key = self._armed(0.50)
+        t._positions.pop(key)
+        t._check_stops()
+        self.assertEqual(t._brackets, {})
+
+    def test_nothing_happens_when_the_profile_is_off(self):
+        t, client, key = self._armed(0.40, )
+        t._static_cfg = cfg(db_path=self.db)
+        t._check_stops()
+        self.assertEqual(client.cancelled, [])
+
+
+class TestScalpFlatten(unittest.TestCase):
+    """The last minute belongs to nobody."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self._built = []
+
+    def tearDown(self):
+        _close_journals(self)
+        for trader in self._built:
+            trader._journal._conn.close()
+        os.unlink(self.db)
+
+    def _at(self, secs_left, *, bid=0.50, **cfgkw):
+        rnd = make_round()
+        now = rnd.end_ms - int(secs_left * 1000)
+        bids = {(1, Side.UP): [(bid, 10_000)]} if bid else {}
+        client = ScalpClient([rnd], [(now, 100_000.0)],
+                             {(1, Side.UP): [(0.50, 10_000)]}, {}, bids=bids)
+        c = scalp_cfg(db_path=self.db, live=True, **cfgkw)
+        t = build_trader(client, c, self.db)
+        self._built.append(t)
+        sig = Signal(Side.UP, 0.5, 0.50, 0.0, 10.0, secs_left)
+        tid = t._journal.record("PAPER", rnd, sig, 0.0, 0.0, 100.0)
+        key = ("BTCUSDT", Side.UP)
+        t._positions[key] = Position(tid, rnd, sig, 10.0, 1)
+        tp, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t._arm_bracket(key, 0.50, tp, stop)
+        return t, client, key
+
+    def test_before_the_deadline_nothing_is_touched(self):
+        t, client, key = self._at(120.0)
+        t._flatten_scalps()
+        self.assertEqual(client.cancelled, [])
+        self.assertIn(key, t._positions)
+
+    def test_at_the_deadline_the_take_profit_is_retracted(self):
+        t, client, key = self._at(60.0)
+        tp_id = t._brackets[key].tp_order_id
+        t._flatten_scalps()
+        self.assertIn(tp_id, client.cancelled)
+        self.assertEqual(t._brackets, {})
+
+    def test_at_the_deadline_the_position_is_offered_back(self):
+        t, _, key = self._at(60.0)
+        t._flatten_scalps()
+        sale = [p for p in t._pending.values()
+                if p.plan.action is m.Action.SELL]
+        self.assertEqual(len(sale), 1)
+
+    def test_a_round_is_flattened_once(self):
+        """
+        Re-running would cancel the very sale the first pass placed, every
+        pass, forever.
+        """
+        t, client, key = self._at(60.0)
+        t._flatten_scalps()
+        before = list(client.cancelled)
+        t._flatten_scalps()
+        self.assertEqual(client.cancelled, before)
+
+    def test_a_failed_flatten_leaves_the_position_to_settle(self):
+        """
+        The honest fallback: retrying into a book that is not there is how a
+        5% loss becomes a 100% one.
+        """
+        t, _, key = self._at(60.0, bid=None)
+        with self.assertLogs("btc5m", level="ERROR") as logged:
+            t._flatten_scalps()
+        self.assertIn(key, t._positions)
+        self.assertTrue(any("FULL-STAKE" in line for line in logged.output))
+
+    def test_nothing_happens_when_the_profile_is_off(self):
+        t, client, _ = self._at(60.0)
+        t._static_cfg = cfg(db_path=self.db)
+        t._flatten_scalps()
+        self.assertEqual(client.cancelled, [])
+
+
+class TestSoldPositionsReachTheRiskManager(unittest.TestCase):
+    """
+    A sold position never reaches _settle_one, which is where every other
+    ending reports itself. Without this the daily loss limit and the streak
+    counter are wired to a path a selling profile never takes.
+    """
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        self._built = []
+
+    def tearDown(self):
+        _close_journals(self)
+        for trader in self._built:
+            trader._journal._conn.close()
+        os.unlink(self.db)
+
+    def _sold(self, proceeds, **cfgkw):
+        rnd = make_round()
+        client = ScalpClient([rnd], [(rnd.end_ms - 200_000, 100_000.0)],
+                             {}, {})
+        c = scalp_cfg(db_path=self.db, **cfgkw)
+        t = build_trader(client, c, self.db)
+        self._built.append(t)
+        key = ("BTCUSDT", Side.UP)
+        sig = Signal(Side.UP, 0.5, 0.50, 0.0, 10.0, 200.0)
+        tid = t._journal.record("PAPER", rnd, sig, 0.0, 0.0, 100.0)
+        t._positions[key] = Position(tid, rnd, sig, 10.0, 1)
+        t._brackets[key] = m.Bracket(0.50, 0.5357, 0.4847, "tp1")
+        plan = m.OrderPlan(side=Side.UP, action=m.Action.SELL,
+                           order_type=m.OrderType.LIMIT, amount=20.0,
+                           price_limit=0.5357)
+        pending = m.PendingOrder(order_id="tp1", rnd=rnd, plan=plan,
+                                 signal=sig, expires_at_ms=rnd.end_ms,
+                                 filled_usdt=0.0, filled_shares=0.0,
+                                 trade_id=tid)
+        t._pending["tp1"] = pending
+        state = m.OrderState("FILLED", proceeds, 20.0, proceeds / 20.0)
+        t._book_sale("tp1", pending, state)
+        return t, key
+
+    def test_a_winning_sale_is_reported_as_a_win(self):
+        t, _ = self._sold(10.50)
+        self.assertEqual(t._account_risk.consecutive_losses, 0)
+        self.assertAlmostEqual(t._account_risk.realised_pnl, 0.50)
+
+    def test_a_losing_sale_moves_the_streak_and_the_daily_total(self):
+        t, _ = self._sold(9.50)
+        self.assertEqual(t._account_risk.consecutive_losses, 1)
+        self.assertAlmostEqual(t._account_risk.realised_pnl, -0.50)
+
+    def test_the_per_symbol_manager_hears_it_too(self):
+        t, _ = self._sold(9.50)
+        self.assertEqual(t._risk["BTCUSDT"].consecutive_losses, 1)
+
+    def test_the_round_trip_counts_toward_the_daily_ceiling(self):
+        t, _ = self._sold(10.50)
+        self.assertEqual(t._account_risk.rounds_today, 1)
+
+    def test_the_paper_bankroll_actually_moves(self):
+        """Without this a paper scalper trades all day against a fixed balance."""
+        t, _ = self._sold(10.50)
+        self.assertAlmostEqual(t._paper_bankroll,
+                               scalp_cfg().paper_start_bankroll + 0.50)
+
+    def test_calibration_is_not_fed_an_outcome_that_never_happened(self):
+        """
+        Those buckets answer "did the price paid predict the outcome", and a
+        position closed BEFORE the outcome existed has no answer to give.
+        """
+        t, _ = self._sold(10.50)
+        self.assertIsNone(t._account_risk.calibration_z())
+
+    def test_the_bracket_leaves_with_the_position(self):
+        t, key = self._sold(10.50)
+        self.assertNotIn(key, t._positions)
+        self.assertNotIn(key, t._brackets)
+
+
 class TestCoherenceCorpus(unittest.TestCase):
     """
     coherence.py must judge "used anywhere" across every analysed file.
@@ -9944,9 +10921,16 @@ class TestMarketData(unittest.TestCase):
     def test_status_names_every_feed(self):
         md, _ = self._md()
         status = md.status()
-        self.assertEqual(set(status), {"spot", "book"})
+        self.assertEqual(set(status), {"spot", "book", "futures"})
         for value in status.values():
             self.assertIn(value, ("live", "connecting", "disabled", "off"))
+
+    def test_the_futures_feed_is_off_unless_something_reads_it(self):
+        """Only scalp does, and a socket nobody reads is spent on nothing."""
+        md, _ = self._md()
+        self.assertEqual(md.status()["futures"], "off")
+        self.assertIsNone(md.futures_mid("BTCUSDT"))
+        self.assertIsNone(md.futures_move_bps("BTCUSDT", 1500.0))
 
     def test_status_says_off_when_disabled(self):
         md, _ = self._md(enabled=False)

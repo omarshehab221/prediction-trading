@@ -100,6 +100,18 @@ EPS = 1e-9
 # Fallback only, for journal rows written before the fee column existed.
 DEFAULT_FEE_BPS = 200
 
+# The perp/spot basis is tracked as an EWMA so the scalp strategy can measure
+# a DISLOCATION rather than a level -- the level is mostly funding, which is a
+# bias and not information. Not configurable on purpose: these describe how a
+# mean is estimated, not what the strategy will accept, and every knob that
+# blurs that distinction ends up tuned against the sample it was measured on.
+#
+# 0.05 is a ~14-sample half-life, which at the profile's 1s poll is about a
+# quarter minute of "recent". The minimum sample count is what stops the very
+# first observation being compared against itself and reported as a signal.
+BASIS_EWMA_ALPHA = 0.05
+BASIS_EWMA_MIN_SAMPLES = 20
+
 # How far the WebSocket-derived ask ladder may sit from the REST ladder it is
 # validated against, at top of book, in absolute price. Loose enough to
 # survive the few hundred milliseconds between the push and the REST reply on
@@ -228,6 +240,14 @@ class Config:
     # the winning token. Stated rather than implied, so a profile that wants
     # exits has to say so and a profile that does not cannot acquire them by
     # a default changing underneath it.
+    #
+    # MARKET and LIMIT both price the exit off the MODEL: leave when the book
+    # overpays by the same edge the entry demanded. BRACKET does not, and is
+    # therefore its own value rather than a flavour of LIMIT -- the scalp
+    # strategy's exit prices come from the price it FILLED at and the P&L it
+    # is willing to take, and the model has no opinion about either. Folding
+    # it into LIMIT would mean exit_trigger silently applied to a mechanism
+    # it does not describe.
     exit_order_type: str = "NONE"
     # RESTING posts the sell when the entry fills and lets the venue wait.
     # POLLED recomputes the reservation price each loop and sends only once
@@ -574,6 +594,75 @@ class Config:
     # round rather than half of it.
     last_minute_stake_pct: float = 0.05
 
+    # --- Scalping the futures lead ----------------------------------------
+    # A fourth entry strategy, and the only one whose P&L does not depend on
+    # the oracle at all. Spot follows the USD-M perpetual by milliseconds, and
+    # the prediction market settles on spot -- so a perp move is a forecast of
+    # the settlement quantity, and while the prediction book has not repriced
+    # to it, the side the move points at is underpriced.
+    #
+    # That edge decays in about a second, so it is not held to settlement. The
+    # position is bought, offered back out for a small fixed gain, and cut for
+    # a small fixed loss if the move was wrong -- many round trips inside one
+    # round rather than one all-or-nothing bet per round.
+    #
+    # See docs/superpowers/specs/2026-09-10-futures-lead-scalping-design.md.
+    scalp: bool = False
+    # Stake per ROUND TRIP, as a fraction of bankroll. Not per round: a round
+    # may hold twenty of these, and each is opened only once the previous is
+    # flat, so this is the exposure at any one instant.
+    scalp_stake_pct: float = 0.05
+    # Net gain and net loss per unit staked that close a position.
+    #
+    # These are P&L, not price moves, and the difference is the whole
+    # economics of the profile. Selling n shares at q nets n*q*(1-f), so a
+    # position filled at p needs q = p(1+r)/(1-f) to return r. At a 2% fee a
+    # +5% RESULT needs a +7.14% price move while a -5% result arrives after
+    # only -3.06%, which on a driftless walk is a 30% chance of the good
+    # ending. bracket_prices() derives both from the market's own fee, and
+    # signal_edge_required() turns that asymmetry into the one number worth
+    # gating on.
+    scalp_take_profit_pct: float = 0.05
+    scalp_stop_loss_pct: float = 0.05
+    # The window the perp move is measured over, and how far it must have
+    # moved in it. 2 bps of BTC is roughly a 20-dollar move at 100k -- small
+    # enough to happen many times a round, large enough not to be the spread
+    # flickering.
+    scalp_lookback_ms: float = 1500.0
+    scalp_min_move_bps: float = 2.0
+    # How far the perp/spot basis must have DISLOCATED from its own recent
+    # mean, in bps, in the direction of the move. This is the "spot has not
+    # caught up yet" half of the premise, and it is measured as a dislocation
+    # rather than a level because the basis has a persistent non-zero mean --
+    # funding, not information. Gating on the level would fire constantly on
+    # one side and never on the other: a funding-rate detector wearing a
+    # lead-lag costume. 0 disables the second condition.
+    scalp_min_basis_bps: float = 0.5
+    # A perp tick older than this is not a signal. The socket's own health
+    # check cannot serve here: it asks whether ANY frame arrived recently,
+    # across every subscribed symbol, and a busy BTC stream keeps it healthy
+    # while a quiet altcoin's last tick is a minute old.
+    scalp_max_tick_age_ms: float = 2000.0
+    # Minimum gap between entries on one symbol. A signal that persists for
+    # three passes is one signal, and without this it opens three positions.
+    scalp_cooldown_s: float = 2.0
+    # Hard ceiling per round. An unbounded re-entry loop is a way to pay the
+    # venue fee twenty times a minute while believing it is a strategy.
+    scalp_max_entries_per_round: int = 20
+    # Cancel every scalp order and sell every scalp position at this many
+    # seconds left. This is "stop in the last minute" -- the book thins there
+    # and orders fail, so nothing is PLACED inside it either, which is why
+    # entry_window_end_s must sit above this and not on it.
+    scalp_flatten_s: float = 60.0
+    # Refuse a market whose fee demands more signal than this.
+    #
+    # signal_edge_required() answers "how far above a no-information coin
+    # flip must the hit rate be for this bracket to break even", in hit-rate
+    # points. It is 0.00 at a zero fee and about 0.20 at 200 bps. Above this
+    # threshold the bracket is a bet the arithmetic cannot defend, and the
+    # market is skipped loudly rather than traded quietly.
+    scalp_max_edge_required: float = 0.25
+
     # --- Claiming (background, non-blocking) --------------------------
     # A win must be claimed (on-chain redemption) before its proceeds are
     # real, spendable balance, and that can take anywhere from about a
@@ -635,6 +724,10 @@ class Config:
     ws_enabled: bool = True
     ws_spot_url: str = "wss://stream.binance.com:9443/stream"
     ws_book_url: str = "wss://api.binance.com/sapi/wss"
+    # USD-M perpetuals, a different host from spot. Read only by the scalp
+    # strategy, and only over the socket: see FuturesFeed on why this one
+    # feed has no REST fallback.
+    ws_futures_url: str = "wss://fstream.binance.com/stream"
     # Silence on a socket for longer than this marks the feed unhealthy and
     # sends every read back to REST. Measured on the CONNECTION, never per
     # market: a book that is not changing sends nothing, so per-market
@@ -695,10 +788,10 @@ class Config:
             raise ValueError(
                 f"entry_order_type must be MARKET or LIMIT, got "
                 f"{self.entry_order_type!r}")
-        if self.exit_order_type not in ("NONE", "MARKET", "LIMIT"):
+        if self.exit_order_type not in ("NONE", "MARKET", "LIMIT", "BRACKET"):
             raise ValueError(
-                f"exit_order_type must be NONE, MARKET or LIMIT, got "
-                f"{self.exit_order_type!r}")
+                f"exit_order_type must be NONE, MARKET, LIMIT or BRACKET, "
+                f"got {self.exit_order_type!r}")
         if self.exit_trigger not in ("RESTING", "POLLED"):
             raise ValueError(
                 f"exit_trigger must be RESTING or POLLED, got "
@@ -853,16 +946,84 @@ class Config:
                 f"({self.last_minute_deadline_s}) < last_minute_fallback_s "
                 f"({self.last_minute_fallback_s}) <= last_minute_start_s "
                 f"({self.last_minute_start_s})")
-        if self.last_minute and self.straddle:
-            # Two entry strategies behind one dispatch. Enabling both would
-            # silently run whichever branch happens to be tested first.
-            raise ValueError("straddle and last_minute cannot both be enabled")
         if self.last_minute and self.scale_in:
             # Scale-in tops a position up toward the Kelly stake for a RISING
             # model probability. This strategy has no model probability --
             # there is nothing for a top-up to aim at.
             raise ValueError(
                 "last_minute and scale_in cannot both be enabled")
+        if not 0 < self.scalp_stake_pct <= 0.25:
+            raise ValueError("scalp_stake_pct must be in (0, 0.25]")
+        if not 0 < self.scalp_take_profit_pct < 1.0:
+            raise ValueError("scalp_take_profit_pct must be in (0, 1)")
+        if not 0 < self.scalp_stop_loss_pct < 1.0:
+            # At or above 1.0 the stop price is negative and the position can
+            # never be cut -- a "capped" loss that is the whole stake.
+            raise ValueError("scalp_stop_loss_pct must be in (0, 1)")
+        if self.scalp_lookback_ms <= 0:
+            raise ValueError("scalp_lookback_ms must be positive")
+        if self.scalp_min_move_bps <= 0:
+            # At zero every tick is a signal in whichever direction the last
+            # frame happened to land, which is a coin flip paying two fees.
+            raise ValueError("scalp_min_move_bps must be positive")
+        if self.scalp_min_basis_bps < 0:
+            raise ValueError("scalp_min_basis_bps must be non-negative")
+        if self.scalp_max_tick_age_ms <= 0:
+            raise ValueError("scalp_max_tick_age_ms must be positive")
+        if self.scalp_cooldown_s < 0:
+            raise ValueError("scalp_cooldown_s must be non-negative")
+        if self.scalp_max_entries_per_round < 1:
+            raise ValueError("scalp_max_entries_per_round must be >= 1")
+        if self.scalp_flatten_s < 0:
+            raise ValueError("scalp_flatten_s must be non-negative")
+        if not 0 <= self.scalp_max_edge_required < 0.5:
+            # At or above 0.5 the gate can never bind: no fee makes the
+            # required edge exceed half, so it would read as a safety limit
+            # and behave as nothing.
+            raise ValueError("scalp_max_edge_required must be in [0, 0.5)")
+        if self.scalp:
+            if self.entry_window_end_s <= self.scalp_flatten_s:
+                # A scalp opened at the entry deadline is flattened the same
+                # instant, so the profile would pay two fees for a position
+                # it never held. The gap between the two is the runway a
+                # fresh bracket gets.
+                raise ValueError(
+                    f"entry_window_end_s ({self.entry_window_end_s}) must be "
+                    f"above scalp_flatten_s ({self.scalp_flatten_s}): a scalp "
+                    f"opened at the deadline is closed before it can move")
+            if self.scalp_max_tick_age_ms < self.scalp_lookback_ms:
+                # A tick fresh enough to trade on must at least be able to
+                # span the window the move is measured over, or every signal
+                # is rejected by one gate or unmeasurable by the other.
+                raise ValueError(
+                    f"scalp_max_tick_age_ms ({self.scalp_max_tick_age_ms}) "
+                    f"must be at least scalp_lookback_ms "
+                    f"({self.scalp_lookback_ms})")
+        # BRACKET and scalp are one decision wearing two names, so neither is
+        # allowed without the other. A BRACKET exit with no scalp entry is an
+        # exit mechanism nothing arms; a scalp with any other exit setting
+        # would run the model-priced offer against a position the model has
+        # no opinion about.
+        if self.scalp != (self.exit_order_type == "BRACKET"):
+            raise ValueError(
+                "scalp requires exit_order_type BRACKET, and BRACKET requires "
+                f"scalp (scalp={self.scalp}, "
+                f"exit_order_type={self.exit_order_type!r})")
+        # Two entry strategies behind one dispatch. Enabling any pair would
+        # silently run whichever branch happens to be tested first.
+        chosen = [n for n, on in (("straddle", self.straddle),
+                                  ("last_minute", self.last_minute),
+                                  ("scalp", self.scalp)) if on]
+        if len(chosen) > 1:
+            raise ValueError(
+                f"only one entry strategy may be enabled, got: "
+                f"{', '.join(chosen)}")
+        if self.scalp and self.scale_in:
+            # Scale-in tops a position up toward the Kelly stake for a rising
+            # model probability. This strategy has no model probability, and
+            # a top-up would move the fill price the whole bracket is
+            # computed from after the bracket was already placed.
+            raise ValueError("scalp and scale_in cannot both be enabled")
         if self.claim_poll_interval_s <= 0:
             raise ValueError("claim_poll_interval_s must be positive")
         if self.claim_timeout_s <= 0:
@@ -981,31 +1142,115 @@ PROFILES: dict[str, dict] = {
                      # Inert here unless scale_in is enabled; sized to this
                      # profile's own band (0.55-0.80), not buffer's.
                      "max_blended_price": 0.72},
-    # Post a resting bid instead of crossing the spread. Every risk number
-    # here already exists on the other profiles; what differs is only how the
-    # order reaches the book -- and therefore whether the spread is paid.
+    # SCALP THE FUTURES LEAD. The only profile whose P&L never touches the
+    # oracle.
     #
-    # The window is wide and closes early on purpose. A resting order needs
-    # time to be hit, and it is cancelled when the window shuts, so a narrow
-    # window posts an order and retracts it before anyone could take it.
+    # Spot follows the USD-M perpetual by milliseconds and the prediction
+    # market settles on spot, so a perp move is a forecast of the settlement
+    # quantity. While the prediction book has not repriced to it, the side
+    # the move points at is underpriced. That edge decays in about a second,
+    # so nothing here is held to settlement: buy, offer the shares back out
+    # for +5% of stake, cut at -5%, and go again. Many small round trips in
+    # one round instead of one all-or-nothing bet per round.
     #
-    # Whether this actually earns more than it misses is an open question.
-    # The journal records order_type, so --calibration-report can be asked
-    # whether limit fills calibrate differently from market fills, and until
-    # that data exists this profile is an experiment rather than a claim.
-    "maker": {"max_entry_price": 0.85, "min_entry_price": 0.10,
-              "min_edge": 0.04, "min_edge_ratio": 0.15,
-              "max_stake_pct": 0.05, "entry_window_start_s": 240,
-              "entry_window_end_s": 45, "max_consecutive_losses": 15,
-              "daily_loss_limit_pct": 0.20, "assumed_spread_pct": 0.04,
-              "kelly_fraction": 0.25,
-              "min_liquidity": 0.0, "max_rounds_per_day": 200,
-              "paper_start_bankroll": 100.0,
-              "min_win_return": 0.0,
+    # WHAT THE FEE DOES TO THIS, STATED PLAINLY
+    # -----------------------------------------
+    # The bracket is symmetric in money and asymmetric in price, because the
+    # fee is paid on the way out of both legs. At 200 bps a +5% RESULT needs
+    # the token to rise 7.14% while a -5% result arrives after it falls only
+    # 3.06% -- so a market with no opinion at all hits the stop 70% of the
+    # time, and the signal must lift the hit rate 20 points above a coin flip
+    # before the first unit of profit exists. At a market whose published
+    # feeRateBps is near zero the same bracket is symmetric and "more right
+    # than wrong" is exactly the bar.
+    #
+    # scalp_max_edge_required is that number made into a gate, so the profile
+    # refuses a market whose arithmetic it cannot defend rather than trading
+    # it quietly. It is the first thing to look at if this profile is losing.
+    #
+    # THE WINDOW IS TWO NUMBERS, NOT ONE
+    # ----------------------------------
+    # Entries stop at 75s and everything is flattened at 60s. The last minute
+    # is when the book thins and orders fail, so nothing is PLACED inside it
+    # -- which means the flatten has to happen at its edge, and entries have
+    # to stop before that with enough runway for a fresh bracket to resolve.
+    #
+    # poll_interval_s is 1.0 rather than the usual 2.0. This is the shape of
+    # the strategy, not the speed of it: the signal is read inside a poll
+    # loop, so what is actually traded is a one-to-two-second momentum
+    # signal, and the millisecond lead the premise describes is future work.
+    "scalp": {"scalp": True,
+              # Wide, because the band is not this profile's gate -- the
+              # bracket is. What the band does exclude is the ends of the
+              # book, where a 7% rise runs into 1.00 and bracket_prices
+              # refuses the position anyway; stating it here means the round
+              # is skipped before a quote is spent on it.
+              "max_entry_price": 0.85, "min_entry_price": 0.15,
+              # Inert: no model probability is computed on this path, so
+              # nothing consults them. Declared at the defaults so a change
+              # to the defaults cannot make them start mattering.
+              "min_edge": 0.02, "min_edge_ratio": 0.30,
+              "kelly_fraction": 0.25, "min_win_return": 0.0,
+              # The stake that matters. max_stake_pct is the ceiling the
+              # shared risk checks read; scalp_stake_pct is what is actually
+              # committed per round trip, and they are kept equal so the two
+              # cannot drift into disagreeing about the same number.
+              "scalp_stake_pct": 0.05, "max_stake_pct": 0.05,
+              "scalp_take_profit_pct": 0.05, "scalp_stop_loss_pct": 0.05,
+              "scalp_lookback_ms": 1500.0, "scalp_min_move_bps": 2.0,
+              "scalp_min_basis_bps": 0.5, "scalp_max_tick_age_ms": 2000.0,
+              "scalp_cooldown_s": 2.0, "scalp_max_entries_per_round": 20,
+              "scalp_flatten_s": 60.0, "scalp_max_edge_required": 0.25,
+              "entry_window_start_s": 300, "entry_window_end_s": 75,
+              "poll_interval_s": 1.0,
+              # MARKET in, resting LIMIT out. The entry crosses because the
+              # whole premise is being early to a move the book has not
+              # priced yet, and a resting bid fills when someone wants to
+              # sell into it -- which is precisely when the move is going the
+              # other way. The take-profit rests for the opposite reason:
+              # nothing about it is urgent, and resting earns the spread the
+              # entry just paid.
+              "entry_order_type": "MARKET",
+              "exit_order_type": "BRACKET",
+              # Inert under BRACKET: the exit price comes from the fill, not
+              # from a model reading of the book. Declared so it cannot be
+              # mistaken for a live setting on this profile.
+              "exit_trigger": "RESTING",
+              # A BRACKETED loss is 5% of the stake -- 0.25% of bankroll --
+              # so 20% is eighty of them, which is the right order for a
+              # strategy taking twenty trades a round. It is deliberately
+              # not tightened below the shared 2.5x-of-max_stake_pct floor,
+              # because the bracket is not the only way to lose here: a
+              # flatten that fails leaves a position to settle, and that
+              # loses the FULL stake. Four of those is what 20% buys, and
+              # four failed flattens in a day is a venue problem worth
+              # halting on.
+              #
+              # The streak counter is raised instead, since a run of small
+              # bracketed losses is the ordinary texture of this profile and
+              # 40 in a row is a broken signal rather than a bad afternoon.
+              "daily_loss_limit_pct": 0.20,
+              "max_consecutive_losses": 40,
+              # rounds_today counts ROUND TRIPS here, not rounds, because
+              # every scalp closes by selling and reports its result
+              # individually. 20 per round x 12 rounds an hour is 240 an
+              # hour, so a day's ceiling has to be in the thousands or this
+              # halts before the first hour is out.
+              "max_rounds_per_day": 4000,
+              # A thin book is what breaks this strategy: the entry crosses
+              # the spread and the exit needs a bid to sell into, and both
+              # get worse faster than the price does. Stricter than every
+              # other profile on purpose.
+              "min_liquidity": 150.0, "max_price_impact": 0.02,
+              "assumed_spread_pct": 0.03,
+              # Never: a top-up would move the fill price the bracket was
+              # already computed from. Config rejects the pairing; this is
+              # the belt to that brace.
+              "scale_in": False,
+              # Inert with scale_in off, and sized to this profile's own
+              # band so the shared band check passes on a real number.
               "max_blended_price": 0.80,
-              "entry_order_type": "LIMIT",
-              "exit_order_type": "NONE",
-              "exit_trigger": "RESTING"},
+              "paper_start_bankroll": 100.0},
     # YOUR METHOD, encoded. Wait for a buffer to open up, back the side it
     # favours, press it while the market has inertia -- and refuse any price
     # whose win is too small to be worth the loss it risks.
@@ -1872,6 +2117,37 @@ class PendingOrder:
 
 
 @dataclass(frozen=True)
+class Bracket:
+    """
+    The two exits attached to one scalp position. Only one is an order.
+
+    THE ASYMMETRY IS THE VENUE'S, NOT A SHORTCUT
+    --------------------------------------------
+    `tp_order_id` names a resting LIMIT SELL the venue is holding above the
+    market. `stop_price` names a bid level this bot watches, because there is
+    no conditional order type here and a SELL limit posted BELOW the bid is
+    marketable -- it crosses and sells immediately rather than waiting for
+    the price to fall to it. Posting the stop leg as an order would not arm a
+    stop; it would close the position at once, at a loss, every time.
+
+    So "when one fills, cancel the other" is asymmetric in this code the same
+    way it is asymmetric on the venue: a filled take-profit disarms a trigger
+    that was never an order, and a triggered stop cancels a real one -- and
+    then re-reads it, because that cancel can race the very fill it is trying
+    to beat.
+
+    entry_price is carried rather than read back off the position because the
+    position's own fill price blends across tranches, and this bracket was
+    computed from one specific fill.
+    """
+
+    entry_price: float
+    tp_price: float
+    stop_price: float
+    tp_order_id: str | None = None
+
+
+@dataclass(frozen=True)
 class WalletRef:
     address: str
     wallet_id: str
@@ -2252,6 +2528,85 @@ def sell_reservation_price(model_prob: float, cfg: Config,
     if not 0.0 < price < 1.0:
         return None
     return price
+
+
+def bracket_prices(fill_price: float, fee_bps: int, take_profit: float,
+                   stop_loss: float) -> tuple[float, float] | None:
+    """
+    The two exit prices that turn a fill into +take_profit / -stop_loss.
+
+    These are P&L targets, not price moves, and keeping that distinction is
+    the whole reason this is one function rather than two expressions at the
+    call sites. A stake S filled at p holds n = S/p shares; selling them at q
+    nets n*q*(1-f), so
+
+        pnl / S = q(1-f)/p - 1
+
+    and inverting for a target r gives q = p(1+r)/(1-f). The fee is paid on
+    the way out either way, so it pushes BOTH prices up -- which is what
+    makes the bracket asymmetric in price even when it is symmetric in money.
+
+    Returns None when the pair is not tradable:
+
+    * the take-profit lands at or above 1.00, where no counterparty exists
+      because the contract cannot pay more than 1;
+    * the stop lands at or above the fill, which happens when the fee alone
+      exceeds the loss being capped -- the position would then be cut on the
+      tick it opened, at a loss larger than the one it was protecting.
+
+    None is not an error and not a zero. It means this fill cannot carry this
+    bracket, so the caller must not open the position at all.
+    """
+    if not 0.0 < fill_price < 1.0:
+        raise ValueError("fill_price must be in (0, 1)")
+    if not 0.0 < take_profit < 1.0 or not 0.0 < stop_loss < 1.0:
+        raise ValueError("take_profit and stop_loss must be in (0, 1)")
+    net = 1.0 - fee_bps / 10_000.0
+    if net <= 0:
+        return None                     # the fee eats the entire payout
+    tp = fill_price * (1.0 + take_profit) / net
+    stop = fill_price * (1.0 - stop_loss) / net
+    if tp >= 1.0 or not 0.0 < stop < fill_price:
+        return None
+    return tp, stop
+
+
+def signal_edge_required(fee_bps: int, take_profit: float,
+                         stop_loss: float) -> float | None:
+    """
+    How much better than a coin flip this bracket needs, in hit-rate points.
+
+    THE NUMBER THIS PROFILE LIVES OR DIES ON, so it is computed rather than
+    assumed. Two rates matter and they are not the same:
+
+    * the hit rate at which the bracket breaks even in money, which is
+      stop/(take_profit+stop) and is 0.50 for a symmetric 5/5;
+    * the hit rate a DRIFTLESS market would deliver, which is d/(u+d) where
+      u and d are the price moves the two legs actually require.
+
+    At a zero fee those coincide and "more right than wrong" is exactly the
+    bar. At 200 bps the target needs a 7.14% rise while the stop fires after
+    a 3.06% fall, so a market with no opinion at all hits the stop 70% of the
+    time -- and the signal has to make up the whole 0.20 difference before
+    the first unit of profit exists.
+
+    Returns None when no bracket is tradable at this fee, which is the same
+    answer bracket_prices gives and for the same reason.
+    """
+    if not 0.0 < take_profit < 1.0 or not 0.0 < stop_loss < 1.0:
+        raise ValueError("take_profit and stop_loss must be in (0, 1)")
+    net = 1.0 - fee_bps / 10_000.0
+    if net <= 0:
+        return None
+    up = (1.0 + take_profit) / net - 1.0        # price rise the target needs
+    down = 1.0 - (1.0 - stop_loss) / net        # price fall the stop allows
+    if up <= 0 or down <= 0:
+        # down <= 0 means the fee alone exceeds the loss being capped. There
+        # is no bracket here to require an edge OF -- the position is stopped
+        # out the moment it opens.
+        return None
+    breakeven = stop_loss / (take_profit + stop_loss)
+    return breakeven - down / (up + down)
 
 
 def kelly_stake(bankroll: float, model_prob: float, price: float,
@@ -5051,6 +5406,21 @@ class Trader:
         # one as the other books a trade that may never happen, and not
         # tracking it at all abandons one that did.
         self._pending: dict[str, PendingOrder] = {}
+        # Scalp state, keyed to match _positions and _seen so one prune pass
+        # can clear all of it together.
+        #
+        # _scalp_entries counts round TRIPS per round rather than marking the
+        # round seen: every other strategy enters a round once and writes
+        # _seen, and doing that here would cap this profile at one trade in
+        # the five minutes it exists to trade repeatedly.
+        self._brackets: dict[tuple[str, Side], Bracket] = {}
+        # topic_id -> (end_ms, entries taken on this round).
+        self._scalp_entries: dict[int, tuple[int, int]] = {}
+        self._flattened: set[int] = set()
+        # symbol -> monotonic seconds of the last entry, for the cooldown.
+        self._scalp_last_entry: dict[str, float] = {}
+        # symbol -> (EWMA of the perp/spot basis in bps, samples seen).
+        self._basis_ewma: dict[str, tuple[float, int]] = {}
         self._hydrated: dict[int, Round] = {}
         self._errors = 0
         # token_id -> (expected payout USDT, tx hashes). Counted toward the
@@ -5335,10 +5705,19 @@ class Trader:
         self._claim_queue.put(pos)
 
     def _prune(self, now_ms: int) -> None:
-        for tid in [t for t, end in self._seen.items()
-                    if end < now_ms - self._cfg.prune_after_s * 1000]:
+        horizon = now_ms - self._cfg.prune_after_s * 1000
+        for tid in [t for t, end in self._seen.items() if end < horizon]:
             self._seen.pop(tid, None)
             self._hydrated.pop(tid, None)
+        # The scalp counters are keyed by topic and are deliberately NOT
+        # written to _seen -- that would cap this profile at one trade in the
+        # five minutes it exists to trade repeatedly -- so they carry their
+        # own end_ms and get their own sweep. Without it they grow by one
+        # entry per round for the life of the process.
+        for tid in [t for t, (end, _) in self._scalp_entries.items()
+                    if end < horizon]:
+            self._scalp_entries.pop(tid, None)
+            self._flattened.discard(tid)
 
     def _tally_missed(self, now_ms: int) -> None:
         """
@@ -5431,8 +5810,8 @@ class Trader:
             self._client.sync_clock()
             self._market_data.start()
             feeds = self._market_data.status()
-            LOG.info("Feeds: spot %s, book %s", feeds["spot"],
-                     feeds["book"])
+            LOG.info("Feeds: spot %s, book %s, futures %s", feeds["spot"],
+                     feeds["book"], feeds["futures"])
             if self._live:
                 w = self._client.wallet()
                 LOG.info("Prediction wallet %s", w.address)
@@ -5477,6 +5856,13 @@ class Trader:
                     # position before its round is allowed to settle, or the
                     # position settles as though it had never been opened.
                     self._reap_pending()
+                    # After the reaper, so a take-profit that filled this
+                    # pass has already closed its position and disarmed its
+                    # own stop; before the flatten, so a stop that is due
+                    # fires at its own price rather than at whatever the
+                    # deadline can reach.
+                    self._check_stops()
+                    self._flatten_scalps()
                     self._maybe_exit_all()
                     self._settle_open()
                     # Driven from the loop, not from _maybe_enter: that
@@ -5571,6 +5957,8 @@ class Trader:
             self._maybe_enter_straddle(bankroll, mode)
         elif self._cfg.last_minute:
             self._maybe_enter_last_minute(bankroll, mode)
+        elif self._cfg.scalp:
+            self._maybe_enter_scalp(bankroll, mode)
         else:
             self._maybe_enter_model(bankroll, mode)
 
@@ -5755,24 +6143,48 @@ class Trader:
             if not expired:
                 continue
 
-            LOG.info("%s: retracting the %s order (%s)", pending.rnd.slug,
-                     pending.plan.side.value,
-                     "round over" if now_ms >= pending.rnd.end_ms
-                     else "entry window closed")
-            try:
-                self._orders.cancel_orders([order_id])
-            except (ApiError, requests.RequestException) as exc:
-                LOG.error("Cancel failed for %s: %s", order_id, exc)
-                continue
-            try:
-                final = self._orders.order_state(order_id)
-            except (ApiError, requests.RequestException) as exc:
-                LOG.error("Could not re-read %s after cancel: %s",
-                          order_id, exc)
-                continue
-            if final is not None:
-                self._book_fill(order_id, pending, final)
-            self._pending.pop(order_id, None)
+            self._retract(order_id,
+                          "round over" if now_ms >= pending.rnd.end_ms
+                          else "entry window closed")
+
+    def _retract(self, order_id: str, reason: str) -> bool:
+        """
+        Cancel one resting order and book whatever the cancel raced.
+
+        True when the order is done with and out of _pending; False when it
+        could not be reached, in which case it is left pending and retried.
+
+        The cancel is a request, not an answer. batch-cancel reports an order
+        under `failed` most often because it FILLED first, so nothing here
+        reads that list: the order's state AFTER the cancel is the answer,
+        and whatever came back is booked. Reading `failed` as "still
+        resting" walks away from a real position, which then settles, wins,
+        and is never claimed because no journal row knows it exists.
+
+        One body rather than two, because the reaper and the stop trigger
+        need exactly the same discipline and the stop is the case where the
+        race is most likely -- it fires precisely when the price is moving.
+        """
+        pending = self._pending.get(order_id)
+        if pending is None:
+            return True
+        LOG.info("%s: retracting the %s %s order (%s)", pending.rnd.slug,
+                 pending.plan.side.value, pending.plan.action.value, reason)
+        try:
+            self._orders.cancel_orders([order_id])
+        except (ApiError, requests.RequestException) as exc:
+            LOG.error("Cancel failed for %s: %s", order_id, exc)
+            return False
+        try:
+            final = self._orders.order_state(order_id)
+        except (ApiError, requests.RequestException) as exc:
+            LOG.error("Could not re-read %s after cancel: %s", order_id, exc)
+            return False
+        if final is not None:
+            self._book_fill(order_id, self._pending.get(order_id, pending),
+                            final)
+        self._pending.pop(order_id, None)
+        return True
 
     def _book_fill(self, order_id: str, pending: PendingOrder,
                    state: OrderState) -> PendingOrder:
@@ -5868,8 +6280,17 @@ class Trader:
         return True
 
     def _maybe_exit_all(self) -> None:
-        """Consider leaving each open position before the round decides it."""
-        if self._cfg.exit_order_type == "NONE":
+        """
+        Consider leaving each open position before the round decides it.
+
+        MARKET and LIMIT only. BRACKET is not a flavour of these: its exit
+        prices come from the price the position filled at, not from a model
+        reading of the book, and its legs are placed by _arm_bracket at entry
+        rather than reconsidered every pass. Running this over a bracketed
+        position would stack a second, model-priced offer on shares that
+        already have one.
+        """
+        if self._cfg.exit_order_type not in ("MARKET", "LIMIT"):
             return
         offered = {(p.rnd.topic_id, p.plan.side)
                    for p in self._pending.values()
@@ -5990,12 +6411,15 @@ class Trader:
                            filled_shares=state.filled_shares)
         remaining = pos.committed_usdt - sold_cost
         if remaining <= EPS:
+            pnl = state.filled_usdt - pos.committed_usdt
             self._journal.resolve_sold(pos.trade_id, state.filled_usdt,
                                        price, order_id, pos.committed_usdt)
             self._positions.pop(key, None)
-            LOG.info("SOLD %s %s | %.4f USDT at %.4f (entry %.4f)",
+            self._brackets.pop(key, None)
+            self._record_sale(key[0], pnl)
+            LOG.info("SOLD %s %s | %.4f USDT at %.4f (entry %.4f) P&L %+.4f",
                      pending.rnd.slug, pending.plan.side.value,
-                     state.filled_usdt, price, pos.signal.fill_price)
+                     state.filled_usdt, price, pos.signal.fill_price, pnl)
         else:
             self._positions[key] = replace(pos, committed_usdt=remaining)
             LOG.info("%s: sold %.4f of %.4f USDT at %.4f; %.4f left to settle",
@@ -6003,6 +6427,39 @@ class Trader:
                      remaining)
         return replace(pending, filled_usdt=state.filled_usdt,
                        filled_shares=state.filled_shares)
+
+    def _record_sale(self, symbol: str, pnl: float) -> None:
+        """
+        Report a position closed by SELLING to the risk manager.
+
+        THE GAP THIS CLOSES
+        -------------------
+        Every other ending reports itself from _settle_one. A sold position
+        never reaches _settle_one -- it leaves through _book_sale -- so
+        before this existed a profile that closes by selling reported no
+        results at all: daily_loss_limit_pct saw nothing, the consecutive
+        loss counter never moved, and the breaker meant to stop a bad day was
+        wired to a path such a profile never takes.
+
+        That was survivable while selling was rare. It is not survivable for
+        `scalp`, which closes every position this way, twenty times a round.
+
+        model_prob is deliberately not passed. The calibration statistics
+        answer one question -- did the price paid predict the outcome -- and
+        a position closed BEFORE the outcome existed has no answer to
+        contribute. Feeding one in would put a number in that bucket that no
+        round ever produced, which is the single figure this bot exists to
+        get right.
+
+        The paper bankroll moves here for the same reason: in paper mode
+        _settle_one is what credits P&L, so without this a paper scalper
+        would trade all day against a balance that never changed.
+        """
+        if not self._live:
+            self._paper_bankroll += pnl
+        self._risk_for(symbol).record_result(pnl > 0, pnl=pnl)
+        if self._account_risk is not None:
+            self._account_risk.record_result(pnl > 0, pnl=pnl)
 
     def _completion_is_worth_waiting_out(self, raw: Round, be_open: float,
                                          be_other: float,
@@ -6902,10 +7359,467 @@ class Trader:
                     or self._available(bankroll) < self._cfg.min_stake_usdt):
                 return
 
+    # -- scalping the futures lead ------------------------------------------
+
+    def _basis_dislocation_bps(self, symbol: str) -> float | None:
+        """
+        How far the perp/spot basis sits from its own recent mean, in bps.
+
+        The LEVEL of the basis says nothing about whether spot is lagging: it
+        is dominated by funding, which is a persistent bias and not
+        information. Gating on it would fire constantly on one side and never
+        on the other -- a funding-rate detector wearing a lead-lag costume.
+        The DEVIATION from its own recent mean is the quantity the premise
+        actually describes: the perp has moved and spot has not followed yet.
+
+        The mean is an EWMA advanced once per pass, which is the cheapest
+        estimator that does not need a second ring buffer. The deviation is
+        measured against the mean BEFORE this sample is folded in, or every
+        observation would be partly averaged into its own baseline and the
+        dislocation would report smaller than it is.
+
+        None until the EWMA has seen enough samples to be a mean rather than
+        the first observation restated -- and None, not 0.0, because "no
+        dislocation" and "no idea" must not read alike to the caller.
+        """
+        perp = self._market_data.futures_mid(symbol)
+        if perp is None or perp <= 0:
+            return None
+        try:
+            spot = self._market_data.spot(symbol)
+        except (ApiError, requests.RequestException) as exc:
+            LOG.debug("%s: no spot to measure the basis against: %s",
+                      symbol, exc)
+            return None
+        if spot <= 0:
+            return None
+        basis = (perp - spot) / spot * 10_000.0
+        mean, seen = self._basis_ewma.get(symbol, (basis, 0))
+        self._basis_ewma[symbol] = (
+            mean + (basis - mean) * BASIS_EWMA_ALPHA, seen + 1)
+        if seen < BASIS_EWMA_MIN_SAMPLES:
+            return None
+        return basis - mean
+
+    def _scalp_signal(self, symbol: str) -> tuple[Side, float, float] | None:
+        """
+        Which way the perp is going, or None when there is nothing to trade.
+
+        Returns (side, perp move in bps, basis dislocation in bps).
+
+        Two conditions, both required. The first is that the perp has moved
+        at all; the second is that spot has not followed it yet, which is
+        the half that makes this a lead rather than momentum. Setting
+        scalp_min_basis_bps to 0 drops the second and leaves a pure momentum
+        strategy -- a real setting, and a different one, so it is opted into
+        rather than arrived at.
+
+        The freshness check is per SYMBOL and cannot be delegated to the
+        socket's own health. That flag asks whether any frame arrived
+        recently across every subscription, so a busy BTC stream keeps it
+        green while a quiet market's newest tick is a minute old -- and a
+        minute-old tick is not a millisecond lead, it is history.
+        """
+        cfg = self._cfg
+        age = self._market_data.futures_tick_age_ms(symbol)
+        if age is None or age > cfg.scalp_max_tick_age_ms:
+            return None
+        move = self._market_data.futures_move_bps(symbol, cfg.scalp_lookback_ms)
+        if move is None or abs(move) < cfg.scalp_min_move_bps:
+            return None
+        side = Side.UP if move > 0 else Side.DOWN
+        if cfg.scalp_min_basis_bps <= 0:
+            return side, move, 0.0
+        dislocation = self._basis_dislocation_bps(symbol)
+        if dislocation is None:
+            return None
+        # Same sign as the move, by at least the threshold. A perp that has
+        # risen while the basis RICHENED means spot is behind; one that has
+        # risen while the basis cheapened means spot has already caught up
+        # and overtaken, and the thing being chased is over.
+        if move > 0 and dislocation < cfg.scalp_min_basis_bps:
+            return None
+        if move < 0 and dislocation > -cfg.scalp_min_basis_bps:
+            return None
+        return side, move, dislocation
+
+    def _maybe_enter_scalp(self, bankroll: float, mode: str) -> None:
+        """
+        Buy the side the perp is moving toward, and bracket it immediately.
+
+        No model, no strike, no volatility, no buffer. This path never asks
+        which side wins the round -- it asks which way this token's PRICE is
+        about to move, over the next few seconds, and takes a fixed profit or
+        a fixed loss either way.
+
+        A round is entered repeatedly, so _seen is deliberately never
+        written. Three bounds replace it: a per-round ceiling, a per-symbol
+        cooldown, and the requirement that the symbol be completely flat --
+        no position and no resting order. Stacking a second entry on a live
+        bracket would leave the stop watching a price that neither fill
+        chose.
+        """
+        cfg = self._cfg
+        now_ms = self._client.now_ms()
+        self._prune(now_ms)
+        if len(self._positions) >= cfg.max_concurrent_positions:
+            return
+
+        target = bankroll * cfg.scalp_stake_pct
+        if min(target, self._available(bankroll)) < cfg.min_stake_usdt:
+            LOG.debug("No uncommitted bankroll for a scalp (%.2f committed "
+                      "of %.2f)", self._committed(), bankroll)
+            return
+
+        now_s = time.monotonic()
+        for raw in self._client.list_rounds():
+            secs = raw.seconds_remaining(now_ms)
+            if not (cfg.entry_window_end_s <= secs <= cfg.entry_window_start_s):
+                continue
+            # Flat, on both counts. A pending order on this round is a
+            # bracket leg or an entry still resolving; either way the symbol
+            # is not free.
+            if any(k[0] == raw.symbol for k in self._positions):
+                continue
+            if any(p.rnd.symbol == raw.symbol for p in self._pending.values()):
+                continue
+            try:
+                self._risk_for(raw.symbol).check(bankroll)
+            except TradingHalted as exc:
+                LOG.debug("%s halted: %s", raw.symbol, exc)
+                continue
+
+            end_ms, taken = self._scalp_entries.get(raw.topic_id,
+                                                   (raw.end_ms, 0))
+            if taken >= cfg.scalp_max_entries_per_round:
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "the round's scalp ceiling is reached")
+                continue
+            last = self._scalp_last_entry.get(raw.symbol)
+            if last is not None and now_s - last < cfg.scalp_cooldown_s:
+                continue
+
+            if cfg.min_liquidity > 0 and (raw.liquidity is None
+                                          or raw.liquidity < cfg.min_liquidity):
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "the book is thinner than the minimum")
+                continue
+
+            # The bracket has to be worth placing before a quote is spent on
+            # finding out. This is a property of the market's fee and the two
+            # targets, so it can be answered before anything is asked of the
+            # venue.
+            required = signal_edge_required(raw.fee_bps,
+                                            cfg.scalp_take_profit_pct,
+                                            cfg.scalp_stop_loss_pct)
+            if required is None or required > cfg.scalp_max_edge_required:
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "the fee demands more signal than the "
+                                "bracket can carry")
+                LOG.debug("%s: a %d bps fee needs %s hit-rate points over a "
+                          "coin flip, above the %.2f ceiling", raw.slug,
+                          raw.fee_bps,
+                          "no reachable" if required is None
+                          else f"{required:.2f}", cfg.scalp_max_edge_required)
+                continue
+
+            symbol = self._client.market_symbol(raw.feed_symbol)
+            signal = self._scalp_signal(symbol)
+            if signal is None:
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "the futures feed shows no lead to trade")
+                continue
+            side, move_bps, dislocation = signal
+
+            stake = min(target, self._available(bankroll))
+            if stake < cfg.min_stake_usdt:
+                continue
+
+            quote = None
+            price = self._book_price(raw, side)
+            if price is None:
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "the side has no tradable price")
+                continue
+            if self._live:
+                fresh = self._live_bankroll("scalp entry")
+                if fresh is None:
+                    continue
+                stake = min(stake, fresh)
+                if stake < cfg.min_stake_usdt:
+                    LOG.warning("%s: the wallet holds %.2f, under the %.2f "
+                                "minimum order; skipping", raw.slug, fresh,
+                                cfg.min_stake_usdt)
+                    continue
+                quote = self._client.get_quote(raw, _market_buy(side, stake))
+                # The quote is authoritative; the book was a screen. Every
+                # gate below binds on the price that will actually execute,
+                # because the bracket is computed from that price and a
+                # bracket built on a screen price protects nothing.
+                price = quote.average_price
+                if abs(quote.price_impact) > cfg.max_price_impact:
+                    LOG.info("%s: price impact %.1f%% too high for a scalp; "
+                             "skipping", raw.slug, quote.price_impact * 100)
+                    continue
+            if not cfg.min_entry_price <= price <= cfg.max_entry_price:
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "the side is priced outside the band")
+                continue
+
+            bracket = bracket_prices(price, raw.fee_bps,
+                                     cfg.scalp_take_profit_pct,
+                                     cfg.scalp_stop_loss_pct)
+            if bracket is None:
+                # Usually the take-profit landing at or above 1.00: this fill
+                # is too near the top of the book for a 5% gain to exist.
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "no bracket fits around the price on offer")
+                continue
+            tp_price, stop_price = bracket
+
+            self._watching.pop(raw.topic_id, None)
+            placed = self._place_leg(raw, side, price, stake, quote)
+            if placed is None:
+                continue                  # killed by the venue; nothing open
+            price, stake, order_id = placed
+            # Re-derive from the CONFIRMED fill. _place_leg can come back
+            # with a different price and a smaller stake than the screen, and
+            # a bracket around the wrong price is the one failure this whole
+            # strategy cannot absorb.
+            bracket = bracket_prices(price, raw.fee_bps,
+                                     cfg.scalp_take_profit_pct,
+                                     cfg.scalp_stop_loss_pct)
+            if bracket is None:
+                LOG.error("%s: filled at %.4f, which no bracket fits; "
+                          "closing it straight back out", raw.slug, price)
+                tp_price = stop_price = 0.0
+            else:
+                tp_price, stop_price = bracket
+
+            # model_prob is the MARKET'S implied probability, not a forecast:
+            # this path makes none. Recorded so the journal row says what was
+            # paid. edge is 0.0 because paying the market price is by
+            # definition no edge over it, and every one of these rows closes
+            # as settle_source='sold', which diagnose() already keeps out of
+            # the calibration buckets.
+            sig = Signal(side, model_prob=breakeven_probability(price,
+                                                               raw.fee_bps),
+                         fill_price=price, edge=0.0, stake_usdt=stake,
+                         seconds_left=secs)
+            tid = self._journal.record(mode, raw, sig, spot=math.nan,
+                                       sigma=math.nan, bankroll=bankroll,
+                                       order_id=order_id,
+                                       order_type=OrderType.MARKET.value)
+            key = (raw.symbol, side)
+            self._positions[key] = Position(tid, raw, sig, stake, 1)
+            self._scalp_entries[raw.topic_id] = (raw.end_ms, taken + 1)
+            self._scalp_last_entry[raw.symbol] = now_s
+            LOG.info("SCALP %s %s | in %.4f (%.2f) tp %.4f stop %.4f | perp "
+                     "%+.1fbp basis %+.1fbp (%.0fs left, #%d)",
+                     raw.slug, side.value, price, stake, tp_price, stop_price,
+                     move_bps, dislocation, secs, taken + 1)
+
+            if bracket is None:
+                self._sell_now(self._positions[key], "no bracket fits")
+            else:
+                self._arm_bracket(key, price, tp_price, stop_price)
+
+            if (len(self._positions) >= cfg.max_concurrent_positions
+                    or self._available(bankroll) < cfg.min_stake_usdt):
+                return
+
+    def _arm_bracket(self, key: tuple[str, Side], entry: float,
+                     tp_price: float, stop_price: float) -> None:
+        """
+        Post the resting take-profit and arm the stop.
+
+        Only the take-profit becomes an order. The stop is a price this bot
+        watches, because a SELL limit below the bid is marketable and would
+        close the position on the spot instead of waiting -- see Bracket.
+
+        A take-profit the venue refuses is not fatal and is not silent: the
+        stop still guards the position, and the flatten deadline still closes
+        it. What would be fatal is recording a bracket whose take-profit does
+        not exist, so the order id stays None and _check_stops has nothing to
+        cancel.
+        """
+        pos = self._positions.get(key)
+        if pos is None:
+            return
+        tp_price = pos.rnd.round_price(tp_price)
+        shares = pos.committed_usdt / max(pos.signal.fill_price, EPS)
+        order_id: str | None = None
+        if 0.0 < tp_price < 1.0 and shares > EPS:
+            plan = OrderPlan(side=pos.signal.side, action=Action.SELL,
+                             order_type=OrderType.LIMIT, amount=shares,
+                             price_limit=tp_price)
+            try:
+                if self._live:
+                    quote = self._client.get_quote(pos.rnd, plan)
+                    order_id = str(self._client.place_order(pos.rnd, quote))
+                else:
+                    order_id = str(self._paper_book.place(plan, pos.rnd))
+            except (ApiError, requests.RequestException) as exc:
+                LOG.error("%s: the take-profit was refused (%s); the stop and "
+                          "the flatten deadline are all that guard this "
+                          "position", pos.rnd.slug, exc)
+                order_id = None
+            if order_id is not None:
+                self._pending[order_id] = PendingOrder(
+                    order_id=order_id, rnd=pos.rnd, plan=plan,
+                    signal=pos.signal,
+                    # Round end, not the entry window: a take-profit is not
+                    # an entry and has no reason to stop being useful when
+                    # entries do. The flatten deadline retracts it first in
+                    # the ordinary case; this is the backstop.
+                    expires_at_ms=pos.rnd.end_ms,
+                    filled_usdt=0.0, filled_shares=0.0,
+                    trade_id=pos.trade_id)
+        self._brackets[key] = Bracket(entry_price=entry, tp_price=tp_price,
+                                      stop_price=stop_price,
+                                      tp_order_id=order_id)
+
+    def _check_stops(self) -> None:
+        """
+        Fire the stop leg on any bracket whose bid has fallen to it.
+
+        Runs after the reaper, so a take-profit that filled this pass has
+        already closed its position and taken its bracket with it -- which is
+        the "cancel the other one" half of the pair, in the direction where
+        there is nothing to cancel.
+        """
+        if not self._cfg.scalp:
+            return
+        for key, bracket in list(self._brackets.items()):
+            pos = self._positions.get(key)
+            if pos is None:
+                self._brackets.pop(key, None)
+                continue
+            bids = self._market_data.bids(pos.rnd, pos.signal.side)
+            if not bids:
+                continue
+            bid = bids[0][0]
+            if bid > bracket.stop_price:
+                continue
+            LOG.info("STOP %s %s | bid %.4f at or under %.4f (entry %.4f, "
+                     "take-profit was %.4f)", pos.rnd.slug,
+                     pos.signal.side.value, bid, bracket.stop_price,
+                     bracket.entry_price, bracket.tp_price)
+            if bracket.tp_order_id and not self._retract(
+                    bracket.tp_order_id, "stop triggered"):
+                # The take-profit could not be reached. Selling now would put
+                # more shares on offer than the position holds, and the venue
+                # would fill both. Wait a pass; the stop re-fires while the
+                # bid stays down.
+                continue
+            self._brackets.pop(key, None)
+            pos = self._positions.get(key)
+            if pos is None:
+                # The cancel raced the take-profit and lost: it had already
+                # filled, and _retract booked it. That is the good ending.
+                continue
+            self._sell_now(pos, "stop")
+
+    def _flatten_scalps(self) -> None:
+        """
+        Close everything before the last minute, and place nothing inside it.
+
+        The book thins as a round ends, which is the whole reason the profile
+        stops early -- so this fires at the edge of that minute rather than
+        inside it, and each round is flattened exactly once. Re-running it
+        would cancel the very exit order the first pass placed.
+        """
+        if not self._cfg.scalp:
+            return
+        now_ms = self._client.now_ms()
+        due = {p.rnd.topic_id for p in self._positions.values()
+               if p.rnd.seconds_remaining(now_ms) <= self._cfg.scalp_flatten_s}
+        due -= self._flattened
+        if not due:
+            return
+        for order_id, pending in list(self._pending.items()):
+            if pending.rnd.topic_id in due:
+                self._retract(order_id, "flatten deadline")
+        for key, pos in list(self._positions.items()):
+            if pos.rnd.topic_id not in due:
+                continue
+            self._brackets.pop(key, None)
+            LOG.info("FLATTEN %s %s | %.4f USDT with %.0fs left",
+                     pos.rnd.slug, pos.signal.side.value, pos.committed_usdt,
+                     pos.rnd.seconds_remaining(now_ms))
+            if not self._sell_now(pos, "flatten"):
+                # The honest fallback. Retrying into a book that is not there
+                # is how a 5% loss becomes a 100% one; letting the oracle
+                # decide is the smaller of the two bad endings, and it is the
+                # one the rest of this bot already knows how to finish.
+                LOG.error("%s: could not flatten %.4f USDT; it will run to "
+                          "settlement as a FULL-STAKE bet, which is not what "
+                          "this profile's risk numbers assume",
+                          pos.rnd.slug, pos.committed_usdt)
+        self._flattened |= due
+
+    def _sell_now(self, pos: Position, reason: str) -> bool:
+        """
+        Offer the whole position back to the market, to be filled now.
+
+        A MARKETABLE LIMIT, NOT A MARKET ORDER, and the difference matters at
+        exactly the moment this is called. A MARKET order here is FOK: on the
+        thin book that triggered the stop it fills entirely or not at all, and
+        "not at all" is a position that was supposed to be capped and is now
+        running to settlement. A limit priced through the bid sweeps whatever
+        depth exists, keeps the partial fill, and rests the remainder where
+        the reaper will retract it.
+
+        The price is the best bid less the profile's own slippage cap, so how
+        far this is willing to reach through the book is the number that
+        already governs how far every other order may reach.
+
+        True when an order went out. False means the position is still open
+        and nothing is protecting it, which every caller reports loudly.
+        """
+        bids = self._market_data.bids(pos.rnd, pos.signal.side)
+        if not bids:
+            LOG.error("%s: nothing is bidding for %s; cannot sell",
+                      pos.rnd.slug, pos.signal.side.value)
+            return False
+        floor = bids[0][0] * (1.0 - self._cfg.max_slippage_bps / 10_000.0)
+        price = pos.rnd.round_price(floor)
+        if not 0.0 < price < 1.0:
+            LOG.error("%s: a sale through the bid prices at %.4f, which is "
+                      "not tradable", pos.rnd.slug, price)
+            return False
+        shares = pos.committed_usdt / max(pos.signal.fill_price, EPS)
+        if shares <= EPS:
+            return False
+        plan = OrderPlan(side=pos.signal.side, action=Action.SELL,
+                         order_type=OrderType.LIMIT, amount=shares,
+                         price_limit=price)
+        try:
+            if self._live:
+                quote = self._client.get_quote(pos.rnd, plan)
+                order_id = str(self._client.place_order(pos.rnd, quote))
+            else:
+                order_id = str(self._paper_book.place(plan, pos.rnd))
+        except (ApiError, requests.RequestException) as exc:
+            LOG.error("%s: the %s sale was refused: %s", pos.rnd.slug,
+                      reason, exc)
+            return False
+        self._pending[order_id] = PendingOrder(
+            order_id=order_id, rnd=pos.rnd, plan=plan, signal=pos.signal,
+            expires_at_ms=pos.rnd.end_ms, filled_usdt=0.0, filled_shares=0.0,
+            trade_id=pos.trade_id)
+        LOG.info("SELL %s %s | %.4f shares through the bid at %.4f (%s)",
+                 pos.rnd.slug, pos.signal.side.value, shares, price, reason)
+        return True
+
     def _maybe_scale_in_all(self, bankroll: float) -> None:
-        if self._cfg.last_minute:
-            # One order, one round, held to settlement. Config rejects
-            # last_minute + scale_in outright; this is the belt to that
+        if self._cfg.last_minute or self._cfg.scalp:
+            # last_minute: one order, one round, held to settlement.
+            # scalp: a top-up would move the fill price the bracket was
+            # already computed from, leaving the stop guarding a level
+            # neither tranche chose.
+            #
+            # Config rejects both pairings outright; this is the belt to that
             # brace, so a future caller cannot route around the validation.
             return
         if self._cfg.straddle:
@@ -7408,8 +8322,11 @@ def preflight(cfg: Config) -> int:
     # refusing boots because an accelerator was slow.
     time.sleep(2.0)
     feeds = md.status()
+    # futures is "off" unless the scalp strategy is selected -- and for that
+    # strategy it is the one feed whose absence means no trading at all.
     check("websocket feeds",
-          lambda: f"spot {feeds['spot']}, book {feeds['book']}")
+          lambda: f"spot {feeds['spot']}, book {feeds['book']}, "
+                  f"futures {feeds['futures']}")
     md.stop()
     def vol_check() -> str:
         est = VolatilityEstimator(cfg, ws_feeds.MarketData(client, cfg))

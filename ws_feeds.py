@@ -32,6 +32,7 @@ import math
 import re
 import threading
 import time
+from collections import deque
 from collections.abc import Callable
 
 import websocket
@@ -727,6 +728,217 @@ class SpotFeed:
             return list(window) if window else None
 
 
+def _wall_ms() -> float:
+    """Now, in milliseconds, on the clock the perp samples are stamped with."""
+    return time.time() * 1000.0
+
+
+def parse_futures_frame(raw: str) -> tuple[str, float, float] | None:
+    """
+    (symbol, best bid, best ask) from one bookTicker frame, or None.
+
+    bookTicker carries no `e` field on the futures combined stream, so the
+    event type cannot be the discriminator the way it is for spot. The
+    presence of all four price/size fields is: a control reply to SUBSCRIBE
+    has none of them, and neither does any other stream this feed opens.
+    """
+    try:
+        envelope = json.loads(raw)
+        if not isinstance(envelope, dict):
+            return None
+        data = envelope.get("data")
+        if not isinstance(data, dict):
+            return None
+        symbol = str(data.get("s") or "").upper()
+        bid = float(data["b"])
+        ask = float(data["a"])
+    except (ValueError, TypeError, KeyError):
+        return None
+    if not symbol or bid <= 0 or ask <= 0 or ask < bid:
+        return None
+    return symbol, bid, ask
+
+
+class FuturesFeed:
+    """
+    Best bid/ask on the USD-M perpetual, and a short history of the mid.
+
+    Spot follows the perp, so the perp is a forecast of the quantity the
+    prediction market settles against. The `scalp` strategy is the only
+    reader; see docs/superpowers/specs/2026-09-10-futures-lead-scalping-design.md.
+
+    WHY THERE IS NO REST FALLBACK HERE
+    ----------------------------------
+    Every other feed in this file falls back to the REST call it replaced,
+    deliberately, so the REST path stays exercised rather than rotting into
+    code that is discovered broken the first time it is needed. This one does
+    not, and the difference is not an oversight.
+
+    The signal being read is a lead measured in milliseconds. Sampled by a
+    REST round trip inside a poll loop it is not a degraded version of that
+    signal -- it is a different quantity that happens to have the same units,
+    and trading it would be trading noise while believing otherwise. When the
+    socket is unhealthy this feed answers None and the strategy sits out,
+    which is the honest answer and the safe one.
+
+    Samples are kept as (wall-clock ms, mid) pairs in a bounded deque per
+    symbol. The bound
+    is time, not count: a busy market pushes hundreds of frames a second and
+    a quiet one pushes none, so a fixed-length ring would hold a millisecond
+    of one market and ten minutes of another.
+    """
+
+    def __init__(self, client, cfg_source) -> None:
+        self._client = client
+        self._cfg_source = cfg_source
+        self._ticks: dict[str, deque[tuple[float, float]]] = {}
+        self._tracked: set[str] = set()
+        self._lock = threading.Lock()
+        self._conn = WsConnection(
+            name="futures", url_factory=self._url, on_message=self._on_frame,
+            cfg_source=cfg_source, on_open=self.on_reconnect)
+
+    @property
+    def _cfg(self):
+        current = getattr(self._cfg_source, "current", None)
+        return self._cfg_source if current is None else current
+
+    def _url(self) -> str:
+        return self._cfg.ws_futures_url
+
+    def start(self) -> None:
+        self._conn.start()
+
+    def stop(self) -> None:
+        self._conn.stop()
+
+    @property
+    def healthy(self) -> bool:
+        return self._conn.healthy
+
+    @staticmethod
+    def _streams(symbol: str) -> list[str]:
+        # bookTicker only. @aggTrade would add the last traded price, which
+        # is a different quantity from the mid and lags it by however long
+        # nobody happened to trade -- exactly the lag this feed exists to
+        # measure, reintroduced inside the measurement.
+        return [f"{symbol.lower()}@bookTicker"]
+
+    def track(self, symbols) -> None:
+        """Follow the traded set, the way SpotFeed does."""
+        wanted = {s.upper() for s in symbols if s}
+        with self._lock:
+            added = wanted - self._tracked
+            dropped = self._tracked - wanted
+            self._tracked = set(wanted)
+        if added:
+            self._control("SUBSCRIBE", added)
+        if dropped:
+            self._control("UNSUBSCRIBE", dropped)
+            with self._lock:
+                for symbol in dropped:
+                    self._ticks.pop(symbol, None)
+
+    def _control(self, method: str, symbols) -> None:
+        params = [s for symbol in sorted(symbols)
+                  for s in self._streams(symbol)]
+        self._conn.send(json.dumps({"method": method, "params": params,
+                                    "id": int(time.time() * 1000) % 1_000_000}))
+
+    def on_reconnect(self, _conn) -> None:
+        """
+        Resubscribe, and throw the history away.
+
+        A drop of any length leaves a hole, and a move measured across it
+        describes a jump the perp never made in the time this thinks it did.
+        There is nothing to re-seed from -- the venue publishes no history of
+        the best bid/ask -- so the window simply restarts, and `move_bps`
+        answers None until it has refilled. A few seconds of not trading is
+        the correct price for not inventing a move.
+        """
+        with self._lock:
+            tracked = sorted(self._tracked)
+            self._ticks.clear()
+        if tracked:
+            self._control("SUBSCRIBE", tracked)
+
+    def _on_frame(self, raw: str) -> None:
+        parsed = parse_futures_frame(raw)
+        if parsed is None:
+            return
+        symbol, bid, ask = parsed
+        now_ms = _wall_ms()
+        with self._lock:
+            ring = self._ticks.setdefault(symbol, deque())
+            ring.append((now_ms, (bid + ask) / 2.0))
+            self._trim(ring, now_ms)
+
+    def _trim(self, ring, now_ms: float) -> None:
+        """
+        Drop samples older than the window, keeping one behind it.
+
+        The one behind is load-bearing: `move_bps` needs a sample at or
+        before the requested lookback to measure against, and a ring trimmed
+        to exactly the window has its oldest sample drift inside it between
+        frames, which silently shortens every measurement.
+        """
+        horizon = now_ms - self._window_ms()
+        while len(ring) > 1 and ring[1][0] < horizon:
+            ring.popleft()
+
+    def _window_ms(self) -> float:
+        # A little slack over the configured lookback so a reader asking for
+        # exactly that window always finds a sample spanning it.
+        return max(self._cfg.scalp_lookback_ms * 2.0, 1000.0)
+
+    def mid(self, symbol: str) -> float | None:
+        """Most recent perp mid, or None when the feed cannot be trusted."""
+        if not self._conn.healthy:
+            return None
+        with self._lock:
+            ring = self._ticks.get(symbol.upper())
+            return ring[-1][1] if ring else None
+
+    def tick_age_ms(self, symbol: str) -> float | None:
+        """Age of the newest sample. None when there is none."""
+        if not self._conn.healthy:
+            return None
+        with self._lock:
+            ring = self._ticks.get(symbol.upper())
+            if not ring:
+                return None
+            return _wall_ms() - ring[-1][0]
+
+    def move_bps(self, symbol: str, lookback_ms: float) -> float | None:
+        """
+        Signed perp return over the last `lookback_ms`, in basis points.
+
+        None when the window is not covered. That is not the same as zero: a
+        feed that has been up for 200ms has not observed a flat market, it
+        has observed nothing, and answering 0.0 would let a strategy read
+        "no move" out of "no data".
+        """
+        if not self._conn.healthy:
+            return None
+        with self._lock:
+            ring = self._ticks.get(symbol.upper())
+            if not ring or len(ring) < 2:
+                return None
+            now_ms, last = ring[-1]
+            horizon = now_ms - lookback_ms
+            base = None
+            for ts, mid in ring:
+                if ts <= horizon:
+                    base = mid
+                else:
+                    break
+            if base is None or base <= 0:
+                # The oldest sample is already inside the window, so the feed
+                # has not been up long enough to answer the question asked.
+                return None
+        return (last - base) / base * 10_000.0
+
+
 class MarketData:
     """
     The only thing the trading code knows about any of this.
@@ -743,6 +955,7 @@ class MarketData:
         self._cfg_source = cfg_source
         self._spot = SpotFeed(client, cfg_source)
         self._book = BookFeed(client, cfg_source)
+        self._futures = FuturesFeed(client, cfg_source)
 
     @property
     def _cfg(self):
@@ -762,14 +975,21 @@ class MarketData:
             return
         self._spot.start()
         self._book.start()
+        # Only the scalp strategy reads it, and a socket nobody reads is a
+        # connection, a thread and a subscription spent on nothing.
+        if self._cfg.scalp:
+            self._futures.start()
 
     def stop(self) -> None:
         self._spot.stop()
         self._book.stop()
+        self._futures.stop()
 
     def track(self, symbols) -> None:
         if self._cfg.ws_enabled:
             self._spot.track(symbols)
+            if self._cfg.scalp:
+                self._futures.track(symbols)
 
     def spot(self, symbol: str) -> float:
         if self._cfg.ws_enabled:
@@ -799,12 +1019,40 @@ class MarketData:
                 return levels
         return self._client.bids_for(rnd, side)
 
+    def futures_mid(self, symbol: str) -> float | None:
+        """
+        Perp mid, or None. NO REST fallback -- see FuturesFeed's docstring.
+
+        None whenever the socket is unhealthy, the feed is not running, or
+        nothing has arrived for this symbol yet. Each of those means the same
+        thing to the only caller: do not trade on a signal that is not there.
+        """
+        if not (self._cfg.ws_enabled and self._cfg.scalp):
+            return None
+        return self._futures.mid(symbol)
+
+    def futures_move_bps(self, symbol: str,
+                         lookback_ms: float) -> float | None:
+        """Signed perp return over the window, in bps, or None."""
+        if not (self._cfg.ws_enabled and self._cfg.scalp):
+            return None
+        return self._futures.move_bps(symbol, lookback_ms)
+
+    def futures_tick_age_ms(self, symbol: str) -> float | None:
+        """Age of the newest perp sample, or None."""
+        if not (self._cfg.ws_enabled and self._cfg.scalp):
+            return None
+        return self._futures.tick_age_ms(symbol)
+
     def status(self) -> dict[str, str]:
         """One word per feed, for preflight and the log line at startup."""
         if not self._cfg.ws_enabled:
-            return {"spot": "off", "book": "off"}
-        out = {}
-        for name, feed in (("spot", self._spot), ("book", self._book)):
+            return {"spot": "off", "book": "off", "futures": "off"}
+        out = {"futures": "off"}
+        feeds = [("spot", self._spot), ("book", self._book)]
+        if self._cfg.scalp:
+            feeds.append(("futures", self._futures))
+        for name, feed in feeds:
             if feed._conn.disabled:
                 out[name] = "disabled"
             elif feed.healthy:

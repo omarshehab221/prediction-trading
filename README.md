@@ -171,8 +171,8 @@ to one.
 
 ## 6. Profiles
 
-Eight strategies, differing in which contracts they buy. The first six pick a
-side from the model; the last two do not consult it at all.
+Eight strategies, differing in which contracts they buy. Five pick a side from
+the model; `straddle`, `scalp` and `lastminute` do not consult it at all.
 
 | Profile | Entry band | Max stake | Buffer gate | Entry window | Paper |
 |---|---|---|---|---|---|
@@ -182,7 +182,7 @@ side from the model; the last two do not consult it at all.
 | `balanced` | 0.10–0.90 | 5% | — | 150–25s | $100 |
 | `convex` | 0.05–0.35 | 2% | — | 280–30s | $100 |
 | `straddle` | both sides | 20% per leg | — | 60s from open | $100 |
-| `maker` | 0.10–0.85 | 5% | — | 240–45s | $100 |
+| `scalp` | 0.15–0.85 | 5% per round trip | — | 300–75s, flat at 60s | $100 |
 | `lastminute` *(default)* | any | 10% per round | — | 60–5s | $100 |
 
 **`buffer`** encodes "wait for a buffer to open, back the side it favours,
@@ -206,11 +206,10 @@ not chosen.
 when the pair's worst case still pays back more than it cost. No side is ever
 picked, so direction stops mattering.
 
-**`maker`** is the only profile that does not cross the spread. It posts a
-resting bid and waits to be hit, which is why its entry window is the widest
-here and closes earliest — a resting order is retracted when the window shuts,
-so a narrow window posts an order and takes it back before anyone could take
-it. See §6c.
+**`scalp`** follows the perpetual future instead of the model, and trades the
+token's price over a few seconds rather than the round's outcome: many small
+round trips, each bracketed at +/-5% of stake. See §6.4 -- and read the part
+about the fee before running it.
 
 **`lastminute`** is described in §6.3. It is the only profile that reads
 nothing but the price.
@@ -376,6 +375,64 @@ them to?* It halts if they are not.
 
 ---
 
+### 6.4 Scalping the futures lead (`scalp`)
+
+Spot follows the USD-M perpetual by milliseconds, and the prediction market
+settles on spot. So a perp move is a forecast of the settlement quantity, and
+while the prediction book has not caught up with it, the side the move points
+at is underpriced.
+
+`scalp` buys that side at market and brackets it at once: a resting limit sell
+that returns **+5% of the stake**, and a stop that caps the loss at **-5%**.
+Whichever closes the position, the other is cancelled, and once the symbol is
+flat it goes again -- up to 20 round trips a round, and no more than one every
+2 seconds per symbol. Nothing is held to settlement on purpose, so this is the
+one profile whose P&L does not depend on the oracle.
+
+**The signal** is two conditions, and both have to hold:
+
+1. the perp mid has moved at least 2 bps over the last 1.5 s. The sign of the
+   move picks UP or DOWN;
+2. the perp/spot basis has moved at least 0.5 bps away from its own recent
+   mean, in the same direction -- spot has not caught up yet. This is measured
+   as a dislocation, not a level, because the level is mostly funding.
+
+**The stop is not an order.** The venue has no stop or conditional order type,
+and a sell limit priced below the bid fills immediately instead of waiting. So
+only the take-profit rests on the book, and the stop is a price the bot
+watches. When the bid falls to it, the bot cancels the take-profit, re-reads
+it (the cancel can race a fill), and sells what is left with a limit priced
+through the bid. It does not use a fill-or-kill market order here: on the thin
+book that triggered the stop, that fills entirely or not at all.
+
+**The window is two numbers.** New entries stop with 75 s left. At 60 s every
+scalp order is cancelled and every position sold, so nothing is placed inside
+the last minute. If that sale fails, the position runs to settlement and the
+log says so at ERROR, because at that point it is a full-stake bet.
+
+**The fee decides whether this can work.** The 5% is P&L, and the fee is paid
+on the way out of both legs, so it pushes both exit prices up:
+
+| Fee | Rise for +5% | Fall for -5% | Stop hit first, no signal | Edge the signal must add |
+|---|---|---|---|---|
+| 0 bps | 5.00% | 5.00% | 50% | 0 points |
+| 200 bps | 7.14% | 3.06% | 70% | 20 points |
+
+At 200 bps a market with no opinion hits the stop seven times in ten, about
+-2% of stake per round trip, so the signal has to be right about 70% of the
+time to break even. `scalp_max_edge_required` (0.25) makes that a gate: a
+market whose fee demands more is skipped, not traded quietly. If this profile
+is losing, look here first.
+
+**The futures feed has no REST fallback.** A millisecond lead sampled by a REST
+call inside a poll loop is a different signal that only looks like this one.
+If the socket is down, or a symbol's newest tick is more than 2 s old, `scalp`
+does not trade.
+
+**What it is not yet.** The signal is read inside a 1 s poll loop, so what is
+actually traded is a 1-2 second momentum signal. The millisecond lead is the
+premise, not the speed; making it fast is separate work.
+
 ## 6b. Feeds
 
 Three reads used to sit inside the poll loop as blocking round trips: the
@@ -393,6 +450,8 @@ three now arrive on persistent sockets.
     from one REST fetch. The window is 500 closes, so building it from the
     stream alone would leave volatility unusable for 8.3 hours after every
     restart.
+  * **Perpetual futures** -- `@bookTicker` on `fstream.binance.com`, opened
+    only when `scalp` is on. Read by nothing else.
 
 Everything signed and mutating -- quotes, orders, redemptions, balances,
 market discovery -- stays on REST. That is not a gap to be closed later;
@@ -412,7 +471,8 @@ out-of-order updates and for nothing else.
 
 Every read falls back to the REST call that was already there. That keeps
 the REST path exercised on every gap, rather than letting it rot into
-untested code discovered broken the first time it is needed.
+untested code discovered broken the first time it is needed. The futures feed
+is the one exception, on purpose: see §6.4.
 
 ### The mapping the venue does not document
 
@@ -441,8 +501,8 @@ Two order types, chosen per profile.
 
 **MARKET** crosses the spread. It is fill-or-kill: it fills completely at the
 quoted price or it is killed, so there is never a partial position at a price
-the model did not approve. Every profile except `maker` uses it, and it is
-what this bot did exclusively before limit orders existed.
+the model did not approve. Every profile enters with it, and it is what this
+bot did exclusively before limit orders existed.
 
 **LIMIT** rests on the book. The venue only accepts `GTC` for a limit order --
 there is no IOC -- so it sits there until it fills, or until the bot retracts
@@ -491,6 +551,14 @@ the entry fills and lets the venue wait; `POLLED` watches the bid and sends
 only once it crosses. `RESTING` with `MARKET` is refused at startup, because a
 market order cannot rest.
 
+`BRACKET` is the fourth value, and only `scalp` uses it. Its exit prices come
+from the price the position filled at and the P&L it will accept, not from the
+model, so `exit_trigger` does not apply to it. See §6.4.
+
+A sale is reported to the risk manager the way a settlement is: it counts
+toward the daily loss limit, the loss streak and the daily round count. It
+does not count toward calibration.
+
 A sold position never settles and is never redeemed — the shares are gone. Its
 journal row closes from the sale proceeds and is marked `sold`, and
 `--calibration-report` **excludes sold trades from its price buckets**. Those
@@ -502,7 +570,7 @@ instead.
 
 A resting bid fills when someone is willing to sell into it, and that
 correlates with the market moving against it. The edge here is measured against
-the model, not against the fill, so a maker strategy can show a good edge and a
+the model, not against the fill, so a strategy that rests its entries can show a good edge and a
 bad P&L at once. The journal records `order_type` on every trade, so
 `--calibration-report` can be asked whether limit fills calibrate differently
 from market fills. Until that data exists this is an open question, not a
