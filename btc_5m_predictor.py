@@ -83,6 +83,37 @@ from enum import Enum
 import requests
 
 import ws_feeds
+from btc5m.constants import (
+    BASIS_EWMA_ALPHA,
+    BASIS_EWMA_MIN_SAMPLES,
+    DEFAULT_FEE_BPS,
+    DEFAULT_ROUND_SECONDS,
+    EPS,
+    LOG,
+    WS_BOOK_VALIDATE_TOL,
+)
+from btc5m.units import WEI, _as_float_or_none, from_wei, to_wei
+from btc5m.venue.endpoints import BASE, CEX_ACCOUNT_TYPES, DEFAULT_ENDPOINTS
+from btc5m.errors import (
+    ApiError,
+    ERROR_CODES,
+    ErrorKind,
+    NothingToRedeem,
+    OrderNotFilled,
+    Shutdown,
+    TradingHalted,
+    _ALREADY_REDEEMED_HINTS,
+    _AboveBalance,
+    _MESSAGE_HINTS,
+    _is_already_redeemed,
+)
+from btc5m.stats import (
+    _betacf,
+    betainc,
+    norm_cdf,
+    standardised_t_cdf,
+    student_t_cdf,
+)
 
 # Run as a script, this file is the main module -- and ws_feeds' lazy
 # `from btc_5m_predictor import Side` would then import it a SECOND time,
@@ -93,92 +124,9 @@ import ws_feeds
 if __name__ != "btc_5m_predictor":
     sys.modules.setdefault("btc_5m_predictor", sys.modules[__name__])
 
-LOG = logging.getLogger("btc5m")
-
-BASE = "https://api.binance.com"
-# Target round length. A constant here would silently exclude every market if
-# the venue ever lists a different cadence; the tolerance is a fraction of the
-# target rather than a fixed number of seconds.
-DEFAULT_ROUND_SECONDS = 300
-WEI = Decimal(10) ** 18
-
-# Tolerance for float comparisons on money and probabilities. One name so a
-# later change cannot leave some comparisons stricter than others.
-EPS = 1e-9
-
-# Fallback only, for journal rows written before the fee column existed.
-DEFAULT_FEE_BPS = 200
-
-# The perp/spot basis is tracked as an EWMA so the scalp strategy can measure
-# a DISLOCATION rather than a level -- the level is mostly funding, which is a
-# bias and not information. Not configurable on purpose: these describe how a
-# mean is estimated, not what the strategy will accept, and every knob that
-# blurs that distinction ends up tuned against the sample it was measured on.
-#
-# 0.05 is a ~14-sample half-life, which at the profile's 1s poll is about a
-# quarter minute of "recent". The minimum sample count is what stops the very
-# first observation being compared against itself and reported as a signal.
-BASIS_EWMA_ALPHA = 0.05
-BASIS_EWMA_MIN_SAMPLES = 20
-
-# How far the WebSocket-derived ask ladder may sit from the REST ladder it is
-# validated against, at top of book, in absolute price. Loose enough to
-# survive the few hundred milliseconds between the push and the REST reply on
-# a live book; far tighter than the |1 - 2p| error a transposed side mapping
-# would produce anywhere away from 0.50, which is the mistake this check
-# exists to catch.
-WS_BOOK_VALIDATE_TOL = 0.02
-
-# Verified against @binance/w3w-prediction. Overridable in the config
-# file under "endpoints"; run --write-config to generate one.
-# (HTTP method, path). The verb travels WITH the path: keeping them apart is
-# what produced "Request method 'GET' is not supported" on trade/get-quote.
-# Methods verified against @binance/w3w-prediction 2.0.1.
-DEFAULT_ENDPOINTS: dict[str, tuple[str, str]] = {
-    "category_list": ("GET", "/sapi/v1/w3w/wallet/prediction/category/list"),
-    "market_list": ("GET", "/sapi/v1/w3w/wallet/prediction/market/list"),
-    "market_detail": ("GET", "/sapi/v1/w3w/wallet/prediction/market/detail"),
-    "order_book": ("GET", "/sapi/v1/w3w/wallet/prediction/order-book"),
-    "last_trade_price": ("GET", "/sapi/v1/w3w/wallet/prediction/order-book/last-trade-price"),
-    "wallet_list": ("GET", "/sapi/v1/w3w/wallet/prediction/wallet/list"),
-    "balances": ("GET", "/sapi/v1/w3w/wallet/prediction/balance/payment-options"),
-    "quota_status": ("GET", "/sapi/v1/w3w/wallet/prediction/quota/limit/status"),
-    "get_quote": ("POST", "/sapi/v1/w3w/wallet/prediction/trade/get-quote"),
-    "place_order": ("POST", "/sapi/v1/w3w/wallet/prediction/trade/place-order-bundle"),
-    "positions": ("GET", "/sapi/v1/w3w/wallet/prediction/position/list"),
-    "settled_history": ("GET", "/sapi/v1/w3w/wallet/prediction/position/settled-history"),
-    "order_history": ("GET", "/sapi/v1/w3w/wallet/prediction/order/history"),
-    "order_list": ("GET", "/sapi/v1/w3w/wallet/prediction/order/list"),
-    "batch_cancel": ("POST", "/sapi/v1/w3w/wallet/prediction/trade/batch-cancel"),
-    "batch_redeem": ("POST", "/sapi/v1/w3w/wallet/prediction/batch-redeem"),
-    "redeem_status": ("GET", "/sapi/v1/w3w/wallet/prediction/redeem/status"),
-    "portfolio": ("GET", "/sapi/v1/w3w/wallet/prediction/pnl/portfolio"),
-    # Transfers are handled inline by place-order's fundTransferAmount, so
-    # the standalone transfer endpoints are deliberately not wired up.
-}
-
-
 # --------------------------------------------------------------------------
 # Units
 # --------------------------------------------------------------------------
-
-
-def to_wei(amount_usdt: float | Decimal) -> str:
-    """
-    USDT -> wei string, truncated (never rounded up past the balance).
-
-    Decimal throughout: float arithmetic on 18 decimals loses precision and
-    would produce off-by-a-few-wei amounts the venue may reject.
-    """
-    d = Decimal(str(amount_usdt))
-    if d <= 0:
-        raise ValueError("amount must be positive")
-    return str(int((d * WEI).to_integral_value(rounding=ROUND_DOWN)))
-
-
-def from_wei(amount_wei: str | int) -> Decimal:
-    """wei -> USDT as Decimal."""
-    return Decimal(str(amount_wei)) / WEI
 
 
 # --------------------------------------------------------------------------
@@ -1812,12 +1760,6 @@ class ConfigStore:
 # --------------------------------------------------------------------------
 
 
-# `accountType` on place-order accepts ONLY these. Any other value the venue
-# lists as a payment option (the prediction wallet itself) is NOT valid there,
-# and passing one through produces -3026 with no field named.
-CEX_ACCOUNT_TYPES = ("SPOT", "FUNDING")
-
-
 class Side(str, Enum):
     UP = "UP"
     DOWN = "DOWN"
@@ -2162,197 +2104,9 @@ class WalletRef:
     wallet_id: str
 
 
-class Shutdown(Exception):
-    """A platform stop signal (SIGTERM) was received."""
-
-
-class TradingHalted(Exception):
-    """A risk limit tripped. Always fails closed."""
-
-
-class ErrorKind(str, Enum):
-    """
-    What an API failure actually means.
-
-    Classified from the venue's numeric code wherever possible. Matching on
-    message substrings is fragile -- wording changes, locales differ, and a
-    keyword list silently mis-files anything it does not recognise. The code
-    is the structured field; the text is only a last resort.
-    """
-
-    SIZE = "SIZE"                    # order too small / not enough depth
-    INSUFFICIENT_FUNDS = "FUNDS"     # balance cannot cover the order
-    AUTH = "AUTH"                    # key, signature, permissions, IP
-    TIMING = "TIMING"                # clock drift / recvWindow
-    PARAMETER = "PARAMETER"          # malformed or missing parameter
-    NOT_FOUND = "NOT_FOUND"
-    GEO_BLOCKED = "GEO_BLOCKED"      # HTTP 451: server is in a restricted region
-    UNKNOWN = "UNKNOWN"
-
-
-# Venue codes observed or documented. Anything absent stays UNKNOWN, which
-# callers must treat as "do not proceed" rather than "probably harmless".
-ERROR_CODES: dict[int, ErrorKind] = {
-    -9000: ErrorKind.INSUFFICIENT_FUNDS,
-    -3026: ErrorKind.PARAMETER,
-    -1022: ErrorKind.AUTH,
-    -2014: ErrorKind.AUTH,
-    -2015: ErrorKind.AUTH,
-    -1002: ErrorKind.AUTH,
-    -1021: ErrorKind.TIMING,
-    -1102: ErrorKind.PARAMETER,
-    -1104: ErrorKind.PARAMETER,
-    -1121: ErrorKind.PARAMETER,
-}
-
-# Fallback only, when no numeric code is supplied.
-_MESSAGE_HINTS: tuple[tuple[tuple[str, ...], ErrorKind], ...] = (
-    (("enough", "insufficient balance", "insufficient funds"),
-     ErrorKind.INSUFFICIENT_FUNDS),
-    (("minimum", "too small", "min amount", "insufficient liquidity",
-      "depth"), ErrorKind.SIZE),
-    (("signature", "api-key", "api key", "permission", "unauthorized"),
-     ErrorKind.AUTH),
-    (("timestamp", "recvwindow"), ErrorKind.TIMING),
-    (("mandatory parameter", "illegal characters", "not supported"),
-     ErrorKind.PARAMETER),
-)
-
-
-class _AboveBalance(Exception):
-    """Internal: a probe size exceeded the wallet balance, not the floor."""
-
-    def __init__(self, amount: float) -> None:
-        super().__init__(f"probe {amount} exceeds balance")
-        self.amount = amount
-
-
-class ApiError(RuntimeError):
-    """
-    Transient or structural API failure, carrying the venue's own code.
-
-    The code travels with the exception so callers can branch on what went
-    wrong instead of re-parsing the message.
-    """
-
-    def __init__(self, message: str, code: int | None = None,
-                 status: int | None = None) -> None:
-        super().__init__(message)
-        self.code = code
-        self.status = status
-
-    @property
-    def kind(self) -> ErrorKind:
-        if self.status == 404:
-            return ErrorKind.NOT_FOUND      # wrong path, or unknown resource
-        if self.status == 451:
-            # Binance refuses restricted locations, which includes the United
-            # States. A US-region host will fail every call with this.
-            return ErrorKind.GEO_BLOCKED
-        if self.code is not None and self.code in ERROR_CODES:
-            return ERROR_CODES[self.code]
-        if self.code is not None:
-            return ErrorKind.UNKNOWN     # a code we do not know: do not guess
-        text = str(self).lower()
-        for needles, kind in _MESSAGE_HINTS:
-            if any(n in text for n in needles):
-                return kind
-        return ErrorKind.UNKNOWN
-
-
 # --------------------------------------------------------------------------
 # Pricing
 # --------------------------------------------------------------------------
-
-
-def _as_float_or_none(value: object) -> float | None:
-    """Parse a numeric field, or None when it is absent or unusable."""
-    try:
-        parsed = float(value)          # float(None) raises TypeError too
-    except (TypeError, ValueError):
-        return None
-    return parsed if math.isfinite(parsed) else None
-
-
-def norm_cdf(x: float) -> float:
-    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-
-
-def _betacf(a: float, b: float, x: float) -> float:
-    """Continued fraction for the incomplete beta function (Lentz's method)."""
-    tiny = 1e-30
-    qab, qap, qam = a + b, a + 1.0, a - 1.0
-    c = 1.0
-    d = 1.0 - qab * x / qap
-    if abs(d) < tiny:
-        d = tiny
-    d = 1.0 / d
-    h = d
-    for mth in range(1, 301):
-        m2 = 2 * mth
-        aa = mth * (b - mth) * x / ((qam + m2) * (a + m2))
-        d = 1.0 + aa * d
-        if abs(d) < tiny:
-            d = tiny
-        c = 1.0 + aa / c
-        if abs(c) < tiny:
-            c = tiny
-        d = 1.0 / d
-        h *= d * c
-        aa = -(a + mth) * (qab + mth) * x / ((a + m2) * (qap + m2))
-        d = 1.0 + aa * d
-        if abs(d) < tiny:
-            d = tiny
-        c = 1.0 + aa / c
-        if abs(c) < tiny:
-            c = tiny
-        d = 1.0 / d
-        delta = d * c
-        h *= delta
-        if abs(delta - 1.0) < 3e-16:
-            break
-    return h
-
-
-def betainc(a: float, b: float, x: float) -> float:
-    """Regularised incomplete beta I_x(a, b). Used for the Student-t CDF."""
-    if not 0.0 <= x <= 1.0:
-        raise ValueError("x must be in [0, 1]")
-    if x in (0.0, 1.0):
-        return x
-    lbeta = (math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b)
-             + a * math.log(x) + b * math.log(1.0 - x))
-    front = math.exp(lbeta)
-    if x < (a + 1.0) / (a + b + 2.0):
-        return front * _betacf(a, b, x) / a
-    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
-
-
-def student_t_cdf(x: float, df: float) -> float:
-    """
-    CDF of the Student-t distribution with `df` degrees of freedom.
-
-    Implemented in stdlib to keep the runtime dependency to `requests` alone;
-    verified against scipy.stats.t in the test suite.
-    """
-    if df <= 0:
-        raise ValueError("df must be positive")
-    xt = df / (df + x * x)
-    tail = 0.5 * betainc(df / 2.0, 0.5, xt)
-    return 1.0 - tail if x > 0 else tail
-
-
-def standardised_t_cdf(z: float, df: float) -> float:
-    """
-    Student-t CDF rescaled to unit variance, so `z` stays comparable to a
-    Gaussian z-score.
-
-    A raw t has variance df/(df-2); without this rescaling, switching to
-    fat tails would silently change the volatility as well as the shape.
-    """
-    if df <= 2.0:
-        raise ValueError("df must exceed 2 for finite variance")
-    return student_t_cdf(z * math.sqrt(df / (df - 2.0)), df)
 
 
 def buffer_sigmas(spot: float, strike: float, sigma_annual: float,
@@ -2737,54 +2491,6 @@ def _projected_rounds(impulse: float, decay: float,
     if decay <= 0.0:
         return 0.0                      # reversed outright
     return math.log(floor / impulse) / math.log(decay)
-
-
-class OrderNotFilled(ApiError):
-    """
-    The venue confirmed an order did NOT fill -- killed, cancelled, rejected.
-
-    Separate from ApiError because the two demand opposite responses. This
-    one is a fact: no position exists, and recording one invents a trade that
-    later "settles" and books a profit never made. A bare ApiError from the
-    same call is an absence of information -- a timeout, a dropped socket --
-    where a position may well exist, and dropping it strands real money that
-    is never settled and never claimed. Catching both together forces one
-    wrong answer or the other.
-    """
-
-
-class NothingToRedeem(ApiError):
-    """
-    The venue accepted the claim and found nothing to claim.
-
-    Separate from ApiError for the same reason OrderNotFilled is: this one is
-    a fact -- the tokens are gone, which on a winning position means the
-    payout has already been credited, usually because the operator redeemed
-    it by hand in the Binance app. A bare ApiError is an absence of
-    information. Returning an empty hash list for both made them
-    indistinguishable from a batch still in flight, so the claim worker
-    re-submitted a redemption that could never succeed for the whole timeout
-    and then held the token as unredeemed forever.
-    """
-
-
-# Message fragments that mean the same fact arrived as an error rather than
-# an empty batch. Deliberately narrow: a match drops the bot's claim on real
-# money, so anything vaguer than "there is nothing here to redeem" must fall
-# through to the ordinary retry.
-_ALREADY_REDEEMED_HINTS: tuple[str, ...] = (
-    "already redeemed", "already been redeemed", "already claimed",
-    "already been claimed", "no redeemable", "not redeemable",
-    "nothing to redeem", "no position to redeem",
-)
-
-
-def _is_already_redeemed(exc: BaseException) -> bool:
-    """Whether the venue's refusal says the tokens are already gone."""
-    if not isinstance(exc, ApiError):
-        return False        # a transport failure proves nothing either way
-    text = str(exc).lower()
-    return any(hint in text for hint in _ALREADY_REDEEMED_HINTS)
 
 
 class VolatilityEstimator:
