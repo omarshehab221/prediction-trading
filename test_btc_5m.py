@@ -229,6 +229,25 @@ def _close_journals(case=None) -> None:
                 pass
 
 
+def _stage_bot(target_dir):
+    """
+    Copy the whole bot into a directory, the way a deploy would.
+
+    Every root-level module plus the package. Copying the entry point alone
+    was enough while the entry point was the bot; it stopped being enough when
+    ws_feeds arrived, and the entrypoint test has been failing on Linux ever
+    since -- invisibly here, because Windows cannot exec the script at all.
+    """
+    import shutil as _sh, os as _os, glob as _glob
+    for path in _glob.glob(_os.path.join(ROOT, "*.py")):
+        _sh.copy(path, target_dir)
+    pkg = _os.path.join(ROOT, "btc5m")
+    if _os.path.isdir(pkg):
+        _sh.copytree(pkg, _os.path.join(target_dir, "btc5m"),
+                     ignore=_sh.ignore_patterns("__pycache__"),
+                     dirs_exist_ok=True)
+
+
 def make_signal(**kw) -> Signal:
     base = dict(side=Side.UP, model_prob=0.72, fill_price=0.55, edge=0.16,
                 stake_usdt=5.0, seconds_left=60.0)
@@ -4520,7 +4539,7 @@ class TestDeploymentEntrypoint(unittest.TestCase):
 
     def _run(self, config_path, profile=None):
         import subprocess, shutil as _sh, os as _os
-        _sh.copy(self.bot, self.tmp)
+        _stage_bot(self.tmp)
         _sh.copy(self.script, self.tmp)
         _os.chmod(_os.path.join(self.tmp, "entrypoint.sh"), 0o755)
         # These exercise config seeding, not the venue: preflight would try
@@ -4666,15 +4685,24 @@ class TestVerificationGate(unittest.TestCase):
         import shutil
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _stage(self, mutate=None):
-        import shutil as _sh, os as _os, glob
-        for path in glob.glob(_os.path.join(self.here, "*.py")):
-            _sh.copy(path, self.tmp)
+    def _stage(self, mutate=None, target="btc_5m_predictor.py"):
+        import shutil as _sh, os as _os
+        _stage_bot(self.tmp)
         _sh.copy(self.script, self.tmp)
         if mutate:
-            target = _os.path.join(self.tmp, "btc_5m_predictor.py")
-            text = open(target).read()
-            open(target, "w").write(mutate(text))
+            path = _os.path.join(self.tmp, target)
+            text = open(path, encoding="utf-8").read()
+            with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                fh.write(mutate(text))
+
+    def _home_of(self, needle):
+        """The file a definition lives in -- it moves during the split."""
+        import coherence, os as _os
+        for path in coherence.package_sources(self.here):
+            with open(path, encoding="utf-8") as fh:
+                if needle in fh.read():
+                    return _os.path.relpath(path, self.here)
+        self.fail(f"nothing defines {needle!r}")
 
     def _run(self, env_extra=None):
         import subprocess, os as _os
@@ -4697,10 +4725,11 @@ class TestVerificationGate(unittest.TestCase):
 
     def test_broken_logic_is_caught(self):
         """A function that returns a plausible constant still fails."""
+        signature = ("def breakeven_probability(price: float, fee_bps: int) "
+                     "-> float:")
         self._stage(lambda t: t.replace(
-            "def breakeven_probability(price: float, fee_bps: int) -> float:",
-            "def breakeven_probability(price: float, fee_bps: int) -> float:\n"
-            "    return 0.5"))
+            signature, signature + "\n    return 0.5"),
+            target=self._home_of(signature))
         r = self._run()
         self.assertEqual(r.returncode, 1)
         self.assertIn("FAILED", r.stdout)
@@ -4775,6 +4804,13 @@ class TestVerificationGate(unittest.TestCase):
         text = open(path).read()
         build = text[text.index("buildCommand"):text.index("startCommand")]
         self.assertIn("verify.sh", build)
+
+    def test_the_gate_compiles_every_file(self):
+        """A syntax error inside the package must fail the gate as a syntax
+        error, not arrive later dressed as a broken test."""
+        text = open(self.script).read()
+        self.assertIn("btc5m", text)
+
 
 
 class TestModeSwitching(unittest.TestCase):
@@ -5435,6 +5471,18 @@ class TestDeploymentManifests(unittest.TestCase):
                 raw.count(b"\r\n"), 0,
                 f"{name} has CRLF line endings; bash and Docker both read "
                 f"the carriage return as content")
+
+    def test_the_image_ships_the_package(self):
+        """
+        An image with the entry point and not the package has no bot in it,
+        and says so as an ImportError at boot rather than as a build failure.
+        """
+        import re as _re
+        self.assertRegex(
+            self._read("Dockerfile"), _re.compile(r"^COPY\s+btc5m/", _re.M),
+            "the Dockerfile must COPY the btc5m package -- matching the word "
+            "anywhere would pass on the journal filename alone")
+
 
 
 class TestMultiMarket(unittest.TestCase):

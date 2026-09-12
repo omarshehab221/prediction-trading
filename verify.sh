@@ -48,11 +48,15 @@ run() {
 
 echo "=== Verification ==="
 
-if [ -f ws_feeds.py ]; then
-  run "byte-compile" "$PY" -m py_compile btc_5m_predictor.py ws_feeds.py
-else
-  run "byte-compile" "$PY" -m py_compile btc_5m_predictor.py
+# Every file the bot is made of. A syntax error inside the package would
+# otherwise reach the unit run as an ImportError and be reported as a broken
+# test rather than as broken code.
+sources="btc_5m_predictor.py"
+[ -f ws_feeds.py ] && sources="$sources ws_feeds.py"
+if [ -d btc5m ]; then
+  sources="$sources $(find btc5m -name '*.py' | sort | tr '\n' ' ')"
 fi
+run "byte-compile" "$PY" -m py_compile $sources
 
 if [ -f test_btc_5m.py ]; then
   run "unit tests" "$PY" -m unittest test_btc_5m
@@ -62,12 +66,9 @@ else
 fi
 
 if [ -f coherence.py ]; then
-  # Both modules are analysed as one corpus. A config field read only from
-  # ws_feeds.py is not a dead setting, and single-file analysis would call it
-  # one and fail the build for working code.
-  coh_args=(--source btc_5m_predictor.py)
-  [ -f ws_feeds.py ] && coh_args+=(--source ws_feeds.py)
-  run "coherence" "$PY" coherence.py "${coh_args[@]}"
+  # No --source: coherence reads every file the bot is made of by default, so
+  # this list cannot drift from the package's real shape.
+  run "coherence" "$PY" coherence.py
 else
   printf '  %-22s SKIP\n' "coherence"; skipped=$((skipped + 1))
 fi

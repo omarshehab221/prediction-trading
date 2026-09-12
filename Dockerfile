@@ -28,6 +28,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 # again on every boot, so a broken image never becomes a trading process.
 COPY btc_5m_predictor.py ws_feeds.py test_btc_5m.py coherence.py fuzz.py \
      conformance.py verify.sh entrypoint.sh ./
+# The bot itself. Without this the image has an entry point and no bot, and
+# the first thing it does at boot is fail to import one.
+COPY btc5m/ ./btc5m/
+
 RUN chmod +x verify.sh entrypoint.sh
 
 # Fail the BUILD on broken code, so a bad image is never produced rather than

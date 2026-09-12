@@ -91,7 +91,9 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=17)
     args = ap.parse_args()
 
-    here = os.path.dirname(os.path.abspath(args.source)) or "."
+    # The project root, not the source's directory: --source may now name
+    # a file inside the package, and the run needs the whole project.
+    here = os.path.dirname(os.path.abspath(__file__))
     original = open(args.source, encoding="utf-8").read()
     lines = original.split("\n")
 
@@ -102,10 +104,13 @@ def main() -> int:
     print(f"Testing {len(sites)} mutation(s)\n")
 
     workdir = tempfile.mkdtemp(prefix="mutate.")
-    for name in ("btc_5m_predictor.py", "test_btc_5m.py", "conformance.py"):
-        src = os.path.join(here, name)
-        if os.path.exists(src):
-            shutil.copy(src, workdir)
+    for name in os.listdir(here):
+        path = os.path.join(here, name)
+        if name.endswith(".py"):
+            shutil.copy(path, workdir)
+        elif name == "btc5m" and os.path.isdir(path):
+            shutil.copytree(path, os.path.join(workdir, name),
+                            ignore=shutil.ignore_patterns("__pycache__"))
 
     baseline = run_suite(workdir)
     if not baseline:
@@ -114,7 +119,8 @@ def main() -> int:
 
     survived: list[tuple[int, str, str]] = []
     killed = 0
-    target = os.path.join(workdir, os.path.basename(args.source))
+    target = os.path.join(workdir,
+                          os.path.relpath(os.path.abspath(args.source), here))
 
     for n, (idx, desc, pattern, repl) in enumerate(sites, 1):
         mutated = list(lines)
