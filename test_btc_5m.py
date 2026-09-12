@@ -3016,6 +3016,33 @@ class TestSchemaConformance(unittest.TestCase):
             self.skipTest("connector not installed")
         self.assertEqual(r.returncode, 0, r.stdout[-2000:])
 
+    def test_every_request_call_is_found_in_every_source(self):
+        """
+        The client is several files. A checker that reads one of them and
+        reports "all calls conform" is worse than no checker.
+        """
+        import ast as _ast, os as _os, sys as _sys
+        _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+        import coherence, conformance
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        sources = coherence.bot_sources(here)
+        calls, reads = conformance.collect(sources)
+
+        expected = 0
+        for path in sources:
+            with open(path, encoding="utf-8") as fh:
+                tree = _ast.parse(fh.read())
+            expected += sum(
+                1 for n in _ast.walk(tree)
+                if isinstance(n, _ast.Call)
+                and isinstance(n.func, _ast.Attribute)
+                and n.func.attr == "_request"
+                and n.args and isinstance(n.args[0], _ast.Constant))
+        self.assertEqual(len(calls), expected)
+        self.assertEqual(len(calls), 16, "the bot's venue calls changed count")
+        self.assertEqual(len({c.endpoint for c in calls}), 15)
+        self.assertIn("get_quote", reads)
+
 
 class TestBoundaryConditions(unittest.TestCase):
     """

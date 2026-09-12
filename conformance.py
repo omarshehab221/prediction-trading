@@ -101,6 +101,7 @@ class CallSite:
     params: set[str]
     dynamic: bool           # params built at runtime, cannot be fully checked
     line: int
+    source: str = ""        # which file, now that the client is several
 
 
 def _dict_keys(node: ast.AST) -> tuple[set[str], bool]:
@@ -167,7 +168,8 @@ def extract_calls(source_path: str) -> list[CallSite]:
             continue
         endpoint = node.args[0].value
         if len(node.args) < 2:
-            calls.append(CallSite(endpoint, set(), False, node.lineno))
+            calls.append(CallSite(endpoint, set(), False, node.lineno,
+                                  os.path.basename(source_path)))
             continue
         # Narrowest enclosing function, so a variable resolves in its scope.
         scope = min(
@@ -175,7 +177,8 @@ def extract_calls(source_path: str) -> list[CallSite]:
              if f.lineno <= node.lineno <= (f.end_lineno or f.lineno)),
             key=lambda f: (f.end_lineno or f.lineno) - f.lineno, default=tree)
         params, dynamic = _resolve_params(node.args[1], scope)
-        calls.append(CallSite(endpoint, params, dynamic, node.lineno))
+        calls.append(CallSite(endpoint, params, dynamic, node.lineno,
+                              os.path.basename(source_path)))
     return calls
 
 
@@ -211,6 +214,17 @@ def extract_response_reads(source_path: str) -> dict[str, set[str]]:
     return reads
 
 
+def collect(sources: list[str]) -> tuple[list[CallSite], dict[str, set[str]]]:
+    """Every call the bot makes and every response field it reads."""
+    calls: list[CallSite] = []
+    reads: dict[str, set[str]] = {}
+    for path in sources:
+        calls += extract_calls(path)
+        for endpoint, fields in extract_response_reads(path).items():
+            reads.setdefault(endpoint, set()).update(fields)
+    return calls, reads
+
+
 def parse_constraints(path: str) -> dict[tuple[str, str], dict]:
     """
     Extract value constraints from the connector's doc comments.
@@ -242,8 +256,17 @@ def parse_constraints(path: str) -> dict[tuple[str, str], dict]:
     return out
 
 
-def check_values(source: str, constraints: dict, calls: list) -> list[str]:
+def check_values(sources: list[str], constraints: dict,
+                 calls: list) -> list[str]:
     """Verify literal values the bot sends against documented constraints."""
+    problems: list[str] = []
+    for source in sources:
+        problems += _values_in(source, constraints, calls)
+    return problems
+
+
+def _values_in(source: str, constraints: dict, calls: list) -> list[str]:
+    """The same check, for one file of the client."""
     tree = ast.parse(open(source, encoding="utf-8").read())
     problems: list[str] = []
 
@@ -274,19 +297,19 @@ def check_values(source: str, constraints: dict, calls: list) -> list[str]:
                     and isinstance(value.value, str):
                 if value.value not in rule["enum"]:
                     problems.append(
-                        f"L{node.lineno}: {endpoint}.{key.value} = "
+                        f"{os.path.basename(source)}:L{node.lineno}: {endpoint}.{key.value} = "
                         f"{value.value!r} not in {sorted(rule['enum'])}")
 
             if rule.get("wei"):
                 expr = ast.unparse(value)
                 if "to_wei" not in expr:
                     problems.append(
-                        f"L{node.lineno}: {endpoint}.{key.value} is documented "
+                        f"{os.path.basename(source)}:L{node.lineno}: {endpoint}.{key.value} is documented "
                         f"as wei but is built as {expr!r} without to_wei()")
     return problems
 
 
-def check(connector: str, source: str) -> int:
+def check(connector: str, sources: list[str]) -> int:
     if not os.path.exists(connector):
         print(f"Connector not found at {connector}.\n"
               f"Install it with:  npm install @binance/w3w-prediction",
@@ -294,8 +317,7 @@ def check(connector: str, source: str) -> int:
         return 2
 
     interfaces = parse_interfaces(connector)
-    calls = extract_calls(source)
-    reads = extract_response_reads(source)
+    calls, reads = collect(sources)
 
     problems: list[str] = []
     notes: list[str] = []
@@ -306,7 +328,7 @@ def check(connector: str, source: str) -> int:
         seen.add(call.endpoint)
         mapping = ENDPOINT_INTERFACES.get(call.endpoint)
         if mapping is None:
-            problems.append(f"L{call.line}: endpoint {call.endpoint!r} has no "
+            problems.append(f"{call.source}:L{call.line}: endpoint {call.endpoint!r} has no "
                             f"interface mapping")
             continue
         req_name = mapping[0]
@@ -323,11 +345,11 @@ def check(connector: str, source: str) -> int:
         status = "OK"
         if missing:
             status = "MISSING"
-            problems.append(f"L{call.line}: {call.endpoint} omits required "
+            problems.append(f"{call.source}:L{call.line}: {call.endpoint} omits required "
                             f"{sorted(missing)}")
         if unknown:
             status = "UNKNOWN" if status == "OK" else "BOTH"
-            problems.append(f"L{call.line}: {call.endpoint} sends unknown "
+            problems.append(f"{call.source}:L{call.line}: {call.endpoint} sends unknown "
                             f"{sorted(unknown)}")
         flag = " (dynamic params)" if call.dynamic else ""
         print(f"  {call.endpoint:<18} {status:<8} "
@@ -371,7 +393,7 @@ def check(connector: str, source: str) -> int:
     print("\n=== VALUE CONFORMANCE (enums and wei formatting) ===\n")
     constraints = parse_constraints(connector)
     print(f"  {len(constraints)} documented constraint(s) found in the schema")
-    value_problems = check_values(source, constraints, calls)
+    value_problems = check_values(sources, constraints, calls)
     if value_problems:
         problems.extend(value_problems)
         for vp in value_problems:
@@ -397,9 +419,12 @@ def check(connector: str, source: str) -> int:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--connector", default=DEFAULT_CONNECTOR)
-    ap.add_argument("--source", default="btc_5m_predictor.py")
+    ap.add_argument("--source", action="append", default=None,
+                    help="check this file; repeat it, or omit it for the "
+                         "whole bot")
     args = ap.parse_args()
-    return check(args.connector, args.source)
+    from coherence import bot_sources
+    return check(args.connector, args.source or bot_sources())
 
 
 if __name__ == "__main__":
