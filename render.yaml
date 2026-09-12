@@ -59,7 +59,7 @@ services:
         value: /var/data/btc5m_journal.db
       - key: PROFILE
         value: lastminute        # only when the config is first created;
-                                 # must match DEFAULT_PROFILE in the module
+                                 # must match DEFAULT_PROFILE in btc5m/profiles.py
       # paper | live. Pins the mode, overriding the config file's `live`.
       # Leave it unset to let config.json govern, which makes the mode
       # hot-reloadable: edit the file and the bot switches once it is flat.
