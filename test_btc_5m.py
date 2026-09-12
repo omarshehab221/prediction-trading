@@ -11028,3 +11028,31 @@ class TestWsRecycle(unittest.TestCase):
         c.last_frame_ts = 0.0
         c.dispatch("{}")
         self.assertGreater(c.last_frame_ts, 0.0)
+
+
+class TestScriptModeSharesOneSide(unittest.TestCase):
+    """
+    One Side class, however the file was started.
+
+    `python btc_5m_predictor.py` runs this file as __main__, so ws_feeds' lazy
+    `from btc_5m_predictor import Side` used to import a SECOND copy of the
+    module and get a SECOND Side class. `side is Side.UP` was then False for
+    the UP the trader passed in, and the UP ladder came back derived from the
+    DOWN side of the book -- the bot pricing UP off DOWN's prices.
+    """
+
+    def test_ws_feeds_sees_the_scripts_own_side(self):
+        import subprocess, os as _os
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        code = (
+            "import runpy, ws_feeds\n"
+            "g = runpy.run_path('btc_5m_predictor.py', run_name='as_script')\n"
+            "print(ws_feeds.derive_asks([(0.4, 5.0)], [(0.3, 5.0)], g['Side'].UP))\n"
+        )
+        env = dict(_os.environ, BINANCE_API_KEY="k", BINANCE_API_SECRET="s")
+        r = subprocess.run([sys.executable, "-c", code], cwd=here, env=env,
+                           capture_output=True, text=True, timeout=180)
+        self.assertEqual(r.returncode, 0, r.stderr[-1500:])
+        self.assertEqual(r.stdout.strip(), "[(0.4, 5.0)]",
+                         "ws_feeds derived the UP ladder from the DOWN side, "
+                         "which means it resolved a different Side class")

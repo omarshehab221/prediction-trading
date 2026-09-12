@@ -84,6 +84,15 @@ import requests
 
 import ws_feeds
 
+# Run as a script, this file is __main__ -- and ws_feeds' lazy
+# `from btc_5m_predictor import Side` would then import it a SECOND time,
+# producing a second Side class. `side is Side.UP` fails across those two
+# classes, so the UP ladder came back derived from the DOWN side of the book.
+# Registering the running module under its own name makes that import find
+# this module instead of loading another copy of it.
+if __name__ != "btc_5m_predictor":
+    sys.modules.setdefault("btc_5m_predictor", sys.modules[__name__])
+
 LOG = logging.getLogger("btc5m")
 
 BASE = "https://api.binance.com"
