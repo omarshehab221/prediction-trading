@@ -507,7 +507,8 @@ def render_imports(aliases: dict[str, tuple], runtime: set[str],
     plain: dict[str, list[str]] = {}
     typed: dict[str, list[str]] = {}
 
-    def record(into: dict[str, list[str]], name: str) -> None:
+    def record(into: dict[str, list[str]], name: str,
+               strict: bool = True) -> None:
         spec = aliases.get(name)
         if spec is not None:
             if spec[0] == "import":
@@ -520,6 +521,12 @@ def render_imports(aliases: dict[str, tuple], runtime: set[str],
             return
         mod = home_of(name)
         if mod is None:
+            if not strict:
+                # Annotation-only, and nothing at module scope defines it --
+                # a name imported inside the function that uses it, say.
+                # `from __future__ import annotations` means it is never
+                # evaluated, so there is nothing to import for it here.
+                return
             raise SystemExit(
                 f"{where}: {name!r} has no home in MODULES and is not imported "
                 f"by the facade")
@@ -537,7 +544,7 @@ def render_imports(aliases: dict[str, tuple], runtime: set[str],
         if name in moving or name in runtime or name in DUNDERS \
                 or hasattr(builtins, name):
             continue
-        record(typed, name)
+        record(typed, name, strict=False)
 
     def group(mod: str) -> int:
         head = mod.removeprefix("!import ").split(" ")[0].split(".")[0]
