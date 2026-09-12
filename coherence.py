@@ -63,6 +63,33 @@ CORPUS_MODULES: set[str] = set()
 MULTI_FILE = False
 
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def package_sources(root: str = ROOT) -> list[str]:
+    """
+    Every file the bot itself is made of, the facade first.
+
+    The facade leads because the checks that read the deployment manifests
+    resolve them next to the first source, and the facade sits at the root.
+    """
+    out = [os.path.join(root, "btc_5m_predictor.py")]
+    for dirpath, dirnames, filenames in os.walk(os.path.join(root, "btc5m")):
+        dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
+        out += [os.path.join(dirpath, name)
+                for name in sorted(filenames) if name.endswith(".py")]
+    return [path for path in out if os.path.exists(path)]
+
+
+def bot_sources(root: str = ROOT) -> list[str]:
+    """The bot, plus the transport module it reads its feeds through."""
+    out = package_sources(root)
+    feeds = os.path.join(root, "ws_feeds.py")
+    if os.path.exists(feeds):
+        out.append(feeds)
+    return out
+
+
 def load(path: str) -> tuple[str, ast.Module]:
     src = open(path, encoding="utf-8").read()
     return src, ast.parse(src)
@@ -133,7 +160,7 @@ def check_config(src: str, tree: ast.Module, f: Findings) -> None:
                       f"-- dead setting"))
 
     # Which strategy fields does no profile override?
-    profiles = re.search(r"PROFILES:.*?\n\}", src, re.S)
+    profiles = re.search(r"^PROFILES:.*?\n\}", src, re.S | re.M)
     if not profiles:
         f.warn("could not locate PROFILES to audit defaults")
         return
@@ -203,32 +230,68 @@ def check_dead_functions(src: str, tree: ast.Module, f: Findings) -> None:
 # --------------------------------------------------------------------------
 
 
+def class_families(tree: ast.Module) -> dict[str, set[str]]:
+    """
+    Class name -> every class in the corpus that shares an instance with it.
+
+    A mixin's methods run on the instance of the class that mixes them in, so
+    an attribute that class assigns IS assigned as far as the mixin is
+    concerned, and a sibling mixin's method IS a method of the same object.
+    Without this, splitting a class across files reports every attribute it
+    uses as one it never sets.
+    """
+    bases: dict[str, set[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            bases[node.name] = {b.id for b in node.bases
+                                if isinstance(b, ast.Name)}
+
+    def ancestors(name: str, seen: set[str] | None = None) -> set[str]:
+        seen = set() if seen is None else seen
+        if name in seen:
+            return seen
+        seen.add(name)
+        for base in bases.get(name, ()):
+            if base in bases:
+                ancestors(base, seen)
+        return seen
+
+    lineage = {name: ancestors(name) for name in bases}
+    return {name: set().union(*(lineage[d] for d in bases if name in lineage[d]))
+            for name in bases}
+
+
+def _assigned_in(cls: ast.ClassDef) -> dict[str, int]:
+    """Attribute -> the line that first assigns it, methods included."""
+    assigned: dict[str, int] = {}
+    for item in cls.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            assigned.setdefault(item.name, item.lineno)
+        elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+            assigned.setdefault(item.target.id, item.lineno)
+        elif isinstance(item, ast.Assign):
+            for t in item.targets:
+                if isinstance(t, ast.Name):
+                    assigned.setdefault(t.id, item.lineno)
+    for node in ast.walk(cls):
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
+                and node.value.id == "self" and isinstance(node.ctx, ast.Store):
+            assigned.setdefault(node.attr, node.lineno)
+    return assigned
+
+
 def check_attributes(src: str, tree: ast.Module, f: Findings) -> None:
+    families = class_families(CORPUS_TREE)
+    corpus_assigned = {c.name: _assigned_in(c) for c in ast.walk(CORPUS_TREE)
+                       if isinstance(c, ast.ClassDef)}
     for cls in [n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)]:
-        assigned: dict[str, int] = {}
+        assigned = _assigned_in(cls)
         read: set[str] = set()
-        # Methods and class-level constants are "assigned" by definition;
-        # counting self.method() as an unassigned attribute is noise.
-        for item in cls.body:
-            if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                assigned.setdefault(item.name, item.lineno)
-            elif isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
-                assigned.setdefault(item.target.id, item.lineno)
-            elif isinstance(item, ast.Assign):
-                for t in item.targets:
-                    if isinstance(t, ast.Name):
-                        assigned.setdefault(t.id, item.lineno)
         for node in ast.walk(cls):
             if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) \
-                    and node.value.id == "self":
-                if isinstance(node.ctx, ast.Store):
-                    assigned.setdefault(node.attr, node.lineno)
-                else:
-                    read.add(node.attr)
-        # An attribute may legitimately be read by code outside the class
-        # (exception payloads, dataclass fields) and outside the file: a
-        # Config field read only from the transport module is read. Asked of
-        # the corpus for the same reason the config and dead-code checks are.
+                    and node.value.id == "self" \
+                    and not isinstance(node.ctx, ast.Store):
+                read.add(node.attr)
         module_read = {n.attr for n in ast.walk(CORPUS_TREE)
                        if isinstance(n, ast.Attribute)
                        and isinstance(n.ctx, ast.Load)}
@@ -237,7 +300,9 @@ def check_attributes(src: str, tree: ast.Module, f: Findings) -> None:
                 continue
             f.error(where(f"L{line}: {cls.name}.{name} is assigned but never "
                           f"read -- leftover state"))
-        for name in sorted(read - set(assigned)):
+        family = set().union(*(set(corpus_assigned.get(c, {}))
+                               for c in families.get(cls.name, {cls.name})))
+        for name in sorted(read - set(assigned) - family):
             if name.startswith("_") and not hasattr(object, name):
                 # Reading state the constructor never sets is how a test that
                 # bypasses __init__ blows up at runtime.
@@ -407,6 +472,31 @@ def check_mode_flags(src: str, tree: ast.Module, f: Findings) -> None:
                     f"this silently overrides TRADING_MODE")
 
 
+def analyse(sources: list[str]) -> Findings:
+    """Run every check over a corpus and return what it found."""
+    global SOURCE_PATH
+    loaded = set_corpus(sources)
+    f = Findings()
+
+    for path, src, tree in loaded:
+        SOURCE_PATH = path
+        for check in (check_dead_functions, check_attributes,
+                      check_stale_prose, check_magic_numbers):
+            check(src, tree, f)
+
+    # These four describe the bot as a whole -- its one Config, its one
+    # argument parser, its one profile table, its one default profile -- so
+    # they read the merged corpus. They used to read the first file only,
+    # which was the same thing while that file was the whole bot. With the bot
+    # in a package it would mean checking a facade that declares none of them
+    # and reporting nothing, which is worse than not checking at all.
+    SOURCE_PATH = sources[0]
+    for check in (check_config, check_cli, check_default_profile,
+                  check_mode_flags):
+        check(CORPUS_SRC, CORPUS_TREE, f)
+    return f
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--source", action="append", default=None,
@@ -415,27 +505,11 @@ def main() -> int:
                     help="treat warnings as failures")
     args = ap.parse_args()
 
-    sources = args.source or ["btc_5m_predictor.py"]
-    loaded = set_corpus(sources)
-    f = Findings()
+    sources = args.source or bot_sources()
+    f = analyse(sources)
 
-    global SOURCE_PATH
-    # These describe the main module specifically. Config is declared once
-    # and lives there, and the other three read the argument parser and the
-    # profile table -- running any of them over the transport module would
-    # report its lack of those as findings.
-    main_only = (check_config, check_cli, check_default_profile,
-                 check_mode_flags)
-    for path, src, tree in loaded:
-        SOURCE_PATH = path
-        for check in (check_dead_functions, check_attributes,
-                      check_stale_prose, check_magic_numbers):
-            check(src, tree, f)
-        if path == sources[0]:
-            for check in main_only:
-                check(src, tree, f)
-
-    print(f"=== COHERENCE: {', '.join(sources)} ===\n")
+    print(f"=== COHERENCE: {', '.join(os.path.basename(s) for s in sources)} "
+          f"===\n")
     if f.errors:
         print(f"  {len(f.errors)} ERROR(S) -- stale artifacts:\n")
         for e in f.errors:

@@ -10159,19 +10159,83 @@ class TestCoherenceCorpus(unittest.TestCase):
             [w for w in f.warnings if "ws_stale_s" in w], [],
             f"ws_stale_s exists in the corpus; warnings were {f.warnings}")
 
+    def test_default_sources_are_the_whole_bot(self):
+        import os as _os
+        here = _os.path.dirname(_os.path.abspath(__file__))
+        sources = self.coherence.bot_sources(here)
+        self.assertTrue(sources[0].endswith("btc_5m_predictor.py"),
+                        f"the facade must lead, got {sources[:1]}")
+        self.assertTrue(any(s.endswith("ws_feeds.py") for s in sources))
+        for path in sources:
+            self.assertTrue(_os.path.exists(path), path)
+
+    def test_the_config_checks_read_every_file(self):
+        """
+        Config, the CLI and the profile table may live in any file.
+
+        These four checks used to read only the first source. That was right
+        while the first source was the whole bot; with the bot in a package it
+        would check a facade that declares none of them and report nothing --
+        a gate that passes because it looked in an empty room.
+        """
+        facade = self._write("import sys\n")
+        rest = self._write(
+            'PROFILES: dict[str, dict] = {\n'
+            '    "p": dict(min_edge=0.1),\n'
+            '}\n'
+            'DEFAULT_PROFILE = "p"\n'
+            'class Config:\n'
+            '    min_edge: float = 0.05\n'
+            '    unread_setting: float = 1.0\n')
+        f = self.coherence.analyse([facade, rest])
+        self.assertEqual(
+            [e for e in f.errors if "no Config class" in e], [],
+            f"the Config audit did not find Config in the corpus: {f.errors}")
+        self.assertTrue(
+            any("unread_setting" in e for e in f.errors),
+            f"a dead setting in the second file went unreported: {f.errors}")
+
+    def test_a_mixin_may_read_what_its_host_assigns(self):
+        """
+        A mixin's methods run on the host's instance.
+
+        Splitting a class across files must not make every attribute the host
+        assigns read as one the mixin never sets -- that is 200 warnings for
+        code that is working, which is how a report stops being read.
+        """
+        mixin = self._write("class ScalpMixin:\n"
+                            "    def enter(self):\n"
+                            "        return self._client\n")
+        host = self._write("class Trader(ScalpMixin):\n"
+                           "    def __init__(self):\n"
+                           "        self._client = 1\n")
+        f = self.coherence.analyse([host, mixin])
+        self.assertEqual(
+            [w for w in f.warnings if "_client" in w], [],
+            f"_client is assigned by the host: {f.warnings}")
+
+    def test_a_mixin_may_call_a_sibling_mixins_method(self):
+        one = self._write("class OneMixin:\n"
+                          "    def enter(self):\n"
+                          "        return self.settle()\n")
+        two = self._write("class TwoMixin:\n"
+                          "    def settle(self):\n"
+                          "        return 1\n")
+        host = self._write("class Trader(OneMixin, TwoMixin):\n"
+                           "    pass\n")
+        f = self.coherence.analyse([host, one, two])
+        self.assertEqual(
+            [w for w in f.warnings if "settle" in w], [],
+            f"settle() is a sibling mixin's method: {f.warnings}")
+
     def test_the_real_project_is_still_coherent(self):
         """The change must not make the actual codebase report new findings."""
         import subprocess as _sp
         import sys as _sys
         import os as _os
         here = _os.path.dirname(_os.path.abspath(__file__))
-        sources = ["btc_5m_predictor.py"]
-        if _os.path.exists(_os.path.join(here, "ws_feeds.py")):
-            sources.append("ws_feeds.py")
-        argv = [_sys.executable, "coherence.py"]
-        for s in sources:
-            argv += ["--source", s]
-        proc = _sp.run(argv, cwd=here, capture_output=True, text=True)
+        proc = _sp.run([_sys.executable, "coherence.py"], cwd=here,
+                       capture_output=True, text=True)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
 
 
