@@ -84,7 +84,7 @@ import requests
 
 import ws_feeds
 
-# Run as a script, this file is __main__ -- and ws_feeds' lazy
+# Run as a script, this file is the main module -- and ws_feeds' lazy
 # `from btc_5m_predictor import Side` would then import it a SECOND time,
 # producing a second Side class. `side is Side.UP` fails across those two
 # classes, so the UP ladder came back derived from the DOWN side of the book.
