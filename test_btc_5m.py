@@ -37,6 +37,35 @@ from btc_5m_predictor import (
 )
 
 
+ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _package_trees():
+    """
+    (path, source, tree) for every file the bot itself is made of.
+
+    Parsed one file at a time and merged, rather than concatenated: a
+    `from __future__ import annotations` halfway down a joined text is not a
+    module anyone can parse.
+    """
+    import ast as _ast
+    import coherence
+    out = []
+    for path in coherence.package_sources(ROOT):
+        with open(path, encoding="utf-8") as fh:
+            src = fh.read()
+        out.append((path, src, _ast.parse(src)))
+    return out
+
+
+def _package_tree():
+    """Every bot file's top-level statements, as one module to walk."""
+    import ast as _ast
+    return _ast.Module(
+        body=[node for _, _, tree in _package_trees() for node in tree.body],
+        type_ignores=[])
+
+
 def build_client(config=None, **attrs):
     """
     Construct a PredictionClient without __init__ (which opens a session).
@@ -2756,9 +2785,12 @@ class TestNoSilentFailures(unittest.TestCase):
 
     @classmethod
     def setUpClass(cls):
-        import ast, inspect
-        cls.src = inspect.getsource(m)
-        cls.tree = ast.parse(cls.src)
+        import ast
+        files = _package_trees()
+        cls.src = "\n".join(src for _, src, _ in files)
+        cls.tree = ast.Module(
+            body=[n for _, _, tree in files for n in tree.body],
+            type_ignores=[])
 
     def test_no_bare_except(self):
         import ast
@@ -2832,6 +2864,28 @@ class TestNoSilentFailures(unittest.TestCase):
                     or "append" in body):
                 bad.append(n.lineno)
         self.assertEqual(bad, [], f"ApiError handled without a trace at {bad}")
+
+    def test_the_rules_are_pointed_at_the_whole_bot(self):
+        """
+        These rules are worth exactly what they are read against.
+
+        Read through the facade they would find no handlers, no main and no
+        client, and every rule above would pass on an empty corpus. This is
+        the test that fails instead.
+        """
+        import ast
+        defined = {n.name for n in ast.walk(self.tree)
+                   if isinstance(n, (ast.FunctionDef, ast.ClassDef))}
+        for name in ("main", "Trader", "PredictionClient", "Journal",
+                     "assess", "breakeven_probability"):
+            self.assertIn(name, defined, f"{name} is not in view")
+        self.assertGreater(len(defined), 200, "the corpus lost definitions")
+        handlers = [n for n in ast.walk(self.tree)
+                    if isinstance(n, ast.ExceptHandler)]
+        self.assertGreater(len(handlers), 60,
+                           f"only {len(handlers)} except handlers in view; "
+                           f"the rules are reading a fraction of the bot")
+
 
 
 class TestStrictFieldParsing(unittest.TestCase):
@@ -2974,8 +3028,8 @@ class TestNoRawTracebacks(unittest.TestCase):
     """CLI commands must fail with a message, never a traceback."""
 
     def test_every_command_dispatch_is_wrapped(self):
-        import ast, inspect
-        tree = ast.parse(inspect.getsource(m))
+        import ast
+        tree = _package_tree()
         main_fn = next(n for n in ast.walk(tree)
                        if isinstance(n, ast.FunctionDef) and n.name == "main")
         src = ast.unparse(main_fn)
@@ -2983,8 +3037,8 @@ class TestNoRawTracebacks(unittest.TestCase):
         self.assertIn("except KeyboardInterrupt", src)
 
     def test_trader_run_is_wrapped(self):
-        import ast, inspect
-        tree = ast.parse(inspect.getsource(m))
+        import ast
+        tree = _package_tree()
         main_fn = next(n for n in ast.walk(tree)
                        if isinstance(n, ast.FunctionDef) and n.name == "main")
         src = ast.unparse(main_fn)
