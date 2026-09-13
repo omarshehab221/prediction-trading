@@ -137,7 +137,7 @@ class ScalpMixin:
             return
 
         target = bankroll * cfg.scalp_stake_pct
-        if min(target, self._available(bankroll)) < cfg.min_stake_usdt:
+        if self._available(bankroll) < cfg.min_stake_usdt:
             LOG.debug("No uncommitted bankroll for a scalp (%.2f committed "
                       "of %.2f)", self._committed(), bankroll)
             return
@@ -202,7 +202,12 @@ class ScalpMixin:
                 continue
             side, move_bps, dislocation = signal
 
-            stake = min(target, self._available(bankroll))
+            # The fraction, floored at the venue minimum: a small bankroll
+            # still takes one minimum-size order instead of sitting out every
+            # signal. The floor never reaches past what is free to spend, so
+            # the reserve and open positions still bound it.
+            stake = min(max(target, cfg.min_stake_usdt),
+                        self._available(bankroll))
             if stake < cfg.min_stake_usdt:
                 continue
 

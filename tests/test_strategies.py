@@ -1430,6 +1430,32 @@ class TestScalpEntry(unittest.TestCase):
                                breakeven_probability(0.50, 200))
         self.assertEqual(pos.signal.edge, 0.0)
 
+    # -- sizing: the fraction, floored at the venue minimum ---------------
+
+    def test_the_stake_is_the_fraction_when_it_clears_the_minimum(self):
+        t, _ = self._trader(scalp_stake_pct=0.10, reserve_pct=0.0)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertAlmostEqual(
+            t._positions[("BTCUSDT", Side.UP)].signal.stake_usdt, 10.0)
+
+    def test_a_fraction_under_the_minimum_trades_the_minimum(self):
+        """
+        10% of 4.24 is 0.42, under the 1.00 venue minimum. A small account
+        still takes one minimum-size order rather than sitting out every
+        signal it is given.
+        """
+        t, _ = self._trader(scalp_stake_pct=0.10, reserve_pct=0.0)
+        t._maybe_enter(4.24, "PAPER")
+        self.assertAlmostEqual(
+            t._positions[("BTCUSDT", Side.UP)].signal.stake_usdt,
+            t._cfg.min_stake_usdt)
+
+    def test_the_minimum_is_never_forced_past_what_is_free(self):
+        """The floor raises a small stake; it never spends money held back."""
+        t, _ = self._trader(scalp_stake_pct=0.10, reserve_pct=0.5)
+        t._maybe_enter(1.50, "PAPER")        # 0.75 free, under the 1.00 floor
+        self.assertEqual(t._positions, {})
+
     def test_scale_in_never_runs_on_a_scalp(self):
         t, _ = self._trader()
         t._maybe_enter(100.0, "PAPER")
