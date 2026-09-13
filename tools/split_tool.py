@@ -52,6 +52,8 @@ PACKAGE_DOCS = {
              "the entry point and re-exports this package's public surface.",
     "btc5m/venue": "Everything that talks to the venue.",
     "btc5m/trader": "The trading loop and the strategies it runs.",
+    "tests": "The suite, one subject per module. test_btc_5m.py imports all of "
+             "it, so `python -m unittest test_btc_5m` still means the whole suite.",
 }
 
 # module path -> (module docstring, [top-level names to move, in file order])
@@ -255,6 +257,100 @@ MIXINS: dict[str, tuple[str, str, str, str, list[str]]] = {
         "What the round paid, and whether the account agrees.",
         "Settlement and reconciliation against the venue.",
         ["_settle_open", "_settle_one", "_reconcile"]),
+}
+
+# The suite, split the same way, by subject.
+TEST_MODULES: dict[str, tuple[str, list[str]]] = {
+    "tests/support.py": (
+        "What the tests build with: configs, rounds, signals, a trader wired\n"
+        "to a fake client, and the fake clients themselves.",
+        ["ROOT", "build_client", "_EMPTY_CONTAINERS", "build_trader", "cfg",
+         "convex_cfg", "straddle_cfg", "lastminute_cfg", "scalp_cfg",
+         "_close_journals", "_stage_bot", "_package_trees", "_package_tree",
+         "make_signal", "make_trader", "make_pending", "make_position",
+         "make_round", "FakeClient", "QuotingClient", "ScalpClient",
+         "_FakePosition"]),
+    "tests/test_pricing.py": (
+        "The maths: what a contract is worth, what clears a cost, how much to\n"
+        "stake and what a settled trade paid.",
+        ["TestDigitalPricing", "TestBreakeven", "TestKelly", "TestWalkBook",
+         "TestSettlePnl", "TestStudentT", "TestWinReturn",
+         "TestReservationPrice", "TestBracketArithmetic",
+         "TestSignalEdgeRequired", "TestStraddleSplit", "TestStraddleCompletion",
+         "TestTrendArithmetic", "TestProjectedRounds", "TestWeiUnits",
+         "TestEdgeThresholds", "TestSmallAccountSizing"]),
+    "tests/test_venue.py": (
+        "Everything said to the venue and every payload read back from it.",
+        ["TestParseRound", "TestParseAsks", "TestParseBids",
+         "TestVariantParsing", "TestSymbolMapping", "TestRequestSigning",
+         "TestErrorSurfacing", "TestEndpointMethods", "TestBalanceLookup",
+         "TestPredictionWalletBalance", "TestFundingSourceDerivation",
+         "TestMinimumDiscovery", "TestQuoteErrorClassification",
+         "TestStrictFieldParsing", "TestQuoteValidation",
+         "TestErrorClassification", "TestOrderResponseHandling",
+         "TestHostilePayloads", "TestBatchRedeemResponses",
+         "TestVenueDerivedParameters", "TestLimitQuoting",
+         "TestOrderStateAndCancel", "TestOrderPlan", "TestAuthWait",
+         "TestPerMarketFee", "TestRedemption"]),
+    "tests/test_config.py": (
+        "Settings: what they mean, which profile sets them, and what happens\n"
+        "when the file on disk changes underneath a running bot.",
+        ["TestConfigValidation", "TestConvexProfile", "TestMicroProfile",
+         "TestFavoriteProfile", "TestProfileDefaults", "TestProfileRiskCoherence",
+         "TestNoBakedInValues", "TestConfigFile", "TestHotReload",
+         "TestLimitConfig", "TestScalpConfig", "TestScalpProfile",
+         "TestStraddleConfig", "TestLastMinuteConfig", "TestWsConfig",
+         "TestBlendCapIsPerProfile", "TestHostingReadiness"]),
+    "tests/test_risk.py": (
+        "What the bot measures about the market and what makes it stop.",
+        ["TestRiskManager", "TestCalibrationBreaker", "TestBankrollViability",
+         "TestVolatilityCache", "TestTailEstimation", "TestClampedSigmaGuard",
+         "TestRawSigmaDiagnostic", "TestTrendDetection",
+         "TestVolatilityReadsMarketData"]),
+    "tests/test_journal.py": (
+        "The record of what was traded, and every report read off it.",
+        ["TestJournal", "TestBiasReport", "TestPerProfileReport",
+         "TestBufferReport", "TestDiagnose", "TestPerMarketFeeInDiagnostics",
+         "TestPeriodicReport"]),
+    "tests/test_assessment.py": (
+        "The gates between a round and a position.",
+        ["TestEvaluate", "TestBufferGate", "TestBoundaryConditions",
+         "TestGatesSeeThePricePaid", "TestReturnFloor",
+         "TestBlendedPriceCeiling", "TestNewLimitsActuallyBind",
+         "TestOnlyBufferScalesIn"]),
+    "tests/test_trader.py": (
+        "The loop and its machinery: sessions, positions, resting orders,\n"
+        "exits, settlement, reconciliation and scaling in.",
+        ["TestSimulatedSession", "TestLiveQuoteGate", "TestTieSettlement",
+         "TestScaleIn", "TestScaleInSizing", "TestModeSwitching",
+         "TestMultiMarket", "TestBalanceReconciliation",
+         "TestPendingOrderLifecycle", "TestPartialFills", "TestCancelRacesFill",
+         "TestPaperRestingOrders", "TestLimitExits", "TestMissedRoundReporting",
+         "TestLoopSurvivesUnexpectedFailures",
+         "TestSoldPositionsReachTheRiskManager", "TestTrendBoost"]),
+    "tests/test_strategies.py": (
+        "The four strategies, entered end to end against a fake venue.",
+        ["TestStraddleEntry", "TestStraddleCompletionBar", "TestLastMinuteEntry",
+         "TestScalpSignal", "TestScalpEntry", "TestScalpStops",
+         "TestScalpFlatten"]),
+    "tests/test_ws_feeds.py": (
+        "The sockets: connection, books, spot, futures and recycling.",
+        ["TestWsConnection", "TestBookFeed", "TestSpotFeed", "TestMarketData",
+         "TestFuturesFeed", "TestWsRecycle", "TestScriptModeSharesOneSide"]),
+    "tests/test_cli.py": (
+        "What each command does, and what the environment may override.",
+        ["TestMainEntryPoint", "TestTradingModeEnv", "TestSymbolsArgParsing",
+         "TestSymbolsEnv", "TestNewCliSurface", "TestPreflightGate"]),
+    "tests/test_source_rules.py": (
+        "The rules the source itself must obey, and the tools that check them.",
+        ["TestNoSilentFailures", "TestNoRawTracebacks", "TestSchemaConformance",
+         "TestPropertyInvariants", "TestCoherenceCorpus"]),
+    "tests/test_deployment.py": (
+        "The deploy path: the entrypoint, the gate, and the manifests that\n"
+        "have to agree with the module.",
+        ["TestDeploymentEntrypoint", "TestDefaultProfileCoherence",
+         "TestVerificationGate", "TestModeIsNotHardcoded",
+         "TestDeploymentManifests"]),
 }
 
 # The order moves must happen in: a module may only be created once every
@@ -548,7 +644,9 @@ def render_imports(aliases: dict[str, tuple], runtime: set[str],
 
     def group(mod: str) -> int:
         head = mod.removeprefix("!import ").split(" ")[0].split(".")[0]
-        if head.startswith("btc5m") or head == "ws_feeds":
+        if head.startswith("btc5m") or head in (
+                "ws_feeds", "btc_5m_predictor", "tests", "coherence",
+                "conformance"):
             return 2
         return 1 if head in THIRD_PARTY else 0
 
@@ -621,14 +719,14 @@ def cut(lines: list[str], spans: list[tuple[int, int]]) -> list[str]:
 # --------------------------------------------------------------------------
 
 
-def move(module: str) -> None:
+def move(module: str, source: str = FACADE) -> None:
     if module in MIXINS:
         move_members(module)
         return
-    doc, names = MODULES[module]
-    src, tree = load(FACADE)
+    doc, names = MODULES.get(module) or TEST_MODULES[module]
+    src, tree = load(source)
     lines = src.split("\n")
-    table = symtable.symtable(src, FACADE, "exec")
+    table = symtable.symtable(src, source, "exec")
     tops = definitions(tree.body)
     aliases = import_aliases(tree)
     absent = [n for n in names if n not in tops]
@@ -655,7 +753,7 @@ def move(module: str) -> None:
     ensure_packages(os.path.dirname(path))
     write(path, "\n".join(docstring(doc) + [""] + imports + ["", ""])
           + "\n\n\n".join(blocks))
-    write(FACADE, "\n".join(
+    write(source, "\n".join(
         with_import(cut(lines, spans), module_name(module), names)))
 
 
@@ -897,7 +995,10 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
     mover = sub.add_parser("move")
-    mover.add_argument("module", choices=list(MODULES) + list(MIXINS))
+    mover.add_argument("module",
+                       choices=list(MODULES) + list(MIXINS) + list(TEST_MODULES))
+    mover.add_argument("--from", dest="source", default="btc_5m_predictor.py",
+                       help="the file to move the definitions out of")
     checker = sub.add_parser("check")
     checker.add_argument("--baseline", required=True)
     sub.add_parser("leftovers")
@@ -905,7 +1006,7 @@ def main(argv: list[str] | None = None) -> int:
     args = ap.parse_args(argv)
 
     if args.cmd == "move":
-        move(args.module)
+        move(args.module, os.path.join(ROOT, args.source))
         print(f"moved {args.module}")
         return 0
     if args.cmd == "check":
