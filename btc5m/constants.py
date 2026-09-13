@@ -47,3 +47,9 @@ BASIS_EWMA_MIN_SAMPLES = 20
 # would produce anywhere away from 0.50, which is the mistake this check
 # exists to catch.
 WS_BOOK_VALIDATE_TOL = 0.02
+
+
+# A position worth less than this is left to settle rather than sold. A
+# partial exit can leave a remnant of a fraction of a cent, and the venue
+# refuses a sale that small with SYSTEM_ERROR (-9000).
+DUST_USDT = 0.01

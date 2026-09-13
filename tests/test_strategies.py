@@ -1712,6 +1712,22 @@ class TestScalpFlatten(unittest.TestCase):
                 if p.plan.action is m.Action.SELL]
         self.assertEqual(len(sale), 1)
 
+    def test_dust_left_by_a_partial_sale_is_not_offered_back(self):
+        """
+        A partial exit can leave a remnant worth a fraction of a cent. The
+        venue refuses a sale that small (SYSTEM_ERROR, -9000), and reporting
+        it as a FULL-STAKE bet mislabels a position worth 0.0027 USDT.
+        """
+        import dataclasses as _dc
+        t, _, key = self._at(60.0)
+        t._positions[key] = _dc.replace(t._positions[key],
+                                        committed_usdt=0.0027)
+        with self.assertNoLogs("btc5m", level="ERROR"):
+            t._flatten_scalps()
+        sale = [p for p in t._pending.values()
+                if p.plan.action is m.Action.SELL]
+        self.assertEqual(sale, [])
+
     def test_a_round_is_flattened_once(self):
         """
         Re-running would cancel the very sale the first pass placed, every

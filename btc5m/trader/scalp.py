@@ -10,7 +10,13 @@ import time
 
 import requests
 
-from btc5m.constants import BASIS_EWMA_ALPHA, BASIS_EWMA_MIN_SAMPLES, EPS, LOG
+from btc5m.constants import (
+    BASIS_EWMA_ALPHA,
+    BASIS_EWMA_MIN_SAMPLES,
+    DUST_USDT,
+    EPS,
+    LOG,
+)
 from btc5m.domain import (
     Action,
     Bracket,
@@ -434,6 +440,10 @@ class ScalpMixin:
             if pos.rnd.topic_id not in due:
                 continue
             self._brackets.pop(key, None)
+            if pos.committed_usdt < DUST_USDT:
+                LOG.info("%s: %.4f USDT left is too small to sell; it settles "
+                         "with the round", pos.rnd.slug, pos.committed_usdt)
+                continue
             LOG.info("FLATTEN %s %s | %.4f USDT with %.0fs left",
                      pos.rnd.slug, pos.signal.side.value, pos.committed_usdt,
                      pos.rnd.seconds_remaining(now_ms))
