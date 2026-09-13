@@ -281,11 +281,18 @@ def preflight(cfg: Config) -> int:
         hydrated: list[Round] = []
 
         def hydrate():
-            h = client.hydrate(rnd)
-            if h is None:
-                raise ApiError("no startPrice in variantData")
-            hydrated.append(h)
-            return f"strike {h.strike:,.2f} feed {h.feed_symbol}"
+            for candidate in rounds:
+                h = client.hydrate(candidate)
+                if h is not None:
+                    hydrated.append(h)
+                    return f"strike {h.strike:,.2f} feed {h.feed_symbol}"
+            # A round publishes its strike when it opens, so a freshly listed
+            # one legitimately has none -- failing the boot on that turned an
+            # expected state into a restart loop whenever preflight happened
+            # to run between listing and open. Prove the endpoint answers
+            # instead: a real failure still raises and still fails the check.
+            client.market_detail(rnd.topic_id)
+            return "reachable; no live round has published its strike yet"
 
         check("market detail", hydrate)
         check("venue parameters", lambda: (
