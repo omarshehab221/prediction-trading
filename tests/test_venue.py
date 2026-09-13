@@ -277,26 +277,6 @@ class TestRequestSigning(unittest.TestCase):
         self.assertEqual(_json.loads(parsed["cancelInfoList"][0]),
                          [{"orderId": "a"}, {"orderId": "b"}])
 
-    def test_an_indexed_key_is_signed_and_sent_with_literal_brackets(self):
-        """
-        The indexed cancel list failed -1022, signature invalid, with the
-        key signed as cancelInfoList%5B0%5D.orderId. requests sends the
-        brackets percent-encoded either way, so the venue must decode the
-        query before verifying -- and the decoded form is the one to sign.
-        """
-        import hashlib as _hashlib, hmac as _hmac
-        c = self._client()
-        query = c._signed_query({"cancelInfoList[0].orderId": "o1"})
-        self.assertIn("cancelInfoList[0].orderId=o1", query)
-        signed, _, signature = query.rpartition("&signature=")
-        self.assertEqual(signature, _hmac.new(
-            c._cfg.api_secret.encode(), signed.encode(),
-            _hashlib.sha256).hexdigest())
-        sent = requests.Request(
-            "POST", "https://api.binance.com/x?" + query).prepare().url
-        self.assertIn("cancelInfoList%5B0%5D.orderId=o1", sent,
-                      "the wire form this signing assumes has changed")
-
     def test_a_flat_list_is_sent_as_json(self):
         """
         tokenIds is a JSON array, not repeated parameters.
@@ -965,6 +945,30 @@ class TestErrorClassification(unittest.TestCase):
         self.assertEqual(ctx.exception.code, -9000)
         self.assertIs(ctx.exception.kind, m.ErrorKind.INSUFFICIENT_FUNDS)
 
+    def test_a_malformed_or_mis_signed_request_reports_its_bytes(self):
+        """
+        -1102 (malformed) and -1022 (signature) are properties of the bytes
+        sent, so the error carries them -- signature redacted -- rather than
+        leaving the wire format to be inferred from the code.
+        """
+        c = PredictionClient.__new__(PredictionClient)
+        c._store = None
+        c._static_cfg = cfg(); c._clock_offset_ms = 0
+        c._symbol_cache = {}; c._wallet = None
+
+        class S:
+            def request(self, method, url, timeout=None):
+                return types.SimpleNamespace(
+                    status_code=400, text="",
+                    json=lambda: {"code": -1102, "msg": "malformed"})
+        c._session = S()
+        with self.assertRaises(m.ApiError) as ctx:
+            c._request("batch_cancel", {"cancelInfoList": [{"orderId": "o1"}]})
+        msg = str(ctx.exception)
+        self.assertIn("cancelInfoList=%5B%7B%22orderId%22%3A%22o1%22%7D%5D", msg)
+        self.assertIn("signature=<redacted>", msg)
+        self.assertNotRegex(msg, r"signature=[0-9a-f]{16}")
+
 
 class TestOrderResponseHandling(unittest.TestCase):
     """place_order paths, which mutation testing showed were unexercised."""
@@ -1325,30 +1329,6 @@ class TestOrderStateAndCancel(unittest.TestCase):
                          [{"orderId": "o1"}, {"orderId": "o2"}])
         self.assertEqual(sent["walletAddress"], "0xabc")
         self.assertEqual(sent["walletId"], "w1")
-
-    def test_a_malformed_list_is_resent_in_indexed_form(self):
-        """
-        The venue answered the JSON list with -1102, "cancelInfoList was not
-        sent, was empty/null, or malformed", on every cancel. The indexed
-        form is the other encoding a list of objects has, so it is tried
-        before the cancel is reported as failed.
-        """
-        c = self._client()
-        sent = []
-
-        def request(name, params=None):
-            sent.append(dict(params))
-            if "cancelInfoList" in params:
-                raise m.ApiError("Mandatory parameter 'cancelInfoList' was "
-                                 "not sent", code=-1102)
-            return {"canceled": ["o1"]}
-
-        c._request = request
-        cancelled, _ = c.cancel_orders(["o1", "o2"])
-        self.assertEqual(cancelled, ["o1"])
-        self.assertEqual(sent[-1]["cancelInfoList[0].orderId"], "o1")
-        self.assertEqual(sent[-1]["cancelInfoList[1].orderId"], "o2")
-        self.assertEqual(sent[-1]["walletId"], "w1")
 
     def test_cancelling_nothing_makes_no_request(self):
         c = self._client()

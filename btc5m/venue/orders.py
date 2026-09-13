@@ -326,24 +326,10 @@ class OrdersApiMixin:
         if not order_ids:
             return [], {}
         wallet = self.wallet()
-        base = {"walletAddress": wallet.address, "walletId": wallet.wallet_id}
-        try:
-            payload = self._request("batch_cancel", {
-                **base,
-                "cancelInfoList": [{"orderId": str(o)} for o in order_ids]})
-        except ApiError as exc:
-            if exc.code != -1102:
-                raise
-            # The venue rejects the connector's JSON list as malformed
-            # (-1102). Resend it indexed -- cancelInfoList[0].orderId=... --
-            # the other form a list of objects takes on the wire. If that is
-            # refused too, its error propagates and the caller logs it.
-            LOG.debug("batch_cancel refused the JSON list (%s); retrying "
-                      "indexed", exc)
-            payload = self._request("batch_cancel", {
-                **base,
-                **{f"cancelInfoList[{i}].orderId": str(o)
-                   for i, o in enumerate(order_ids)}})
+        payload = self._request("batch_cancel", {
+            "walletAddress": wallet.address,
+            "walletId": wallet.wallet_id,
+            "cancelInfoList": [{"orderId": str(o)} for o in order_ids]})
         cancelled = [str(o) for o in (payload.get("canceled") or [])]
         failed: dict[str, str] = {}
         for entry in payload.get("failed") or []:

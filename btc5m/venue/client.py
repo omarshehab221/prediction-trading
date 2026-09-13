@@ -147,14 +147,7 @@ class PredictionClient(
              for k, v in p.items()}
         p["timestamp"] = self.now_ms()
         p["recvWindow"] = self._cfg.recv_window_ms
-        # Brackets stay literal in KEYS: the indexed form of a list,
-        # cancelInfoList[0].orderId, failed -1022 when they went out as
-        # %5B/%5D, because the venue checks the signature against the
-        # brackets. Values are encoded exactly as urlencode encodes them.
-        query = "&".join(
-            f"{urllib.parse.quote(str(k), safe='[]')}="
-            f"{urllib.parse.quote_plus(str(v))}"
-            for k, v in sorted(p.items()))
+        query = urllib.parse.urlencode(sorted(p.items()))
         signature = hmac.new(self._cfg.api_secret.encode(),
                              query.encode(), hashlib.sha256).hexdigest()
         return f"{query}&signature={signature}"
@@ -216,8 +209,15 @@ class PredictionClient(
                 except (TypeError, ValueError):
                     code_int = None
             hint = self._ERROR_HINTS.get(code_int)
+            sent = ""
+            if code_int in (-1102, -1022):
+                # Malformed (-1102) and mis-signed (-1022) are properties of
+                # the bytes sent, so the error carries them, signature
+                # redacted, instead of leaving the wire to be inferred.
+                sent = " -- sent: " + re.sub(r"signature=[0-9a-f]+",
+                                             "signature=<redacted>", query)
             raise ApiError(f"{method} {path}: HTTP {r.status_code}: {detail}"
-                           + (f" -- {hint}" if hint else ""),
+                           + (f" -- {hint}" if hint else "") + sent,
                            code=code_int, status=r.status_code)
 
         try:

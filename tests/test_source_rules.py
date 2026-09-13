@@ -188,7 +188,7 @@ class TestSchemaConformance(unittest.TestCase):
                 and n.func.attr == "_request"
                 and n.args and isinstance(n.args[0], _ast.Constant))
         self.assertEqual(len(calls), expected)
-        self.assertEqual(len(calls), 17, "the bot's venue calls changed count")
+        self.assertEqual(len(calls), 16, "the bot's venue calls changed count")
         self.assertEqual(len({c.endpoint for c in calls}), 15)
         self.assertIn("get_quote", reads)
 
