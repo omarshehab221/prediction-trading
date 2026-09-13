@@ -173,7 +173,8 @@ until [ "$(aws efs describe-file-systems --file-system-id "$FS_ID" --query 'File
   sleep 5
 done
 
-EXISTING_MT_SUBNETS="$(aws efs describe-mount-targets --file-system-id "$FS_ID" --query 'MountTargets[].SubnetId' --output text)"
+# Text output separates list items with tabs; the match below needs spaces.
+EXISTING_MT_SUBNETS="$(aws efs describe-mount-targets --file-system-id "$FS_ID" --query 'MountTargets[].SubnetId' --output text | tr '\t' ' ')"
 for subnet in $SUBNETS; do
   case " $EXISTING_MT_SUBNETS " in
     *" $subnet "*) ;;
