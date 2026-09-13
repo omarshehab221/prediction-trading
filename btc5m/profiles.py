@@ -487,4 +487,4 @@ PROFILES: dict[str, dict] = {
 # The default strategy, declared once. Previously six literals across four
 # files each carried their own copy of this, which is precisely how a default
 # drifts: change five and the sixth silently disagrees.
-DEFAULT_PROFILE = "lastminute"
+DEFAULT_PROFILE = "scalp"
