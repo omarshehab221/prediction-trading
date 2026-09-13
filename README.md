@@ -59,17 +59,63 @@ Two refinements matter:
 
 | File | Lines | What it is |
 |---|---|---|
-| `btc_5m_predictor.py` | 8041 | The bot: client, pricing, risk, journal, CLI |
-| `ws_feeds.py` | 814 | Persistent WebSocket feeds behind one `MarketData` seam |
-| `test_btc_5m.py` | 9963 | 945 tests across 120 classes |
-| `conformance.py` | 406 | Validates every API call against Binance's own schema |
+| `btc_5m_predictor.py` | 193 | Entry point and public surface; defines nothing |
+| `btc5m/` | 9483 | The bot: one responsibility per module (see below) |
+| `ws_feeds.py` | 1063 | Persistent WebSocket feeds behind one `MarketData` seam |
+| `test_btc_5m.py` | 11251 | 1049 tests across 131 classes |
+| `conformance.py` | 431 | Validates every API call against Binance's own schema |
 | `fuzz.py` | 466 | Property-based testing with hostile inputs |
-| `coherence.py` | 460 | Finds stale artifacts, dead code, config drift |
-| `mutate.py` | 155 | Mutation testing — measures test quality |
-| `verify.sh` | 107 | The gate: runs before the bot is allowed to trade |
-| `checkup.sh` | 139 | Full isolated verification run |
+| `coherence.py` | 534 | Finds stale artifacts, dead code, config drift |
+| `mutate.py` | 161 | Mutation testing — measures test quality |
+| `verify.sh` | 111 | The gate: runs before the bot is allowed to trade |
+| `checkup.sh` | 136 | Full isolated verification run |
 | `entrypoint.sh` | 118 | Deployment boot sequence |
 | `Dockerfile`, `render.yaml` | — | Deployment manifests |
+
+The `btc5m` package, one responsibility per module:
+
+```
+btc5m/
+  constants.py          LOG, EPS, round length, fee fallback, EWMA + socket tolerances
+  units.py              USDT <-> wei, lenient float parsing
+  errors.py             error taxonomy: ErrorKind, ApiError and friends
+  stats.py              normal and Student-t distribution functions
+  pricing.py            what a contract is worth and what price clears
+  sizing.py             how much to stake: Kelly, book walk, blend caps, straddle split
+  pnl.py                what a settled trade paid
+  domain.py             the value types: Side, Round, Signal, Position, PendingOrder...
+  config.py             the Config dataclass and its validation
+  profiles.py           PROFILES and DEFAULT_PROFILE
+  config_file.py        the config document, hot reload, ConfigStore
+  volatility.py         VolatilityEstimator and the trend measure
+  risk.py               RiskManager: streaks, daily loss, calibration breaker
+  journal.py            the sqlite record and its reports
+  assessment.py         the entry gates and assess()
+  paper.py              PaperBook, the paper order simulator
+  probes.py             operator probes: preflight, whoami, discover-min
+  cli.py                argument parsing and main()
+  venue/
+    endpoints.py        BASE, DEFAULT_ENDPOINTS, CEX_ACCOUNT_TYPES
+    client.py           PredictionClient: construction, signing, transport, parsing
+    spot.py             SpotApiMixin: Binance spot price and klines
+    account.py          AccountApiMixin: wallets, balances, funding, quota
+    markets.py          MarketsApiMixin: rounds, detail, order books
+    orders.py           OrdersApiMixin: quote, place, confirm, cancel, order state
+    settlement.py       SettlementApiMixin: settled outcome, redeem, final price
+  trader/
+    core.py             Trader: construction, the loop, mode switching, shutdown
+    accounting.py       AccountingMixin: bankroll, exposure, per-market risk, resize
+    claims.py           ClaimsMixin: the background redemption worker
+    bookkeeping.py      BookkeepingMixin: pruning and missed-round tallies
+    order_lifecycle.py  OrderLifecycleMixin: resting orders, fills, retraction
+    exits.py            ExitsMixin: selling a position before settlement
+    straddle.py         StraddleMixin
+    model_entry.py      ModelEntryMixin
+    last_minute.py      LastMinuteMixin
+    scalp.py            ScalpMixin
+    scale_in.py         ScaleInMixin
+    settling.py         SettlementMixin: settlement and reconciliation
+```
 | `DEPLOY.md` | — | Hosting guide (read it before deploying) |
 
 ---
@@ -631,9 +677,9 @@ bug in this project was found by running the thing, not by the suite.
 | Tool | What it catches | Why it exists |
 |---|---|---|
 | `test_btc_5m.py` | Behaviour | 512 tests, including meta-tests over the source |
-| `conformance.py` | Wrong API calls | Validates against Binance's own OpenAPI connector — **not** my model of the API |
+| `conformance.py` | Wrong API calls | Validates against Binance's own OpenAPI connector — **not** my model of the API. Reads every file the bot is made of by default |
 | `fuzz.py` | Crashes, broken invariants | Random hostile input finds cases nobody would write |
-| `coherence.py` | Stale artifacts | Dead code, unread config, drifted defaults |
+| `coherence.py` | Stale artifacts | Dead code, unread config, drifted defaults. Reads every file the bot is made of by default |
 | `mutate.py` | Weak tests | Injects bugs and reports which survive |
 
 ```bash
