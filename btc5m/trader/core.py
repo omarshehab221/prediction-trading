@@ -122,6 +122,12 @@ class Trader(
         self._scalp_last_entry: dict[str, float] = {}
         # symbol -> (EWMA of the perp/spot basis in bps, samples seen).
         self._basis_ewma: dict[str, tuple[float, int]] = {}
+        # symbol -> (reason, detail) for the last signal that was NOT there,
+        # so the round that declines on it can say what the feed showed.
+        self._signal_why: dict[str, tuple[str, str]] = {}
+        # key -> (reason, monotonic seconds it was last logged). What the bot
+        # is waiting on right now; see _explain for when it is repeated.
+        self._explained: dict[str, tuple[str, float]] = {}
         self._hydrated: dict[int, Round] = {}
         self._errors = 0
         # token_id -> (expected payout USDT, tx hashes). Counted toward the

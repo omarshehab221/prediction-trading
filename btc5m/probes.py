@@ -219,10 +219,20 @@ def preflight(cfg: Config) -> int:
             # The scalp path sizes a fixed fraction floored at the venue
             # minimum and never calls kelly_stake, so the Kelly probe below
             # would call a tradeable account untradeable.
-            per_trade = max(bal * cfg.scalp_stake_pct, cfg.min_stake_usdt)
-            notes.append(f"  -> scalp stakes {per_trade:.2f} per trade "
-                         f"({cfg.scalp_stake_pct:.0%} of bankroll, floored at "
-                         f"the {cfg.min_stake_usdt:.2f} minimum)")
+            # The floor never reaches past what the reserve leaves free, so
+            # a balance just over the minimum can still place nothing.
+            free = bal * (1.0 - cfg.reserve_pct)
+            per_trade = min(max(bal * cfg.scalp_stake_pct,
+                                cfg.min_stake_usdt), free)
+            if per_trade < cfg.min_stake_usdt:
+                notes.append(f"  <-- only {free:.2f} free after the "
+                             f"{cfg.reserve_pct:.0%} reserve, under the "
+                             f"{cfg.min_stake_usdt:.2f} minimum; no scalp "
+                             f"can be placed")
+            else:
+                notes.append(f"  -> scalp stakes {per_trade:.2f} per trade "
+                             f"({cfg.scalp_stake_pct:.0%} of bankroll, floored "
+                             f"at the {cfg.min_stake_usdt:.2f} minimum)")
         elif cfg.last_minute:
             # The last-minute path never calls kelly_stake either, so probing
             # it would answer a question about a strategy this profile does

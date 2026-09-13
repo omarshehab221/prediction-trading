@@ -98,9 +98,17 @@ class ScalpMixin:
         minute-old tick is not a millisecond lead, it is history.
         """
         cfg = self._cfg
+
+        def none(reason: str, detail: str) -> None:
+            self._signal_why[symbol] = (reason, detail)
+            return None
+
         age = self._market_data.futures_tick_age_ms(symbol)
         if age is None or age > cfg.scalp_max_tick_age_ms:
-            return None
+            return none("futures feed stale",
+                        f"no perp tick for {symbol} yet" if age is None else
+                        f"newest perp tick is {age:.0f}ms old, limit "
+                        f"{cfg.scalp_max_tick_age_ms:.0f}ms")
         # Sample the basis on EVERY pass, before the move gate. The mean it
         # is measured against needs BASIS_EWMA_MIN_SAMPLES samples; fed only
         # when the perp had already moved, every restart spent the first
@@ -109,22 +117,41 @@ class ScalpMixin:
         dislocation = (self._basis_dislocation_bps(symbol)
                        if cfg.scalp_min_basis_bps > 0 else 0.0)
         move = self._market_data.futures_move_bps(symbol, cfg.scalp_lookback_ms)
-        if move is None or abs(move) < cfg.scalp_min_move_bps:
-            return None
+        if move is None:
+            return none("perp move unmeasurable",
+                        f"not enough perp history yet to measure a "
+                        f"{cfg.scalp_lookback_ms:.0f}ms move")
+        if abs(move) < cfg.scalp_min_move_bps:
+            return none("perp move too small",
+                        f"perp moved {move:+.2f}bp over "
+                        f"{cfg.scalp_lookback_ms:.0f}ms, needs "
+                        f"{cfg.scalp_min_move_bps:.2f}bp either way")
         side = Side.UP if move > 0 else Side.DOWN
         if cfg.scalp_min_basis_bps <= 0:
             return side, move, 0.0
         if dislocation is None:
-            return None
+            seen = self._basis_ewma.get(symbol, (0.0, 0))[1]
+            return none("basis mean warming up",
+                        f"perp moved {move:+.2f}bp but the basis mean has "
+                        f"{min(seen, BASIS_EWMA_MIN_SAMPLES)}/"
+                        f"{BASIS_EWMA_MIN_SAMPLES} samples (or spot is "
+                        f"unreadable)")
         # Same sign as the move, by at least the threshold. A perp that has
         # risen while the basis RICHENED means spot is behind; one that has
         # risen while the basis cheapened means spot has already caught up
         # and overtaken, and the thing being chased is over.
-        if move > 0 and dislocation < cfg.scalp_min_basis_bps:
-            return None
-        if move < 0 and dislocation > -cfg.scalp_min_basis_bps:
-            return None
+        if ((move > 0 and dislocation < cfg.scalp_min_basis_bps)
+                or (move < 0 and dislocation > -cfg.scalp_min_basis_bps)):
+            return none("spot already followed",
+                        f"perp moved {move:+.2f}bp but the basis sits "
+                        f"{dislocation:+.2f}bp from its mean, needs "
+                        f"{cfg.scalp_min_basis_bps:.2f}bp the same way")
         return side, move, dislocation
+
+    def _decline(self, raw, reason: str, detail: str) -> None:
+        """Watch a refused round for the missed-round tally, and say why."""
+        self._watching[raw.topic_id] = (raw.end_ms, reason)
+        self._explain(raw.symbol, reason, f"{raw.slug}: {reason} -- {detail}")
 
     def _maybe_enter_scalp(self, bankroll: float, mode: str) -> None:
         """
@@ -146,37 +173,57 @@ class ScalpMixin:
         now_ms = self._client.now_ms()
         self._prune(now_ms)
         if len(self._positions) >= cfg.max_concurrent_positions:
+            self._explain("scalp", "position slots full",
+                          f"all {cfg.max_concurrent_positions} position "
+                          f"slot(s) are taken; no new entry until one closes")
             return
 
         target = bankroll * cfg.scalp_stake_pct
-        if self._available(bankroll) < cfg.min_stake_usdt:
-            LOG.debug("No uncommitted bankroll for a scalp (%.2f committed "
-                      "of %.2f)", self._committed(), bankroll)
+        available = self._available(bankroll)
+        if available < cfg.min_stake_usdt:
+            self._explain("scalp", "no free bankroll",
+                          f"only {available:.2f} USDT is free to stake "
+                          f"(bankroll {bankroll:.2f}, {cfg.reserve_pct:.0%} "
+                          f"held in reserve, {self._committed():.2f} in open "
+                          f"positions) and the smallest order is "
+                          f"{cfg.min_stake_usdt:.2f}. Fund the wallet or "
+                          f"lower reserve_pct.")
             return
+        self._explained.pop("scalp", None)
 
         now_s = time.monotonic()
         for raw in self._client.list_rounds():
             secs = raw.seconds_remaining(now_ms)
             if not (cfg.entry_window_end_s <= secs <= cfg.entry_window_start_s):
+                self._explain(raw.symbol, "outside the entry window",
+                              f"{raw.slug}: {secs:.0f}s left; entries are "
+                              f"taken from {cfg.entry_window_start_s:.0f}s "
+                              f"down to {cfg.entry_window_end_s:.0f}s")
                 continue
             # Flat, on both counts. A pending order on this round is a
             # bracket leg or an entry still resolving; either way the symbol
             # is not free.
             if any(k[0] == raw.symbol for k in self._positions):
+                self._explain(raw.symbol, "holding a position",
+                              f"{raw.slug}: a scalp is open; the next entry "
+                              f"waits for its take-profit or stop")
                 continue
             if any(p.rnd.symbol == raw.symbol for p in self._pending.values()):
+                self._explain(raw.symbol, "order resolving",
+                              f"{raw.slug}: an order is still resolving")
                 continue
             try:
                 self._risk_for(raw.symbol).check(bankroll)
             except TradingHalted as exc:
-                LOG.debug("%s halted: %s", raw.symbol, exc)
+                self._explain(raw.symbol, "halted by risk limits",
+                              f"{raw.slug}: halted by risk limits: {exc}")
                 continue
 
             end_ms, taken = self._scalp_entries.get(raw.topic_id,
                                                    (raw.end_ms, 0))
             if taken >= cfg.scalp_max_entries_per_round:
-                self._watching[raw.topic_id] = (
-                    raw.end_ms, "the round's scalp ceiling is reached")
+                self._decline(raw, "the round's scalp ceiling is reached",
+                              f"{taken} entries taken this round")
                 continue
             last = self._scalp_last_entry.get(raw.symbol)
             if last is not None and now_s - last < cfg.scalp_cooldown_s:
@@ -184,8 +231,9 @@ class ScalpMixin:
 
             if cfg.min_liquidity > 0 and (raw.liquidity is None
                                           or raw.liquidity < cfg.min_liquidity):
-                self._watching[raw.topic_id] = (
-                    raw.end_ms, "the book is thinner than the minimum")
+                self._decline(raw, "the book is thinner than the minimum",
+                              f"liquidity {raw.liquidity if raw.liquidity is not None else 'unknown'}"
+                              f", minimum {cfg.min_liquidity:.0f}")
                 continue
 
             # The bracket has to be worth placing before a quote is spent on
@@ -196,21 +244,20 @@ class ScalpMixin:
                                             cfg.scalp_take_profit_pct,
                                             cfg.scalp_stop_loss_pct)
             if required is None or required > cfg.scalp_max_edge_required:
-                self._watching[raw.topic_id] = (
-                    raw.end_ms, "the fee demands more signal than the "
-                                "bracket can carry")
-                LOG.debug("%s: a %d bps fee needs %s hit-rate points over a "
-                          "coin flip, above the %.2f ceiling", raw.slug,
-                          raw.fee_bps,
-                          "no reachable" if required is None
-                          else f"{required:.2f}", cfg.scalp_max_edge_required)
+                self._decline(raw, "the fee demands more signal than the "
+                                   "bracket can carry",
+                              f"a {raw.fee_bps} bps fee needs "
+                              f"{'no reachable' if required is None else f'{required:.2f}'}"
+                              f" hit-rate points over a coin flip, ceiling "
+                              f"{cfg.scalp_max_edge_required:.2f}")
                 continue
 
             symbol = self._client.market_symbol(raw.feed_symbol)
             signal = self._scalp_signal(symbol)
             if signal is None:
-                self._watching[raw.topic_id] = (
-                    raw.end_ms, "the futures feed shows no lead to trade")
+                self._decline(raw, "the futures feed shows no lead to trade",
+                              self._signal_why.get(
+                                  symbol, ("", "no signal"))[1])
                 continue
             side, move_bps, dislocation = signal
 
@@ -221,13 +268,17 @@ class ScalpMixin:
             stake = min(max(target, cfg.min_stake_usdt),
                         self._available(bankroll))
             if stake < cfg.min_stake_usdt:
+                self._explain(raw.symbol, "no free bankroll",
+                              f"{raw.slug}: signal {side.value} but only "
+                              f"{stake:.2f} is free, under the "
+                              f"{cfg.min_stake_usdt:.2f} minimum")
                 continue
 
             quote = None
             price = self._book_price(raw, side)
             if price is None:
-                self._watching[raw.topic_id] = (
-                    raw.end_ms, "the side has no tradable price")
+                self._decline(raw, "the side has no tradable price",
+                              f"signal {side.value} but its book is empty")
                 continue
             if self._live:
                 fresh = self._live_bankroll("scalp entry")
@@ -235,9 +286,10 @@ class ScalpMixin:
                     continue
                 stake = min(stake, fresh)
                 if stake < cfg.min_stake_usdt:
-                    LOG.warning("%s: the wallet holds %.2f, under the %.2f "
-                                "minimum order; skipping", raw.slug, fresh,
-                                cfg.min_stake_usdt)
+                    self._explain(raw.symbol, "wallet under the minimum",
+                                  f"{raw.slug}: the wallet holds {fresh:.2f}, "
+                                  f"under the {cfg.min_stake_usdt:.2f} "
+                                  f"minimum order")
                     continue
                 quote = self._client.get_quote(raw, _market_buy(side, stake))
                 # The quote is authoritative; the book was a screen. Every
@@ -246,12 +298,17 @@ class ScalpMixin:
                 # bracket built on a screen price protects nothing.
                 price = quote.average_price
                 if abs(quote.price_impact) > cfg.max_price_impact:
-                    LOG.info("%s: price impact %.1f%% too high for a scalp; "
-                             "skipping", raw.slug, quote.price_impact * 100)
+                    self._explain(raw.symbol, "price impact too high",
+                                  f"{raw.slug}: signal {side.value} but a "
+                                  f"{stake:.2f} buy moves the price "
+                                  f"{quote.price_impact * 100:.1f}%, limit "
+                                  f"{cfg.max_price_impact * 100:.1f}%")
                     continue
             if not cfg.min_entry_price <= price <= cfg.max_entry_price:
-                self._watching[raw.topic_id] = (
-                    raw.end_ms, "the side is priced outside the band")
+                self._decline(raw, "the side is priced outside the band",
+                              f"signal {side.value} at {price:.4f}, band "
+                              f"{cfg.min_entry_price:.2f}-"
+                              f"{cfg.max_entry_price:.2f}")
                 continue
 
             bracket = bracket_prices(price, raw.fee_bps,
@@ -260,8 +317,8 @@ class ScalpMixin:
             if bracket is None:
                 # Usually the take-profit landing at or above 1.00: this fill
                 # is too near the top of the book for a 5% gain to exist.
-                self._watching[raw.topic_id] = (
-                    raw.end_ms, "no bracket fits around the price on offer")
+                self._decline(raw, "no bracket fits around the price on offer",
+                              f"signal {side.value} at {price:.4f}")
                 continue
             tp_price, stop_price = bracket
 
@@ -271,11 +328,15 @@ class ScalpMixin:
             # spread wider than the stop, stopped out within three seconds.
             bids = self._market_data.bids(raw, side)
             if not bids or bids[0][0] <= stop_price:
-                self._watching[raw.topic_id] = (
-                    raw.end_ms, "the spread is wider than the stop")
+                self._decline(raw, "the spread is wider than the stop",
+                              f"signal {side.value}: ask {price:.4f}, bid "
+                              f"{bids[0][0]:.4f}, stop {stop_price:.4f}"
+                              if bids else
+                              f"signal {side.value}: no bid to sell into")
                 continue
 
             self._watching.pop(raw.topic_id, None)
+            self._explained.pop(raw.symbol, None)
             quoted_stake = stake
             placed = self._place_leg(raw, side, price, stake, quote)
             if placed is None:

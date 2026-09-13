@@ -172,6 +172,10 @@ class Config:
     calibration_z_halt: float = -2.5
     max_rounds_per_day: int = 200
     max_consecutive_errors: int = 20
+    # Seconds between repeats of an unchanged "WAITING ... | why" line. A new
+    # reason is always logged at once; this only paces the reminders that
+    # the old one still holds. 0 logs changes only.
+    decision_log_interval_s: float = 30.0
 
     # --- Venue -------------------------------------------------------------
     # chainId, collateral, fee and the venue's own slippage all come from the
@@ -645,6 +649,8 @@ class Config:
             raise ValueError("max_concurrent_positions must be >= 1")
         if not 0 <= self.reserve_pct < 1:
             raise ValueError("reserve_pct must be in [0, 1)")
+        if self.decision_log_interval_s < 0:
+            raise ValueError("decision_log_interval_s must be non-negative")
         if not 0 < self.round_duration_tolerance < 1.0:
             raise ValueError("round_duration_tolerance must be in (0, 1)")
         if self.settled_history_limit < 1:

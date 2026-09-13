@@ -1283,6 +1283,38 @@ class TestScalpEntry(unittest.TestCase):
         t._maybe_enter(100.0, "PAPER")
         self.assertIn(("BTCUSDT", Side.UP), t._positions)
 
+    def test_a_bankroll_the_reserve_leaves_under_the_minimum_is_explained(self):
+        """
+        Live at 1.19 USDT the 30% reserve left 0.83 free, the entry returned
+        on its first check, and the only word of it was at DEBUG -- a quarter
+        of an hour of silence that read exactly like a hung bot.
+        """
+        t, _ = self._trader()
+        with self.assertLogs("btc5m", level="INFO") as logs:
+            t._maybe_enter(1.19, "PAPER")
+        self.assertEqual(t._positions, {})
+        text = "\n".join(logs.output)
+        self.assertIn("WAITING scalp", text)
+        self.assertIn("0.83", text)
+        self.assertIn("reserve", text)
+
+    def test_an_unchanged_reason_is_not_repeated_every_pass(self):
+        t, _ = self._trader(decision_log_interval_s=3600.0)
+        with self.assertLogs("btc5m", level="INFO") as logs:
+            for _ in range(5):
+                t._maybe_enter(1.19, "PAPER")
+            t._explain("scalp", "something else", "a new reason")
+        waiting = [line for line in logs.output if "WAITING" in line]
+        self.assertEqual(len(waiting), 2, waiting)
+
+    def test_a_missing_lead_says_what_the_perp_did(self):
+        t, _ = self._trader()
+        t._market_data.futures_move_bps = lambda s, l: 0.4
+        with self.assertLogs("btc5m", level="INFO") as logs:
+            t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        self.assertIn("perp moved +0.40bp", "\n".join(logs.output))
+
     def test_the_side_follows_the_perp(self):
         t, _ = self._trader()
         t._market_data.futures_move_bps = lambda s, l: -5.0

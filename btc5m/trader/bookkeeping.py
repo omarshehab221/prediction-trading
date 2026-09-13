@@ -5,6 +5,8 @@ were never entered.
 
 from __future__ import annotations
 
+import time
+
 from btc5m.constants import LOG
 
 
@@ -24,6 +26,27 @@ class BookkeepingMixin:
                     if end < horizon]:
             self._scalp_entries.pop(tid, None)
             self._flattened.discard(tid)
+
+    def _explain(self, key: str, reason: str, detail: str) -> None:
+        """
+        Say at INFO what is holding an entry back, without flooding the log.
+
+        The loop polls every second, so logging each refusal would bury the
+        trades under thousands of identical lines, and logging none of them
+        left a live bot silent for a quarter of an hour with no way to tell
+        "no money to stake" from "no signal" from "hung". So a refusal is
+        logged when its REASON changes, and again every
+        decision_log_interval_s while it holds, with the detail -- the
+        numbers -- as they stand at that moment. 0 logs changes only.
+        """
+        now = time.monotonic()
+        last = self._explained.get(key)
+        interval = self._cfg.decision_log_interval_s
+        if (last is not None and last[0] == reason
+                and (interval <= 0 or now - last[1] < interval)):
+            return
+        self._explained[key] = (reason, now)
+        LOG.info("WAITING %s | %s", key, detail)
 
     def _tally_missed(self, now_ms: int) -> None:
         """
