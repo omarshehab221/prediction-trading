@@ -1340,14 +1340,18 @@ class TestScalpEntry(unittest.TestCase):
         self.assertAlmostEqual(bracket.stop_price, expected[1])
         self.assertAlmostEqual(bracket.entry_price, 0.50)
 
-    def test_the_take_profit_is_a_resting_limit_sell(self):
+    def test_the_take_profit_is_watched_not_rested(self):
+        """
+        Nothing rests on the book. A resting take-profit had to be cancelled
+        before a stop could sell, and batch-cancel has never succeeded on
+        this venue -- every stop then waited on a cancel that could not
+        happen while the price kept falling.
+        """
         t, _ = self._trader()
         t._maybe_enter(100.0, "PAPER")
         bracket = t._brackets[("BTCUSDT", Side.UP)]
-        pending = t._pending[bracket.tp_order_id]
-        self.assertIs(pending.plan.action, m.Action.SELL)
-        self.assertIs(pending.plan.order_type, m.OrderType.LIMIT)
-        self.assertAlmostEqual(pending.plan.price_limit, bracket.tp_price)
+        self.assertFalse([p for p in t._pending.values()
+                          if p.plan.action is m.Action.SELL])
 
     def test_the_stop_is_never_an_order(self):
         """
@@ -1358,7 +1362,8 @@ class TestScalpEntry(unittest.TestCase):
         t._maybe_enter(100.0, "PAPER")
         bracket = t._brackets[("BTCUSDT", Side.UP)]
         resting = [p.plan.price_limit for p in t._pending.values()]
-        self.assertEqual(resting, [bracket.tp_price])
+        self.assertNotIn(bracket.stop_price, resting)
+        self.assertEqual(resting, [])
 
     def test_the_entry_crosses_rather_than_rests(self):
         # Live fills at the quote's 0.51, putting the stop near 0.494;
@@ -1584,8 +1589,10 @@ class TestScalpStops(unittest.TestCase):
         buy's fee comes out of the shares received. Offering 20 is what the
         venue refused as "exceeded your available shares".
         """
-        _, client, _ = self._armed(0.50, shares=19.6)
-        self.assertAlmostEqual(self._sells(client)[0].amount, 19.6)
+        tp, _ = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t, client, _ = self._armed(tp, shares=19.6)
+        t._check_stops()
+        self.assertAlmostEqual(self._sells(client)[-1].amount, 19.6)
 
     def test_a_stop_sells_the_shares_held(self):
         _, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
@@ -1594,8 +1601,19 @@ class TestScalpStops(unittest.TestCase):
         self.assertAlmostEqual(self._sells(client)[-1].amount, 19.6)
 
     def test_without_a_recorded_count_the_cost_implied_shares_are_sold(self):
-        _, client, _ = self._armed(0.50)
-        self.assertAlmostEqual(self._sells(client)[0].amount, 20.0)
+        tp, _ = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t, client, _ = self._armed(tp)
+        t._check_stops()
+        self.assertAlmostEqual(self._sells(client)[-1].amount, 20.0)
+
+    def test_a_bid_at_the_take_profit_sells_the_position(self):
+        tp, _ = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t, client, key = self._armed(tp)
+        t._check_stops()
+        self.assertNotIn(key, t._brackets)
+        self.assertEqual(client.cancelled, [])
+        self.assertTrue([p for p in t._pending.values()
+                         if p.plan.action is m.Action.SELL])
 
     def test_a_bid_above_the_stop_does_nothing(self):
         t, client, key = self._armed(0.50)
@@ -1603,13 +1621,14 @@ class TestScalpStops(unittest.TestCase):
         self.assertIn(key, t._brackets)
         self.assertEqual(client.cancelled, [])
 
-    def test_a_bid_at_the_stop_cancels_the_take_profit(self):
+    def test_a_bid_at_the_stop_sells_without_cancelling_anything(self):
         _, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
         t, client, key = self._armed(stop)
-        tp_id = t._brackets[key].tp_order_id
         t._check_stops()
-        self.assertEqual(client.cancelled, [tp_id])
+        self.assertEqual(client.cancelled, [])
         self.assertNotIn(key, t._brackets)
+        self.assertTrue([p for p in t._pending.values()
+                         if p.plan.action is m.Action.SELL])
 
     def test_the_stop_sells_through_the_bid_rather_than_resting(self):
         """
@@ -1635,25 +1654,11 @@ class TestScalpStops(unittest.TestCase):
                     if p.plan.action is m.Action.SELL)
         self.assertIs(sale.plan.order_type, m.OrderType.LIMIT)
 
-    def test_a_cancel_that_raced_a_fill_is_booked_not_double_sold(self):
+    def test_a_stop_sells_even_when_cancel_is_unavailable(self):
         """
-        batch-cancel reports an order under `failed` most often because it
-        FILLED first. The state after the cancel is the answer.
-        """
-        t, client, key = self._armed(0.40)
-        tp_id = t._brackets[key].tp_order_id
-        shares = 10.0 / 0.50
-        client.states[tp_id] = m.OrderState("FILLED", 10.50, shares, 0.5357)
-        t._check_stops()
-        self.assertNotIn(key, t._positions)
-        self.assertFalse([p for p in t._pending.values()
-                          if p.plan.action is m.Action.SELL
-                          and p.order_id != tp_id])
-
-    def test_an_unreachable_cancel_leaves_the_stop_armed(self):
-        """
-        Selling before the take-profit is retracted would offer more shares
-        than the position holds, and the venue would fill both.
+        The live failure: batch-cancel refused every call, and the stop sat
+        waiting on it while the bid fell from 0.61 to 0.57. With nothing
+        resting, a stop never needs a cancel.
         """
         t, client, key = self._armed(0.40)
 
@@ -1662,11 +1667,9 @@ class TestScalpStops(unittest.TestCase):
 
         t._client.cancel_orders = refuse
         t._check_stops()
-        self.assertIn(key, t._brackets)
-        self.assertIn(key, t._positions)
-        self.assertFalse([p for p in t._pending.values()
-                          if p.plan.action is m.Action.SELL
-                          and p.order_id != t._brackets[key].tp_order_id])
+        self.assertNotIn(key, t._brackets)
+        self.assertTrue([p for p in t._pending.values()
+                         if p.plan.action is m.Action.SELL])
 
     def test_a_bracket_whose_position_is_gone_is_forgotten(self):
         t, _, key = self._armed(0.50)
@@ -1718,12 +1721,11 @@ class TestScalpFlatten(unittest.TestCase):
         self.assertEqual(client.cancelled, [])
         self.assertIn(key, t._positions)
 
-    def test_at_the_deadline_the_take_profit_is_retracted(self):
+    def test_at_the_deadline_the_bracket_is_disarmed(self):
         t, client, key = self._at(60.0)
-        tp_id = t._brackets[key].tp_order_id
         t._flatten_scalps()
-        self.assertIn(tp_id, client.cancelled)
         self.assertEqual(t._brackets, {})
+        self.assertEqual(client.cancelled, [])
 
     def test_at_the_deadline_the_position_is_offered_back(self):
         t, _, key = self._at(60.0)

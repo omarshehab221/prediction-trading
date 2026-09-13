@@ -1654,7 +1654,7 @@ class TestSoldPositionsReachTheRiskManager(unittest.TestCase):
         sig = Signal(Side.UP, 0.5, 0.50, 0.0, 10.0, 200.0)
         tid = t._journal.record("PAPER", rnd, sig, 0.0, 0.0, 100.0)
         t._positions[key] = Position(tid, rnd, sig, 10.0, 1)
-        t._brackets[key] = m.Bracket(0.50, 0.5357, 0.4847, "tp1")
+        t._brackets[key] = m.Bracket(0.50, 0.5357, 0.4847)
         plan = m.OrderPlan(side=Side.UP, action=m.Action.SELL,
                            order_type=m.OrderType.LIMIT, amount=20.0,
                            price_limit=0.5357)

@@ -337,22 +337,14 @@ class PendingOrder:
 @dataclass(frozen=True)
 class Bracket:
     """
-    The two exits attached to one scalp position. Only one is an order.
+    The two exits attached to one scalp position. Neither is an order.
 
-    THE ASYMMETRY IS THE VENUE'S, NOT A SHORTCUT
-    --------------------------------------------
-    `tp_order_id` names a resting LIMIT SELL the venue is holding above the
-    market. `stop_price` names a bid level this bot watches, because there is
-    no conditional order type here and a SELL limit posted BELOW the bid is
-    marketable -- it crosses and sells immediately rather than waiting for
-    the price to fall to it. Posting the stop leg as an order would not arm a
-    stop; it would close the position at once, at a loss, every time.
-
-    So "when one fills, cancel the other" is asymmetric in this code the same
-    way it is asymmetric on the venue: a filled take-profit disarms a trigger
-    that was never an order, and a triggered stop cancels a real one -- and
-    then re-reads it, because that cancel can race the very fill it is trying
-    to beat.
+    Both legs are prices this bot watches. The stop could never be an order:
+    there is no conditional order type here, and a SELL limit posted below
+    the bid is marketable, so it would close the position at once. The
+    take-profit used to rest on the book, but a resting sell holds the
+    position's shares, so a stop could not sell until it was cancelled --
+    and batch-cancel has never succeeded on this venue.
 
     entry_price is carried rather than read back off the position because the
     position's own fill price blends across tranches, and this bracket was
@@ -362,7 +354,6 @@ class Bracket:
     entry_price: float
     tp_price: float
     stop_price: float
-    tp_order_id: str | None = None
 
 
 @dataclass(frozen=True)

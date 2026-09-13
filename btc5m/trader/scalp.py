@@ -337,57 +337,26 @@ class ScalpMixin:
     def _arm_bracket(self, key: tuple[str, Side], entry: float,
                      tp_price: float, stop_price: float) -> None:
         """
-        Post the resting take-profit and arm the stop.
+        Arm both legs as prices this bot watches. Nothing is posted.
 
-        Only the take-profit becomes an order. The stop is a price this bot
-        watches, because a SELL limit below the bid is marketable and would
-        close the position on the spot instead of waiting -- see Bracket.
-
-        A take-profit the venue refuses is not fatal and is not silent: the
-        stop still guards the position, and the flatten deadline still closes
-        it. What would be fatal is recording a bracket whose take-profit does
-        not exist, so the order id stays None and _check_stops has nothing to
-        cancel.
+        The take-profit used to rest on the book as a LIMIT SELL. A resting
+        sell holds the position's shares, so a stop could not sell until the
+        take-profit was cancelled -- and batch-cancel has never succeeded on
+        this venue. Every stop then waited on a cancel that could not happen
+        while the price kept falling: a BNB scalp stopped at 0.59 rode that
+        wait to a full-stake loss. Watching the take-profit the way the stop
+        is watched means a scalp never needs to cancel anything.
         """
         pos = self._positions.get(key)
         if pos is None:
             return
-        tp_price = pos.rnd.round_price(tp_price)
-        shares = pos.held_shares
-        order_id: str | None = None
-        if 0.0 < tp_price < 1.0 and shares > EPS:
-            plan = OrderPlan(side=pos.signal.side, action=Action.SELL,
-                             order_type=OrderType.LIMIT, amount=shares,
-                             price_limit=tp_price)
-            try:
-                if self._live:
-                    quote = self._client.get_quote(pos.rnd, plan)
-                    order_id = str(self._client.place_order(pos.rnd, quote))
-                else:
-                    order_id = str(self._paper_book.place(plan, pos.rnd))
-            except (ApiError, requests.RequestException) as exc:
-                LOG.error("%s: the take-profit was refused (%s); the stop and "
-                          "the flatten deadline are all that guard this "
-                          "position", pos.rnd.slug, exc)
-                order_id = None
-            if order_id is not None:
-                self._pending[order_id] = PendingOrder(
-                    order_id=order_id, rnd=pos.rnd, plan=plan,
-                    signal=pos.signal,
-                    # Round end, not the entry window: a take-profit is not
-                    # an entry and has no reason to stop being useful when
-                    # entries do. The flatten deadline retracts it first in
-                    # the ordinary case; this is the backstop.
-                    expires_at_ms=pos.rnd.end_ms,
-                    filled_usdt=0.0, filled_shares=0.0,
-                    trade_id=pos.trade_id)
-        self._brackets[key] = Bracket(entry_price=entry, tp_price=tp_price,
-                                      stop_price=stop_price,
-                                      tp_order_id=order_id)
+        self._brackets[key] = Bracket(entry_price=entry,
+                                      tp_price=pos.rnd.round_price(tp_price),
+                                      stop_price=stop_price)
 
     def _check_stops(self) -> None:
         """
-        Fire the stop leg on any bracket whose bid has fallen to it.
+        Sell any bracketed position whose bid has reached either leg.
 
         Runs after the reaper, so a take-profit that filled this pass has
         already closed its position and taken its bracket with it -- which is
@@ -405,26 +374,24 @@ class ScalpMixin:
             if not bids:
                 continue
             bid = bids[0][0]
-            if bid > bracket.stop_price:
+            if bid >= bracket.tp_price:
+                leg = "take-profit"
+                LOG.info("TAKE-PROFIT %s %s | bid %.4f at or over %.4f "
+                         "(entry %.4f)", pos.rnd.slug, pos.signal.side.value,
+                         bid, bracket.tp_price, bracket.entry_price)
+            elif bid <= bracket.stop_price:
+                leg = "stop"
+                LOG.info("STOP %s %s | bid %.4f at or under %.4f (entry "
+                         "%.4f, take-profit was %.4f)", pos.rnd.slug,
+                         pos.signal.side.value, bid, bracket.stop_price,
+                         bracket.entry_price, bracket.tp_price)
+            else:
                 continue
-            LOG.info("STOP %s %s | bid %.4f at or under %.4f (entry %.4f, "
-                     "take-profit was %.4f)", pos.rnd.slug,
-                     pos.signal.side.value, bid, bracket.stop_price,
-                     bracket.entry_price, bracket.tp_price)
-            if bracket.tp_order_id and not self._retract(
-                    bracket.tp_order_id, "stop triggered"):
-                # The take-profit could not be reached. Selling now would put
-                # more shares on offer than the position holds, and the venue
-                # would fill both. Wait a pass; the stop re-fires while the
-                # bid stays down.
-                continue
+            # Both legs are watched prices, so nothing rests and there is
+            # nothing to cancel first: the sale goes out on the pass that
+            # sees the price.
             self._brackets.pop(key, None)
-            pos = self._positions.get(key)
-            if pos is None:
-                # The cancel raced the take-profit and lost: it had already
-                # filled, and _retract booked it. That is the good ending.
-                continue
-            self._sell_now(pos, "stop")
+            self._sell_now(pos, leg)
 
     def _flatten_scalps(self) -> None:
         """
