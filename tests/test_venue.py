@@ -1611,6 +1611,58 @@ class TestRedemption(unittest.TestCase):
         self.assertTrue(client.redeemed)           # the retry got through
         self.assertEqual(t._unredeemed, {})        # and then confirmed
 
+    def _timeout_warnings(self, logs):
+        return [r.getMessage() for r in logs.records
+                if "not confirmed within" in r.getMessage()]
+
+    def test_a_timed_out_claim_says_what_the_venue_answered(self):
+        """
+        "Not confirmed within 90s" alone reads the same whether the chain is
+        slow, the venue refuses the claim, or the payout was credited without
+        one. The venue's own answer is the only thing that separates them,
+        and it used to be logged at DEBUG, which the host never shows.
+        """
+        client = self._client()
+
+        def refuse(token_ids, chain_id="56"):
+            raise m.ApiError("the round is still settling")
+
+        client.batch_redeem = refuse
+        with self.assertLogs("btc5m", level="WARNING") as logs:
+            t = self._win_once(client, claim_timeout_s=0.05,
+                               claim_poll_interval_s=0.01)
+            t._claim_queue.join()
+        timeouts = self._timeout_warnings(logs)
+        self.assertEqual(len(timeouts), 1, logs.output)
+        self.assertIn("the round is still settling", timeouts[0])
+
+    def test_a_status_that_never_confirms_is_named(self):
+        client = self._client()
+        client.redeem_state = "PENDING"
+        with self.assertLogs("btc5m", level="WARNING") as logs:
+            t = self._win_once(client, claim_timeout_s=0.05,
+                               claim_poll_interval_s=0.01)
+            t._claim_queue.join()
+        timeouts = self._timeout_warnings(logs)
+        self.assertEqual(len(timeouts), 1, logs.output)
+        self.assertIn("PENDING", timeouts[0])
+
+    def test_a_refused_claim_is_warned_once_not_every_retry(self):
+        client = self._client()
+
+        def refuse(token_ids, chain_id="56"):
+            raise m.ApiError("the round is still settling")
+
+        client.batch_redeem = refuse
+        with self.assertLogs("btc5m", level="WARNING") as logs:
+            t = self._win_once(client, claim_timeout_s=0.1,
+                               claim_poll_interval_s=0.01)
+            t._claim_queue.join()
+        early = [r for r in logs.records
+                 if "still settling" in r.getMessage()
+                 and "not confirmed within" not in r.getMessage()]
+        self.assertEqual(len(early), 1, logs.output)
+
     def test_a_loss_never_redeems(self):
         client = self._client()
         t = self._live_trader(client)

@@ -81,6 +81,11 @@ class ClaimsMixin:
         chain_id = pos.rnd.chain_id
         deadline = time.time() + self._cfg.claim_timeout_s
         hashes: list[str] = []
+        # The venue's most recent answer, carried into the timeout warning.
+        # Without it "not confirmed" reads the same whether the chain is
+        # slow, the claim is refused, or the payout landed without one.
+        last_answer = "no answer yet"
+        refusal_warned = False
 
         while time.time() < deadline:
             if not hashes:
@@ -106,8 +111,18 @@ class ClaimsMixin:
                                     pos.rnd.slug, payout, exc)
                         self._forget_claim(token_id)
                         return
-                    LOG.debug("Redeem attempt for %s failed, retrying: %s",
-                              token_id, exc)
+                    last_answer = f"redeem refused: {exc}"
+                    if not refusal_warned:
+                        # Once, at WARNING: retries run every
+                        # claim_poll_interval_s, and the same refusal on each
+                        # of them would bury the log it is meant to explain.
+                        LOG.warning("Redeem for %s refused, retrying for up "
+                                    "to %.0fs: %s", pos.rnd.slug,
+                                    self._cfg.claim_timeout_s, exc)
+                        refusal_warned = True
+                    else:
+                        LOG.debug("Redeem attempt for %s failed, retrying: "
+                                  "%s", token_id, exc)
                     time.sleep(self._cfg.claim_poll_interval_s)
                     continue
 
@@ -116,10 +131,13 @@ class ClaimsMixin:
                     statuses = [self._client.redeem_status(h)
                                for h in hashes]
                 except (ApiError, requests.RequestException) as exc:
+                    last_answer = f"status check failed: {exc}"
                     LOG.debug("Status check for %s failed, retrying: %s",
                               token_id, exc)
                     time.sleep(self._cfg.claim_poll_interval_s)
                     continue
+                last_answer = "tx status " + (
+                    ", ".join(s or "unknown" for s in statuses) or "unknown")
                 if statuses and all(
                         s in ("SUCCESS", "CONFIRMED", "COMPLETED")
                         for s in statuses):
@@ -144,10 +162,10 @@ class ClaimsMixin:
 
             time.sleep(self._cfg.claim_poll_interval_s)
 
-        LOG.warning("Redemption for %s not confirmed within %.0fs; still "
-                    "tracked as unredeemed and will keep being retried the "
-                    "next time this token is claimed", pos.rnd.slug,
-                    self._cfg.claim_timeout_s)
+        LOG.warning("Redemption for %s not confirmed within %.0fs (last "
+                    "venue answer: %s); still tracked as unredeemed and will "
+                    "keep being retried the next time this token is claimed",
+                    pos.rnd.slug, self._cfg.claim_timeout_s, last_answer)
 
     def _claim(self, pos: Position) -> None:
         """
