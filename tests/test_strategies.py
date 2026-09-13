@@ -1309,6 +1309,22 @@ class TestScalpEntry(unittest.TestCase):
         t._maybe_enter(100.0, "PAPER")
         self.assertIn(("BTCUSDT", Side.UP), t._positions)
 
+    def test_an_entry_whose_bid_is_already_under_the_stop_is_skipped(self):
+        """
+        The entry buys the ask; the stop watches the bid. When the spread is
+        wider than the stop distance the position is stopped the moment it
+        opens -- live, BNB UP bought 0.80 with the bid at 0.61 stopped out
+        three seconds later. Nothing is entered that is born stopped.
+        """
+        t, _ = self._trader(ask=0.50, bid=0.40)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+
+    def test_an_entry_whose_bid_clears_the_stop_still_trades(self):
+        t, _ = self._trader(ask=0.50, bid=0.49)
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
     def test_no_signal_opens_nothing(self):
         t, _ = self._trader()
         t._market_data.futures_move_bps = lambda s, l: None
@@ -1345,7 +1361,9 @@ class TestScalpEntry(unittest.TestCase):
         self.assertEqual(resting, [bracket.tp_price])
 
     def test_the_entry_crosses_rather_than_rests(self):
-        t, client = self._trader(live=True)
+        # Live fills at the quote's 0.51, putting the stop near 0.494;
+        # the bid has to clear it or the spread gate refuses the entry.
+        t, client = self._trader(live=True, bid=0.50)
         t._maybe_enter(100.0, "PAPER")
         entry = client.orders[0]
         self.assertIs(entry[1], m.Action.BUY)
@@ -1455,7 +1473,9 @@ class TestScalpEntry(unittest.TestCase):
     def test_a_live_entry_records_the_shares_the_quote_returned(self):
         """The count every exit sells comes from the venue, not from cost."""
         import dataclasses as _dc
-        t, client = self._trader(live=True)
+        # Live fills at the quote's 0.51, putting the stop near 0.494;
+        # the bid has to clear it or the spread gate refuses the entry.
+        t, client = self._trader(live=True, bid=0.50)
         quote = client.get_quote
 
         def net_of_fee(rnd, plan):

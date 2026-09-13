@@ -265,6 +265,16 @@ class ScalpMixin:
                 continue
             tp_price, stop_price = bracket
 
+            # Buying the ask while the stop watches the bid: a bid already at
+            # or under the stop means the position is stopped the moment it
+            # opens. Live, every early loss was exactly that -- entries on a
+            # spread wider than the stop, stopped out within three seconds.
+            bids = self._market_data.bids(raw, side)
+            if not bids or bids[0][0] <= stop_price:
+                self._watching[raw.topic_id] = (
+                    raw.end_ms, "the spread is wider than the stop")
+                continue
+
             self._watching.pop(raw.topic_id, None)
             quoted_stake = stake
             placed = self._place_leg(raw, side, price, stake, quote)

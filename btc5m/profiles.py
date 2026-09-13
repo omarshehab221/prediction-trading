@@ -140,8 +140,8 @@ PROFILES: dict[str, dict] = {
               # The bracket: 5% profit or 5% loss on the position -- a
               # different number from the stake above, not a second stake.
               "scalp_take_profit_pct": 0.05, "scalp_stop_loss_pct": 0.05,
-              "scalp_lookback_ms": 1500.0, "scalp_min_move_bps": 1.0,
-              "scalp_min_basis_bps": 0.0, "scalp_max_tick_age_ms": 2000.0,
+              "scalp_lookback_ms": 1500.0, "scalp_min_move_bps": 1.5,
+              "scalp_min_basis_bps": 0.25, "scalp_max_tick_age_ms": 2000.0,
               "scalp_cooldown_s": 2.0, "scalp_max_entries_per_round": 20,
               "scalp_flatten_s": 60.0, "scalp_max_edge_required": 0.25,
               "entry_window_start_s": 300, "entry_window_end_s": 75,
@@ -184,7 +184,7 @@ PROFILES: dict[str, dict] = {
               # the spread and the exit needs a bid to sell into, and both
               # get worse faster than the price does. Stricter than every
               # other profile on purpose.
-              "min_liquidity": 50.0, "max_price_impact": 0.05,
+              "min_liquidity": 100.0, "max_price_impact": 0.03,
               "assumed_spread_pct": 0.03,
               # Never: a top-up would move the fill price the bracket was
               # already computed from. Config rejects the pairing; this is
