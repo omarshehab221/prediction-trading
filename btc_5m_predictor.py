@@ -53,36 +53,35 @@ Order book, spot price and the volatility window arrive on persistent
 sockets; see ws_feeds.py. Everything signed and mutating stays on REST.
 Set `ws_enabled` to false in the config to go back to REST for everything,
 which is what this did before the sockets existed.
+
+LAYOUT
+------
+This file is the entry point and the public surface: it defines nothing and
+re-exports everything, so `python btc_5m_predictor.py` and
+`import btc_5m_predictor as m` both still mean what they always did.
+
+The bot is the btc5m package, one responsibility per module: constants, units,
+errors and stats at the bottom; pricing, sizing and pnl above them; domain for
+the value types; config, profiles and config_file for settings; volatility,
+risk, journal, assessment and paper for the decision; venue/ for everything
+said to the venue; trader/ for the loop and the four strategies; probes and cli
+for what an operator runs. ws_feeds.py stays outside it: it is transport, and
+it borrows only Side and two constants.
 """
 
 from __future__ import annotations
 
-import argparse
-import dataclasses
-import hashlib
-import hmac
-import itertools
-import json
-import logging
-import math
-import os
-import re
-import signal
-import sqlite3
-import statistics
 import sys
-import threading
-import time
-import urllib.parse
-import queue
-from collections.abc import Iterable
-from dataclasses import dataclass, replace
-from decimal import ROUND_DOWN, Decimal
-from enum import Enum
 
-import requests
+# Run as a script, this file is the main module, not btc_5m_predictor.
+# Anything that later imports btc_5m_predictor would then execute it a
+# second time -- which, when the bot was defined here, meant a second Side
+# class, `side is Side.UP` failing, and the UP ladder derived from the DOWN
+# side of the book. Nothing is defined here any more, but registering the
+# running module under its own name keeps there being only one of it.
+if __name__ != "btc_5m_predictor":
+    sys.modules.setdefault("btc_5m_predictor", sys.modules[__name__])
 
-import ws_feeds
 from btc5m.constants import (
     BASIS_EWMA_ALPHA,
     BASIS_EWMA_MIN_SAMPLES,
@@ -126,7 +125,6 @@ from btc5m.pricing import (
     signal_edge_required,
     win_return,
 )
-from btc5m.pnl import settle_pnl, straddle_worst_case_pnl, wins_per_loss
 from btc5m.sizing import (
     boosted_stake,
     kelly_multiple,
@@ -136,6 +134,7 @@ from btc5m.sizing import (
     straddle_split,
     walk_book,
 )
+from btc5m.pnl import settle_pnl, straddle_worst_case_pnl, wins_per_loss
 from btc5m.domain import (
     Action,
     Bracket,
@@ -177,24 +176,6 @@ from btc5m.assessment import (
     entry_window_start_s,
 )
 from btc5m.paper import PaperBook
-from btc5m.venue.spot import SpotApiMixin
-from btc5m.venue.account import AccountApiMixin
-from btc5m.venue.markets import MarketsApiMixin
-from btc5m.venue.orders import OrdersApiMixin
-from btc5m.venue.settlement import SettlementApiMixin
-from btc5m.venue.client import PredictionClient
-from btc5m.trader.accounting import AccountingMixin
-from btc5m.trader.claims import ClaimsMixin
-from btc5m.trader.bookkeeping import BookkeepingMixin
-from btc5m.trader.order_lifecycle import OrderLifecycleMixin
-from btc5m.trader.exits import ExitsMixin
-from btc5m.trader.settling import SettlementMixin
-from btc5m.trader.scale_in import ScaleInMixin
-from btc5m.trader.straddle import StraddleMixin
-from btc5m.trader.model_entry import ModelEntryMixin
-from btc5m.trader.last_minute import LastMinuteMixin
-from btc5m.trader.scalp import ScalpMixin
-from btc5m.trader.core import Trader
 from btc5m.probes import (
     IP_SERVICES,
     discover_min,
@@ -204,73 +185,8 @@ from btc5m.probes import (
     whoami,
 )
 from btc5m.cli import _parse_symbols_arg, main
-
-# Run as a script, this file is the main module -- and ws_feeds' lazy
-# `from btc_5m_predictor import Side` would then import it a SECOND time,
-# producing a second Side class. `side is Side.UP` fails across those two
-# classes, so the UP ladder came back derived from the DOWN side of the book.
-# Registering the running module under its own name makes that import find
-# this module instead of loading another copy of it.
-if __name__ != "btc_5m_predictor":
-    sys.modules.setdefault("btc_5m_predictor", sys.modules[__name__])
-
-# --------------------------------------------------------------------------
-# Units
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# Configuration
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# Configuration file and hot reload
-# --------------------------------------------------------------------------
-
-# --------------------------------------------------------------------------
-# Domain types
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# Pricing
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# Risk
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# API client
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# Journal
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# Strategy (pure)
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# Runner
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# Preflight
-# --------------------------------------------------------------------------
-
-
-# --------------------------------------------------------------------------
-# Entry point
-# --------------------------------------------------------------------------
+from btc5m.venue.client import PredictionClient
+from btc5m.trader.core import Trader
 
 
 if __name__ == "__main__":

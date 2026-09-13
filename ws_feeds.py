@@ -340,7 +340,7 @@ def derive_asks(asks: list[tuple[float, float]],
     against REST once per market before any of it is allowed to price a
     trade.
     """
-    from btc_5m_predictor import Side
+    from btc5m.domain import Side
     if side is Side.UP:
         return sorted(asks)
     return sorted((round(1.0 - price, 10), size) for price, size in bids)
@@ -361,7 +361,7 @@ def derive_bids(asks: list[tuple[float, float]],
     would make the worst price in the book look like the best one available,
     which on an exit is money given away rather than an error raised.
     """
-    from btc_5m_predictor import Side
+    from btc5m.domain import Side
     if side is Side.UP:
         return sorted(bids, reverse=True)
     return sorted(((round(1.0 - price, 10), size) for price, size in asks),
@@ -467,7 +467,8 @@ class BookFeed:
         tick it replaces. Top of book only, and price only: depth and size
         move faster than the round trip and would reject a correct mapping.
         """
-        from btc_5m_predictor import LOG as _LOG, Side, WS_BOOK_VALIDATE_TOL
+        from btc5m.constants import LOG as _LOG, WS_BOOK_VALIDATE_TOL
+        from btc5m.domain import Side
         with self._lock:
             book = self._books.get(rnd.market_id)
             if book is None:
