@@ -176,8 +176,8 @@ class TestProfileDefaults(unittest.TestCase):
         self.assertEqual(m.default_config_document()["active_profile"],
                          m.DEFAULT_PROFILE)
 
-    def test_default_profile_is_the_last_minute_one(self):
-        self.assertEqual(m.DEFAULT_PROFILE, "lastminute")
+    def test_default_profile_is_the_scalp_one(self):
+        self.assertEqual(m.DEFAULT_PROFILE, "scalp")
 
     def test_default_profile_exists(self):
         self.assertIn(m.DEFAULT_PROFILE, m.PROFILES)
