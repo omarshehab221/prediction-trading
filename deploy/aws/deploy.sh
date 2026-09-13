@@ -123,8 +123,13 @@ fi
 if [ "$(aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" \
         --query "logGroups[?logGroupName=='$LOG_GROUP'] | length(@)" --output text)" = "0" ]; then
   aws logs create-log-group --log-group-name "$LOG_GROUP"
-  aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 30
   echo "created log group $LOG_GROUP"
+fi
+# Retention is housekeeping, not a reason to abandon a deploy halfway through.
+if [ "$(aws logs describe-log-groups --log-group-name-prefix "$LOG_GROUP" \
+        --query "logGroups[?logGroupName=='$LOG_GROUP'].retentionInDays | [0]" --output text)" = "None" ]; then
+  aws logs put-retention-policy --log-group-name "$LOG_GROUP" --retention-in-days 30 \
+    || echo "WARNING: could not set log retention; logs are kept forever." >&2
 fi
 
 # --- Network -----------------------------------------------------------------
