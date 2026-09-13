@@ -210,8 +210,10 @@ else
   fi
 
   archive="$(mktemp -d)/source.zip"
-  git archive --format=zip -o "$archive" HEAD
+  # git and aws are native Windows programs under Git Bash; /tmp means nothing
+  # to either, so hand them the Windows form of the path.
   case "$(uname -s)" in MINGW*|MSYS*|CYGWIN*) archive="$(cygpath -w "$archive")" ;; esac
+  git archive --format=zip -o "$archive" HEAD
   aws s3 cp "$archive" "s3://$BUCKET/source/$TAG.zip" --only-show-errors
 
   BUILD_ID="$(aws codebuild start-build --project-name "$APP" \
