@@ -162,9 +162,11 @@ echo "vpc=$VPC task_sg=$TASK_SG efs_sg=$EFS_SG"
 log "EFS"
 FS_ID="$(aws efs describe-file-systems --creation-token "$APP" --query 'FileSystems[0].FileSystemId' --output text)"
 if [ "$FS_ID" = "None" ]; then
+  # No --tags: the creation token is the lookup key, and tagging needs
+  # elasticfilesystem:TagResource, which the deploying user may not have.
   FS_ID="$(aws efs create-file-system --creation-token "$APP" --encrypted \
     --performance-mode generalPurpose --throughput-mode elastic \
-    --tags Key=Name,Value="$APP-data" --query FileSystemId --output text)"
+    --query FileSystemId --output text)"
   echo "created file system $FS_ID"
 fi
 until [ "$(aws efs describe-file-systems --file-system-id "$FS_ID" --query 'FileSystems[0].LifeCycleState' --output text)" = "available" ]; do
