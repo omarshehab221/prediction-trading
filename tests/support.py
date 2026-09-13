@@ -215,7 +215,7 @@ def _stage_bot(target_dir):
     """
     Copy the whole bot into a directory, the way a deploy would.
 
-    Every root-level module plus the package. Copying the entry point alone
+    Every root-level module, the package and the suite. Copying the entry point alone
     was enough while the entry point was the bot; it stopped being enough when
     ws_feeds arrived, and the entrypoint test has been failing on Linux ever
     since -- invisibly here, because Windows cannot exec the script at all.
@@ -223,11 +223,12 @@ def _stage_bot(target_dir):
     import shutil as _sh, os as _os, glob as _glob
     for path in _glob.glob(_os.path.join(ROOT, "*.py")):
         _sh.copy(path, target_dir)
-    pkg = _os.path.join(ROOT, "btc5m")
-    if _os.path.isdir(pkg):
-        _sh.copytree(pkg, _os.path.join(target_dir, "btc5m"),
-                     ignore=_sh.ignore_patterns("__pycache__"),
-                     dirs_exist_ok=True)
+    for name in ("btc5m", "tests"):
+        source = _os.path.join(ROOT, name)
+        if _os.path.isdir(source):
+            _sh.copytree(source, _os.path.join(target_dir, name),
+                         ignore=_sh.ignore_patterns("__pycache__"),
+                         dirs_exist_ok=True)
 
 
 def _package_trees():

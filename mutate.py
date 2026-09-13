@@ -108,7 +108,7 @@ def main() -> int:
         path = os.path.join(here, name)
         if name.endswith(".py"):
             shutil.copy(path, workdir)
-        elif name == "btc5m" and os.path.isdir(path):
+        elif name in ("btc5m", "tests") and os.path.isdir(path):
             shutil.copytree(path, os.path.join(workdir, name),
                             ignore=shutil.ignore_patterns("__pycache__"))
 

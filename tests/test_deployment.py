@@ -497,6 +497,16 @@ class TestDeploymentManifests(unittest.TestCase):
                 f"{name} has CRLF line endings; bash and Docker both read "
                 f"the carriage return as content")
 
+    def test_the_image_ships_the_suite(self):
+        """
+        The image runs the suite at build AND at boot. Half a suite copied in
+        is a gate that passes because most of it was not there.
+        """
+        import re as _re
+        self.assertRegex(
+            self._read("Dockerfile"), _re.compile("^COPY[ ]+tests/", _re.M),
+            "the Dockerfile must COPY the tests package")
+
     def test_the_image_ships_the_package(self):
         """
         An image with the entry point and not the package has no bot in it,
