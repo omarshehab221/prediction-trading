@@ -62,7 +62,8 @@ Two refinements matter:
 | `btc_5m_predictor.py` | 193 | Entry point and public surface; defines nothing |
 | `btc5m/` | 9483 | The bot: one responsibility per module (see below) |
 | `ws_feeds.py` | 1063 | Persistent WebSocket feeds behind one `MarketData` seam |
-| `test_btc_5m.py` | 11251 | 1049 tests across 131 classes |
+| `test_btc_5m.py` | 177 | The whole suite by name: imports every `tests/` module |
+| `tests/` | 11462 | 1050 tests across 131 classes, one subject per module |
 | `conformance.py` | 431 | Validates every API call against Binance's own schema |
 | `fuzz.py` | 466 | Property-based testing with hostile inputs |
 | `coherence.py` | 534 | Finds stale artifacts, dead code, config drift |
@@ -676,7 +677,7 @@ bug in this project was found by running the thing, not by the suite.
 
 | Tool | What it catches | Why it exists |
 |---|---|---|
-| `test_btc_5m.py` | Behaviour | 512 tests, including meta-tests over the source |
+| `test_btc_5m.py` → `tests/` | Behaviour | 1050 tests, including meta-tests over the source |
 | `conformance.py` | Wrong API calls | Validates against Binance's own OpenAPI connector — **not** my model of the API. Reads every file the bot is made of by default |
 | `fuzz.py` | Crashes, broken invariants | Random hostile input finds cases nobody would write |
 | `coherence.py` | Stale artifacts | Dead code, unread config, drifted defaults. Reads every file the bot is made of by default |
