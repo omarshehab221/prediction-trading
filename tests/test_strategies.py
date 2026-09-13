@@ -1144,6 +1144,9 @@ class TestScalpSignal(unittest.TestCase):
                 **cfgkw):
         rnd = make_round()
         client = ScalpClient([rnd], [(rnd.end_ms - 200_000, spot)], {}, {})
+        # These test the spot-lag gate itself, so they switch it on; the
+        # profile trades the futures move alone (scalp_min_basis_bps 0).
+        cfgkw.setdefault("scalp_min_basis_bps", 0.5)
         t = build_trader(client, scalp_cfg(db_path=self.db, **cfgkw), self.db)
         self._built.append(t)
         t._market_data.futures_move_bps = lambda symbol, lookback: move
