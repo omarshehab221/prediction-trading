@@ -277,27 +277,18 @@ class TestRequestSigning(unittest.TestCase):
         self.assertEqual(_json.loads(parsed["cancelInfoList"][0]),
                          [{"orderId": "a"}, {"orderId": "b"}])
 
-    def test_a_flat_list_is_sent_as_json(self):
+    def test_a_flat_list_is_sent_as_repeated_parameters(self):
         """
-        tokenIds is a JSON array, not repeated parameters.
+        tokenIds goes as tokenIds=a&tokenIds=b.
 
-        Verified by running the connector's own serialiser: @binance/common
-        puts every array parameter through JSON.stringify, and signs the
-        string it built, so the venue both receives and HMACs the JSON form.
-        Repeated parameters are not a Binance array convention anywhere.
-
-        This was a guess from the initial commit that no live call ever
-        tested -- batch_redeem cannot run until a real position exists, and
-        place-order-bundle has never been executed against a funded account.
+        That is the form that redeemed in production (2026-09-07). Sent as
+        one JSON array, to match @binance/common, every redemption was
+        refused with SYSTEM_ERROR -9000 -- the venue, not the connector, is
+        the authority on what it accepts.
         """
-        import json as _json, urllib.parse as _up
         c = self._client()
         query = c._signed_query({"tokenIds": ["a", "b"]})
-        self.assertNotIn("tokenIds=a&tokenIds=b", query)
-        parsed = _up.parse_qs(query)
-        self.assertEqual(len(parsed["tokenIds"]), 1,
-                         "sent as repeated parameters, not one JSON value")
-        self.assertEqual(_json.loads(parsed["tokenIds"][0]), ["a", "b"])
+        self.assertIn("tokenIds=a&tokenIds=b", query)
 
     def test_the_signature_covers_the_json_form(self):
         """

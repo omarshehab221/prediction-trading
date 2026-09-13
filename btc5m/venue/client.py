@@ -120,34 +120,27 @@ class PredictionClient(
         signature error. Returning a string rather than a dict makes that
         class of bug unrepresentable.
 
-        Every array and object parameter is a JSON string, which is what the
-        connector does and therefore what the venue expects. See below.
+        Flat lists go as repeated parameters; objects and lists of objects
+        go as JSON strings. See below.
         """
         p = {k: v for k, v in params.items() if v is not None}
-        # Arrays and objects go as JSON, because that is what the venue is
-        # given by its own connector. @binance/common routes every parameter
-        # through serializeValue, which JSON.stringify's anything that is not
-        # a scalar, and then HMACs the string it built -- so the JSON form is
-        # both what arrives and what the signature is checked against.
+        # Flat lists go as repeated parameters, tokenIds=a&tokenIds=b, via
+        # urlencode's doseq. That is the form that redeemed in production on
+        # 2026-09-07. Sending them as one JSON array instead, to match
+        # @binance/common, got every redemption refused with SYSTEM_ERROR --
+        # what the venue accepts outranks what its connector sends.
         #
-        # This used to send flat lists as repeated parameters
-        # (tokenIds=a&tokenIds=b) via urlencode's doseq. That was a guess
-        # carried from the first commit which no live call ever tested:
-        # batch_redeem cannot run until a real position exists, and
-        # place-order-bundle has never executed against a funded account, so
-        # the only two array parameters in the bot -- tokenIds and
-        # cancelInfoList -- had never left the machine. Repeated parameters
-        # are not a Binance array convention anywhere.
-        #
-        # doseq is therefore gone rather than left set: no list or tuple can
-        # reach urlencode any more, so a doseq=True here would describe a
-        # path that no longer exists.
+        # An object, or a list of objects, has no doseq form: each element
+        # would go as its Python repr. Those stay JSON.
         p = {k: (json.dumps(v, separators=(",", ":"))
-                 if isinstance(v, (dict, list, tuple)) else v)
+                 if isinstance(v, dict)
+                 or (isinstance(v, (list, tuple))
+                     and any(isinstance(x, dict) for x in v))
+                 else v)
              for k, v in p.items()}
         p["timestamp"] = self.now_ms()
         p["recvWindow"] = self._cfg.recv_window_ms
-        query = urllib.parse.urlencode(sorted(p.items()))
+        query = urllib.parse.urlencode(sorted(p.items()), doseq=True)
         signature = hmac.new(self._cfg.api_secret.encode(),
                              query.encode(), hashlib.sha256).hexdigest()
         return f"{query}&signature={signature}"
