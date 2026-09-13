@@ -80,12 +80,14 @@ class WsConnection:
                  url_factory: Callable[[], str],
                  on_message: Callable[[str], None],
                  cfg_source,
-                 on_open: Callable[["WsConnection"], None] | None = None
+                 on_open: Callable[["WsConnection"], None] | None = None,
+                 header_factory: Callable[[], dict] | None = None
                  ) -> None:
         self.name = name
         self._url_factory = url_factory
         self._on_message = on_message
         self._on_open = on_open
+        self._header_factory = header_factory
         # Either a Config or a ConfigStore, matching PredictionClient, so a
         # hot reload reaches the transport without rebuilding it. Which one
         # it is never needs asking: _cfg duck-types on .current.
@@ -131,6 +133,23 @@ class WsConnection:
         if self.opened_ts <= 0.0:
             return False
         return (time.time() - self.opened_ts) >= self._cfg.ws_recycle_s
+
+    def headers(self) -> dict | None:
+        """Handshake headers, built fresh so a hot-reloaded key applies."""
+        return self._header_factory() if self._header_factory else None
+
+    @staticmethod
+    def next_attempt(attempt: int, got_frames: bool) -> int:
+        """
+        The attempt count after a connection ends cleanly.
+
+        A socket that delivered frames was healthy, so its successor starts
+        from scratch. One that closed before the first frame was refused --
+        the venue answers a bad signed handshake by accepting it and closing
+        with code 1000 -- and resetting on that meant reconnecting every two
+        seconds forever instead of backing off.
+        """
+        return 0 if got_frames else attempt + 1
 
     def backoff_for(self, attempt: int) -> float:
         return min(self._cfg.ws_reconnect_max_s, 2.0 ** min(attempt, 6))
@@ -230,7 +249,7 @@ class WsConnection:
                 return
             try:
                 self._connect_once()
-                attempt = 0
+                attempt = self.next_attempt(attempt, self.last_frame_ts > 0.0)
             except Exception as exc:         # noqa: BLE001
                 self.note_failure(exc)
                 if not self.should_retry:
@@ -260,7 +279,10 @@ class WsConnection:
         self._ws = websocket.WebSocketApp(
             self._url_factory(),
             on_open=_on_open,
+            header=self.headers(),
             on_message=lambda _ws, raw: self.dispatch(raw),
+            on_close=lambda _ws, code, reason: LOG.warning(
+                "%s feed closed (code %s): %s", self.name, code, reason),
             on_error=lambda _ws, exc: LOG.debug("%s feed error: %s",
                                                 self.name, exc))
         # 30s ping is the venue's stated keepalive requirement on the signed
@@ -399,12 +421,21 @@ class BookFeed:
         self._lock = threading.Lock()
         self._conn = WsConnection(
             name="book", url_factory=self._url, on_message=self._on_frame,
-            cfg_source=cfg_source, on_open=self.on_reconnect)
+            cfg_source=cfg_source, on_open=self.on_reconnect,
+            header_factory=self._headers)
 
     @property
     def _cfg(self):
         current = getattr(self._cfg_source, "current", None)
         return self._cfg_source if current is None else current
+
+    def _headers(self) -> dict:
+        """
+        The key the signature was made with. The signed query proves the
+        secret; only this header says whose it is, and without it the venue
+        closes the handshake with 1000 "Bye - goodbye".
+        """
+        return {"X-MBX-APIKEY": self._cfg.api_key}
 
     def _url(self) -> str:
         """

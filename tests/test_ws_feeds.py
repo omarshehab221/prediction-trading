@@ -143,6 +143,22 @@ class TestWsConnection(unittest.TestCase):
         c = self._conn()
         self.assertFalse(c.send('{"method":"SUBSCRIBE"}'))
 
+    def test_a_public_socket_sends_no_headers(self):
+        self.assertIsNone(self._conn().headers())
+
+    def test_a_socket_closed_before_any_frame_counts_as_a_failure(self):
+        """
+        A clean close is not a healthy connection when nothing arrived.
+
+        The venue refuses a bad signed handshake by accepting it and closing
+        with code 1000. Resetting the backoff on that turned one refusal into
+        a reconnect every two seconds, all day.
+        """
+        nxt = self.ws_feeds.WsConnection.next_attempt
+        self.assertEqual(nxt(0, got_frames=False), 1)
+        self.assertEqual(nxt(4, got_frames=False), 5)
+        self.assertEqual(nxt(4, got_frames=True), 0)
+
 
 class TestBookFeed(unittest.TestCase):
     """The signed order-book stream, and the mapping it has to prove."""
@@ -322,6 +338,19 @@ class TestBookFeed(unittest.TestCase):
             feed._rejected.add(7000000)
         self.assertIsNotNone(feed.asks(good, m.Side.UP))
         self.assertIn(8859231, feed._validated)
+
+    # -- the signed handshake -----------------------------------------------
+
+    def test_the_signed_socket_sends_the_api_key_header(self):
+        """
+        The signature proves the query was made with the secret; only the
+        X-MBX-APIKEY header says WHICH key that was. Without it the venue
+        accepts the handshake and closes at once with 1000 "Bye - goodbye",
+        and the feed reconnects forever without delivering a frame.
+        """
+        c = cfg()
+        feed = self.ws_feeds.BookFeed(build_client(c), c)
+        self.assertEqual(feed._conn.headers(), {"X-MBX-APIKEY": c.api_key})
 
     # -- the signed URL -----------------------------------------------------
 
