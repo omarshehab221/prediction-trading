@@ -276,3 +276,49 @@ class TestPreflightGate(unittest.TestCase):
         if not _os.path.exists(path):
             self.skipTest("Dockerfile not present")
         self.assertNotIn("--preflight", open(path).read())
+
+    # -- the quote probe ----------------------------------------------------
+
+    @staticmethod
+    def _quoting(answers):
+        import types as _types
+        calls = []
+
+        def get_quote(rnd, plan):
+            calls.append((rnd, plan.side))
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        return _types.SimpleNamespace(get_quote=get_quote), calls
+
+    def test_a_thin_book_moves_the_quote_probe_on(self):
+        """
+        Live, the boot died on "The market lacks enough liquidity" -- one
+        thin book at the moment preflight looked, which is market state and
+        not a broken connection -- and the worker restart-looped on it.
+        """
+        import types as _types
+        from btc5m.errors import ApiError
+        from btc5m.probes import _probe_quote
+        thin = ApiError("The market lacks enough liquidity for this")
+        client, calls = self._quoting(
+            [thin, _types.SimpleNamespace(average_price=0.51)])
+        self.assertEqual(_probe_quote(client, ["r2"], "r1", 1.0), "avg 0.5100")
+        self.assertEqual(len(calls), 2)
+
+    def test_every_book_thin_passes_the_probe_with_a_note(self):
+        from btc5m.errors import ApiError
+        from btc5m.probes import _probe_quote
+        thin = ApiError("The market lacks enough liquidity for this")
+        client, _ = self._quoting([thin] * 4)
+        self.assertIn("too thin", _probe_quote(client, ["r2"], "r1", 1.0))
+
+    def test_any_other_quote_refusal_still_fails_the_probe(self):
+        from btc5m.errors import ApiError
+        from btc5m.probes import _probe_quote
+        client, _ = self._quoting(
+            [ApiError("Signature for this request is not valid.")])
+        with self.assertRaises(ApiError):
+            _probe_quote(client, [], "r1", 1.0)

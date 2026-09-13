@@ -115,6 +115,31 @@ def wait_for_auth(cfg: Config, client: PredictionClient) -> bool:
         time.sleep(min(cfg.auth_wait_poll_s, remaining))
 
 
+def _probe_quote(client, rounds, first, stake: float) -> str:
+    """
+    Prove get-quote answers, without letting one thin book fail the boot.
+
+    A quote refused for lack of liquidity is market state, not a broken
+    connection: the request was signed, routed and understood. Live, preflight
+    quoted only the first round's UP side, and "The market lacks enough
+    liquidity" made the whole boot fatal and restart-looped the worker. So
+    every live round and both sides are tried, and when all of them are thin
+    the endpoint still counts as reachable. Any other refusal is raised.
+    """
+    refused = None
+    for candidate in [first, *rounds]:
+        for side in (Side.UP, Side.DOWN):
+            try:
+                quote = client.get_quote(candidate, _market_buy(side, stake))
+            except ApiError as exc:
+                if "liquidity" not in str(exc).lower():
+                    raise
+                refused = exc
+                continue
+            return f"avg {quote.average_price:.4f}"
+    return f"reachable; every live book is too thin to quote right now ({refused})"
+
+
 def preflight(cfg: Config) -> int:
     """Probe every endpoint and report which ones actually work."""
     client = PredictionClient(cfg)
@@ -317,8 +342,8 @@ def preflight(cfg: Config) -> int:
         check("redeem status",
               lambda: f"{client.redeem_status('0x0') or 'reachable'}")
         if hydrated:
-            check("quote (no order)", lambda: (
-                f"avg {client.get_quote(hydrated[0], _market_buy(Side.UP, cfg.min_stake_usdt)).average_price:.4f}"))
+            check("quote (no order)", lambda: _probe_quote(
+                client, rounds, hydrated[0], cfg.min_stake_usdt))
     else:
         print("  (no live rounds -- detail/book/quote checks skipped)")
 
