@@ -147,7 +147,14 @@ class PredictionClient(
              for k, v in p.items()}
         p["timestamp"] = self.now_ms()
         p["recvWindow"] = self._cfg.recv_window_ms
-        query = urllib.parse.urlencode(sorted(p.items()))
+        # Brackets stay literal in KEYS: the indexed form of a list,
+        # cancelInfoList[0].orderId, failed -1022 when they went out as
+        # %5B/%5D, because the venue checks the signature against the
+        # brackets. Values are encoded exactly as urlencode encodes them.
+        query = "&".join(
+            f"{urllib.parse.quote(str(k), safe='[]')}="
+            f"{urllib.parse.quote_plus(str(v))}"
+            for k, v in sorted(p.items()))
         signature = hmac.new(self._cfg.api_secret.encode(),
                              query.encode(), hashlib.sha256).hexdigest()
         return f"{query}&signature={signature}"

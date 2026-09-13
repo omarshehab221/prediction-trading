@@ -277,6 +277,26 @@ class TestRequestSigning(unittest.TestCase):
         self.assertEqual(_json.loads(parsed["cancelInfoList"][0]),
                          [{"orderId": "a"}, {"orderId": "b"}])
 
+    def test_an_indexed_key_is_signed_and_sent_with_literal_brackets(self):
+        """
+        The indexed cancel list failed -1022, signature invalid, with the
+        key signed as cancelInfoList%5B0%5D.orderId. requests sends the
+        brackets percent-encoded either way, so the venue must decode the
+        query before verifying -- and the decoded form is the one to sign.
+        """
+        import hashlib as _hashlib, hmac as _hmac
+        c = self._client()
+        query = c._signed_query({"cancelInfoList[0].orderId": "o1"})
+        self.assertIn("cancelInfoList[0].orderId=o1", query)
+        signed, _, signature = query.rpartition("&signature=")
+        self.assertEqual(signature, _hmac.new(
+            c._cfg.api_secret.encode(), signed.encode(),
+            _hashlib.sha256).hexdigest())
+        sent = requests.Request(
+            "POST", "https://api.binance.com/x?" + query).prepare().url
+        self.assertIn("cancelInfoList%5B0%5D.orderId=o1", sent,
+                      "the wire form this signing assumes has changed")
+
     def test_a_flat_list_is_sent_as_json(self):
         """
         tokenIds is a JSON array, not repeated parameters.
