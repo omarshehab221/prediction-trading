@@ -1306,6 +1306,30 @@ class TestOrderStateAndCancel(unittest.TestCase):
         self.assertEqual(sent["walletAddress"], "0xabc")
         self.assertEqual(sent["walletId"], "w1")
 
+    def test_a_malformed_list_is_resent_in_indexed_form(self):
+        """
+        The venue answered the JSON list with -1102, "cancelInfoList was not
+        sent, was empty/null, or malformed", on every cancel. The indexed
+        form is the other encoding a list of objects has, so it is tried
+        before the cancel is reported as failed.
+        """
+        c = self._client()
+        sent = []
+
+        def request(name, params=None):
+            sent.append(dict(params))
+            if "cancelInfoList" in params:
+                raise m.ApiError("Mandatory parameter 'cancelInfoList' was "
+                                 "not sent", code=-1102)
+            return {"canceled": ["o1"]}
+
+        c._request = request
+        cancelled, _ = c.cancel_orders(["o1", "o2"])
+        self.assertEqual(cancelled, ["o1"])
+        self.assertEqual(sent[-1]["cancelInfoList[0].orderId"], "o1")
+        self.assertEqual(sent[-1]["cancelInfoList[1].orderId"], "o2")
+        self.assertEqual(sent[-1]["walletId"], "w1")
+
     def test_cancelling_nothing_makes_no_request(self):
         c = self._client()
         self.assertEqual(c.cancel_orders([]), ([], {}))
