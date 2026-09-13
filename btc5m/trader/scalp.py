@@ -95,13 +95,19 @@ class ScalpMixin:
         age = self._market_data.futures_tick_age_ms(symbol)
         if age is None or age > cfg.scalp_max_tick_age_ms:
             return None
+        # Sample the basis on EVERY pass, before the move gate. The mean it
+        # is measured against needs BASIS_EWMA_MIN_SAMPLES samples; fed only
+        # when the perp had already moved, every restart spent the first
+        # twenty real moves warming up and traded none of them -- and the
+        # mean it learned was a mean of moves, not of the basis.
+        dislocation = (self._basis_dislocation_bps(symbol)
+                       if cfg.scalp_min_basis_bps > 0 else 0.0)
         move = self._market_data.futures_move_bps(symbol, cfg.scalp_lookback_ms)
         if move is None or abs(move) < cfg.scalp_min_move_bps:
             return None
         side = Side.UP if move > 0 else Side.DOWN
         if cfg.scalp_min_basis_bps <= 0:
             return side, move, 0.0
-        dislocation = self._basis_dislocation_bps(symbol)
         if dislocation is None:
             return None
         # Same sign as the move, by at least the threshold. A perp that has

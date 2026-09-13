@@ -1287,6 +1287,25 @@ class TestScalpEntry(unittest.TestCase):
         t._maybe_enter(100.0, "PAPER")
         self.assertIn(("BTCUSDT", Side.DOWN), t._positions)
 
+    def test_the_basis_mean_warms_up_on_quiet_passes(self):
+        """
+        A fresh trader -- every restart -- has no basis mean. It must learn
+        one while the perp is quiet, so the first real move can trade.
+        Sampled only on moves, the first twenty moves after each restart
+        were spent warming up and none of them traded.
+        """
+        t, _ = self._trader()
+        t._basis_ewma.clear()
+        t._market_data.futures_move_bps = lambda s, l: 0.0
+        t._market_data.futures_mid = lambda s: 100_000.0
+        for _ in range(m.BASIS_EWMA_MIN_SAMPLES):
+            t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        t._market_data.futures_move_bps = lambda s, l: 5.0
+        t._market_data.futures_mid = lambda s: 100_020.0
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
     def test_no_signal_opens_nothing(self):
         t, _ = self._trader()
         t._market_data.futures_move_bps = lambda s, l: None
