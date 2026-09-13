@@ -636,6 +636,8 @@ class TestScalpProfile(unittest.TestCase):
         c = self._c()
         self.assertAlmostEqual(c.scalp_take_profit_pct, 0.05)
         self.assertAlmostEqual(c.scalp_stop_loss_pct, 0.05)
+        # The stake is 10% of bankroll; the 5% above is the bracket.
+        self.assertAlmostEqual(c.scalp_stake_pct, 0.10)
 
     def test_the_stake_cap_and_the_scalp_stake_agree(self):
         """

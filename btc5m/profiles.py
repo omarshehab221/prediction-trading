@@ -134,8 +134,11 @@ PROFILES: dict[str, dict] = {
               # The stake that matters. max_stake_pct is the ceiling the
               # shared risk checks read; scalp_stake_pct is what is actually
               # committed per round trip, and they are kept equal so the two
-              # cannot drift into disagreeing about the same number.
-              "scalp_stake_pct": 0.05, "max_stake_pct": 0.05,
+              # cannot drift into disagreeing about the same number. 10% of
+              # bankroll, floored at min_stake_usdt when that falls short.
+              "scalp_stake_pct": 0.10, "max_stake_pct": 0.10,
+              # The bracket: 5% profit or 5% loss on the position -- a
+              # different number from the stake above, not a second stake.
               "scalp_take_profit_pct": 0.05, "scalp_stop_loss_pct": 0.05,
               "scalp_lookback_ms": 1500.0, "scalp_min_move_bps": 2.0,
               "scalp_min_basis_bps": 0.5, "scalp_max_tick_age_ms": 2000.0,
@@ -156,20 +159,20 @@ PROFILES: dict[str, dict] = {
               # from a model reading of the book. Declared so it cannot be
               # mistaken for a live setting on this profile.
               "exit_trigger": "RESTING",
-              # A BRACKETED loss is 5% of the stake -- 0.25% of bankroll --
-              # so 20% is eighty of them, which is the right order for a
+              # A BRACKETED loss is 5% of the stake -- 0.5% of bankroll --
+              # so 25% is fifty of them, which is the right order for a
               # strategy taking twenty trades a round. It is deliberately
               # not tightened below the shared 2.5x-of-max_stake_pct floor,
               # because the bracket is not the only way to lose here: a
               # flatten that fails leaves a position to settle, and that
-              # loses the FULL stake. Four of those is what 20% buys, and
-              # four failed flattens in a day is a venue problem worth
+              # loses the FULL stake. 25% buys two and a half of those -- the
+              # shared floor -- and three failed flattens in a day is a venue problem worth
               # halting on.
               #
               # The streak counter is raised instead, since a run of small
               # bracketed losses is the ordinary texture of this profile and
               # 40 in a row is a broken signal rather than a bad afternoon.
-              "daily_loss_limit_pct": 0.20,
+              "daily_loss_limit_pct": 0.25,
               "max_consecutive_losses": 40,
               # rounds_today counts ROUND TRIPS here, not rounds, because
               # every scalp closes by selling and reports its result
