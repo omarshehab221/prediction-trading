@@ -465,6 +465,12 @@ class TestDeploymentManifests(unittest.TestCase):
         it worth pinning rather than remembering.
         """
         import os as _os
+        if not _os.path.exists(_os.path.join(self.here, ".git")):
+            # Line endings are a property of the repository. The image and
+            # the gates' staging directories are copies with no checkout in
+            # them, so there is nothing here for this rule to govern -- and
+            # failing there is what kept every Docker build red.
+            self.skipTest("not a git checkout; .gitattributes governs clones")
         path = _os.path.join(self.here, ".gitattributes")
         if not _os.path.exists(path):
             self.fail(".gitattributes is missing; shell scripts are then at "

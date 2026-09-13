@@ -223,6 +223,10 @@ def _stage_bot(target_dir):
     import shutil as _sh, os as _os, glob as _glob
     for path in _glob.glob(_os.path.join(ROOT, "*.py")):
         _sh.copy(path, target_dir)
+    # The image ships requirements.txt as well, and a test reads it.
+    requirements = _os.path.join(ROOT, "requirements.txt")
+    if _os.path.exists(requirements):
+        _sh.copy(requirements, target_dir)
     for name in ("btc5m", "tests"):
         source = _os.path.join(ROOT, name)
         if _os.path.isdir(source):
