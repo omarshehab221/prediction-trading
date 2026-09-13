@@ -93,7 +93,7 @@ class ExitsMixin:
         if not 0.0 < target < 1.0:
             return False
 
-        shares = pos.committed_usdt / max(pos.signal.fill_price, EPS)
+        shares = pos.held_shares
         order_type = (OrderType.LIMIT if self._cfg.exit_order_type == "LIMIT"
                       else OrderType.MARKET)
         plan = OrderPlan(side=pos.signal.side, action=Action.SELL,
@@ -140,16 +140,35 @@ class ExitsMixin:
             return replace(pending, filled_usdt=state.filled_usdt,
                            filled_shares=state.filled_shares)
         price = state.price or pending.plan.price_limit or 0.0
-        sold_cost = state.filled_shares * pos.signal.fill_price
-        if sold_cost > pos.committed_usdt + EPS:
-            # Impossible: more shares came back than the position ever held.
-            # Netting it silently would report a profit made from nothing.
-            LOG.error("%s: sale of %.4f shares exceeds the %.4f USDT held; "
-                      "refusing to net it", pending.rnd.slug,
-                      state.filled_shares, pos.committed_usdt)
-            return replace(pending, filled_usdt=state.filled_usdt,
-                           filled_shares=state.filled_shares)
-        remaining = pos.committed_usdt - sold_cost
+        shrunk: dict = {}
+        if pos.shares is not None:
+            # Counted in shares when the fill reported them. Reckoned by
+            # cost, a sale of every fee-net share still looks a few percent
+            # short of the stake and leaves a phantom remainder open.
+            sold = state.filled_shares - pending.filled_shares
+            if sold > pos.shares + EPS:
+                LOG.error("%s: sale of %.4f shares exceeds the %.4f held; "
+                          "refusing to net it", pending.rnd.slug, sold,
+                          pos.shares)
+                return replace(pending, filled_usdt=state.filled_usdt,
+                               filled_shares=state.filled_shares)
+            left = max(pos.shares - sold, 0.0)
+            sold_cost = pos.committed_usdt * min(
+                1.0, sold / max(pos.shares, EPS))
+            remaining = pos.committed_usdt - sold_cost if left > EPS else 0.0
+            shrunk = {"shares": left}
+        else:
+            sold_cost = state.filled_shares * pos.signal.fill_price
+            if sold_cost > pos.committed_usdt + EPS:
+                # Impossible: more shares came back than the position ever
+                # held. Netting it silently would report a profit made from
+                # nothing.
+                LOG.error("%s: sale of %.4f shares exceeds the %.4f USDT "
+                          "held; refusing to net it", pending.rnd.slug,
+                          state.filled_shares, pos.committed_usdt)
+                return replace(pending, filled_usdt=state.filled_usdt,
+                               filled_shares=state.filled_shares)
+            remaining = pos.committed_usdt - sold_cost
         if remaining <= EPS:
             pnl = state.filled_usdt - pos.committed_usdt
             self._journal.resolve_sold(pos.trade_id, state.filled_usdt,
@@ -161,7 +180,8 @@ class ExitsMixin:
                      pending.rnd.slug, pending.plan.side.value,
                      state.filled_usdt, price, pos.signal.fill_price, pnl)
         else:
-            self._positions[key] = replace(pos, committed_usdt=remaining)
+            self._positions[key] = replace(pos, committed_usdt=remaining,
+                                           **shrunk)
             LOG.info("%s: sold %.4f of %.4f USDT at %.4f; %.4f left to settle",
                      pending.rnd.slug, sold_cost, pos.committed_usdt, price,
                      remaining)
@@ -231,7 +251,7 @@ class ExitsMixin:
             LOG.error("%s: a sale through the bid prices at %.4f, which is "
                       "not tradable", pos.rnd.slug, price)
             return False
-        shares = pos.committed_usdt / max(pos.signal.fill_price, EPS)
+        shares = pos.held_shares
         if shares <= EPS:
             return False
         plan = OrderPlan(side=pos.signal.side, action=Action.SELL,

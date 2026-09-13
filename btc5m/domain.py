@@ -8,6 +8,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+from btc5m.constants import EPS
+
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -271,6 +273,18 @@ class Position:
     signal: Signal
     committed_usdt: float = 0.0      # total staked on this round so far
     tranches: int = 1
+    # Shares actually held, when the fill reported them. The buy's fee comes
+    # out of the shares received, so committed_usdt / fill_price overstates
+    # the holding -- and a sale of that many is refused by the venue as
+    # exceeding the shares available.
+    shares: float | None = None
+
+    @property
+    def held_shares(self) -> float:
+        """Shares to sell: the recorded count, else the cost-implied one."""
+        if self.shares is not None:
+            return self.shares
+        return self.committed_usdt / max(self.signal.fill_price, EPS)
 
     def average_price(self, extra_stake: float, extra_price: float) -> float:
         """Blended fill price after adding another tranche."""

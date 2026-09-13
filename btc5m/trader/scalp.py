@@ -254,10 +254,17 @@ class ScalpMixin:
             tp_price, stop_price = bracket
 
             self._watching.pop(raw.topic_id, None)
+            quoted_stake = stake
             placed = self._place_leg(raw, side, price, stake, quote)
             if placed is None:
                 continue                  # killed by the venue; nothing open
             price, stake, order_id = placed
+            # The shares the buy actually returned. The fee comes out of
+            # them, so cost / price overstates the holding, and every exit
+            # sized from that was refused as exceeding the shares available.
+            # Scaled down if the confirmed fill came back smaller than quoted.
+            shares = (quote.amount_out * min(1.0, stake / quoted_stake)
+                      if quote is not None and quoted_stake > 0 else None)
             # Re-derive from the CONFIRMED fill. _place_leg can come back
             # with a different price and a smaller stake than the screen, and
             # a bracket around the wrong price is the one failure this whole
@@ -287,7 +294,8 @@ class ScalpMixin:
                                        order_id=order_id,
                                        order_type=OrderType.MARKET.value)
             key = (raw.symbol, side)
-            self._positions[key] = Position(tid, raw, sig, stake, 1)
+            self._positions[key] = Position(tid, raw, sig, stake, 1,
+                                            shares=shares)
             self._scalp_entries[raw.topic_id] = (raw.end_ms, taken + 1)
             self._scalp_last_entry[raw.symbol] = now_s
             LOG.info("SCALP %s %s | in %.4f (%.2f) tp %.4f stop %.4f | perp "
@@ -323,7 +331,7 @@ class ScalpMixin:
         if pos is None:
             return
         tp_price = pos.rnd.round_price(tp_price)
-        shares = pos.committed_usdt / max(pos.signal.fill_price, EPS)
+        shares = pos.held_shares
         order_id: str | None = None
         if 0.0 < tp_price < 1.0 and shares > EPS:
             plan = OrderPlan(side=pos.signal.side, action=Action.SELL,

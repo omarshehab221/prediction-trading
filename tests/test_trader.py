@@ -1355,6 +1355,38 @@ class TestLimitExits(unittest.TestCase):
         remaining = t._positions[("BTCUSDT", Side.UP)]
         self.assertAlmostEqual(remaining.committed_usdt, 3.0)
 
+    def test_selling_every_recorded_share_closes_the_position(self):
+        """
+        A fee-net holding sells for fewer shares than cost / price implies.
+        Reckoned by cost, that full sale left a phantom remainder open; by
+        the recorded count it is exactly what was held.
+        """
+        import dataclasses as _dc
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
+        tid = t._journal.record("PAPER", make_round(), make_signal(), 100.0,
+                                0.5, 50.0, "o1")
+        base = make_position(committed=5.0, trade_id=tid)
+        held = 0.98 * base.committed_usdt / base.signal.fill_price
+        t._positions[("BTCUSDT", Side.UP)] = _dc.replace(base, shares=held)
+        t._maybe_exit_all()
+        self._fills(t, m.OrderState("FILLED", 6.0, held, 0.60))
+        t._reap_pending()
+        self.assertEqual(t._positions, {})
+
+    def test_a_partial_sale_counts_the_recorded_shares_down(self):
+        import dataclasses as _dc
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
+        tid = t._journal.record("PAPER", make_round(), make_signal(), 100.0,
+                                0.5, 50.0, "o1")
+        base = make_position(committed=5.0, trade_id=tid)
+        t._positions[("BTCUSDT", Side.UP)] = _dc.replace(base, shares=8.0)
+        t._maybe_exit_all()
+        self._fills(t, m.OrderState("PARTIAL", 2.0, 2.0, 0.60))
+        t._reap_pending()
+        left = t._positions[("BTCUSDT", Side.UP)]
+        self.assertAlmostEqual(left.shares, 6.0)
+        self.assertAlmostEqual(left.committed_usdt, 3.75)
+
     def test_selling_more_than_is_held_is_refused(self):
         t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
         tid = t._journal.record("PAPER", make_round(), make_signal(), 100.0,

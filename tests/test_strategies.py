@@ -1430,6 +1430,24 @@ class TestScalpEntry(unittest.TestCase):
                                breakeven_probability(0.50, 200))
         self.assertEqual(pos.signal.edge, 0.0)
 
+    def test_a_live_entry_records_the_shares_the_quote_returned(self):
+        """The count every exit sells comes from the venue, not from cost."""
+        import dataclasses as _dc
+        t, client = self._trader(live=True)
+        quote = client.get_quote
+
+        def net_of_fee(rnd, plan):
+            q = quote(rnd, plan)
+            if plan.action is m.Action.BUY:
+                q = _dc.replace(q, amount_out=q.amount_out * 0.98)
+            return q
+
+        client.get_quote = net_of_fee
+        t._maybe_enter(100.0, "LIVE")
+        pos = t._positions[("BTCUSDT", Side.UP)]
+        self.assertAlmostEqual(pos.shares,
+                               pos.committed_usdt / 0.51 * 0.98, places=6)
+
     # -- sizing: the fraction, floored at the venue minimum ---------------
 
     def test_the_stake_is_the_fraction_when_it_clears_the_minimum(self):
@@ -1484,7 +1502,7 @@ class TestScalpStops(unittest.TestCase):
             trader._journal._conn.close()
         os.unlink(self.db)
 
-    def _armed(self, bid, **cfgkw):
+    def _armed(self, bid, shares=None, **cfgkw):
         """A trader holding one bracketed position, with `bid` on the book."""
         rnd = make_round()
         now = rnd.end_ms - 200_000
@@ -1500,10 +1518,42 @@ class TestScalpStops(unittest.TestCase):
         sig = Signal(Side.UP, 0.5, 0.50, 0.0, 10.0, 200.0)
         tid = t._journal.record("PAPER", rnd, sig, 0.0, 0.0, 100.0)
         key = ("BTCUSDT", Side.UP)
-        t._positions[key] = Position(tid, rnd, sig, 10.0, 1)
+        t._positions[key] = Position(tid, rnd, sig, 10.0, 1, shares=shares)
+        # Every order plan the venue is asked to quote, so a test can read
+        # how many shares each sale asked for.
+        client.plans = []
+        quote = client.get_quote
+
+        def recording(r, plan):
+            client.plans.append(plan)
+            return quote(r, plan)
+
+        client.get_quote = recording
         tp, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
         t._arm_bracket(key, 0.50, tp, stop)
         return t, client, key
+
+    def _sells(self, client):
+        return [p for p in client.plans if p.action is m.Action.SELL]
+
+    def test_the_take_profit_sells_the_shares_the_buy_returned(self):
+        """
+        10.00 at 0.50 is 20 shares on paper and fewer in the wallet: the
+        buy's fee comes out of the shares received. Offering 20 is what the
+        venue refused as "exceeded your available shares".
+        """
+        _, client, _ = self._armed(0.50, shares=19.6)
+        self.assertAlmostEqual(self._sells(client)[0].amount, 19.6)
+
+    def test_a_stop_sells_the_shares_held(self):
+        _, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t, client, _ = self._armed(stop, shares=19.6)
+        t._check_stops()
+        self.assertAlmostEqual(self._sells(client)[-1].amount, 19.6)
+
+    def test_without_a_recorded_count_the_cost_implied_shares_are_sold(self):
+        _, client, _ = self._armed(0.50)
+        self.assertAlmostEqual(self._sells(client)[0].amount, 20.0)
 
     def test_a_bid_above_the_stop_does_nothing(self):
         t, client, key = self._armed(0.50)
