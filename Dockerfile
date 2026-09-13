@@ -1,7 +1,9 @@
 # Pin the Debian release, not just `slim`. The bare tag follows Debian stable
 # and moved from bookworm to trixie underneath everyone who used it -- the base
 # OS should change because you changed it, not because a symlink moved.
-FROM python:3.12-slim-trixie
+# Pulled from ECR Public's mirror of the Docker official image: same image,
+# but CodeBuild's shared IPs exhaust Docker Hub's anonymous pull limit.
+FROM public.ecr.aws/docker/library/python:3.12-slim-trixie
 
 # The official image is rebuilt on a schedule, not on every Debian security
 # advisory, so a freshly pulled base still lags whatever landed since its last

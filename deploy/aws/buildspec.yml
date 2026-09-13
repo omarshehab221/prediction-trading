@@ -1,0 +1,13 @@
+# CodeBuild spec for the bot image. Driven by deploy.sh, which uploads a
+# `git archive` of HEAD and passes REPO_URI and IMAGE_TAG.
+#
+# Build and push share one phase on purpose: post_build runs even when build
+# fails, and an image whose verify.sh gate failed must never reach ECR.
+version: 0.2
+
+phases:
+  build:
+    commands:
+      - aws ecr get-login-password --region "$AWS_DEFAULT_REGION" | docker login --username AWS --password-stdin "${REPO_URI%%/*}"
+      - docker build -t "$REPO_URI:$IMAGE_TAG" .
+      - docker push "$REPO_URI:$IMAGE_TAG"
