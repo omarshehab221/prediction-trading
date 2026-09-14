@@ -381,6 +381,11 @@ class FakeClient:
         # a partial or dead fill override this per-instance.
         return requested_usdt
 
+    def delivered_shares(self, order_id):
+        # No venue record here, so no delivered count: callers fall back to
+        # the quote. Tests that need one override this per-instance.
+        return None
+
     def list_rounds(self):
         return list(self._rounds)
 

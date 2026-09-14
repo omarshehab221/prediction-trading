@@ -1527,6 +1527,20 @@ class TestScalpEntry(unittest.TestCase):
         self.assertAlmostEqual(pos.shares,
                                pos.committed_usdt / 0.51 * 0.98, places=6)
 
+    def test_a_live_entry_records_the_shares_the_venue_delivered(self):
+        """
+        Live, the quote said 2.294 shares and the venue delivered 2.29: it
+        holds shares to two decimals. The stop's sale of 2.294 was refused as
+        exceeding the shares available, and so was the flatten, and the
+        position ran to settlement. The delivered count wins whenever the
+        venue reports one.
+        """
+        t, client = self._trader(live=True, bid=0.50)
+        client.delivered_shares = lambda order_id: 1.23
+        t._maybe_enter(100.0, "LIVE")
+        pos = t._positions[("BTCUSDT", Side.UP)]
+        self.assertAlmostEqual(pos.shares, 1.23)
+
     # -- sizing: the fraction, floored at the venue minimum ---------------
 
     def test_the_stake_is_the_fraction_when_it_clears_the_minimum(self):

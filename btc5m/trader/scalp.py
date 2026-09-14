@@ -345,17 +345,28 @@ class ScalpMixin:
             # The shares the buy actually returned. The fee comes out of
             # them, so cost / price overstates the holding, and every exit
             # sized from that was refused as exceeding the shares available.
-            # Scaled down if the confirmed fill came back smaller than quoted.
-            shares = (quote.amount_out * min(1.0, stake / quoted_stake)
-                      if quote is not None and quoted_stake > 0 else None)
+            # The venue's own count wins: it holds shares to two decimals,
+            # so the quote's amountOut (2.294) overstated a delivered 2.29
+            # and the stop and the flatten were both refused. The quote,
+            # scaled to the confirmed fill, is only the fallback for a
+            # record that carried no count.
+            delivered = (self._client.delivered_shares(order_id)
+                         if self._live and order_id else None)
+            if delivered is not None:
+                shares = delivered
+            else:
+                shares = (quote.amount_out * min(1.0, stake / quoted_stake)
+                          if quote is not None and quoted_stake > 0 else None)
             if quote is not None:
                 # Every number an exit's size is built from, side by side, so
                 # a refused sale can be traced to the one that was wrong.
                 LOG.info("%s: bought %s | quoted %.4f USDT -> %.6f shares at "
-                         "%.4f (fee %.4f); confirmed %.4f USDT; recording %s "
-                         "shares", raw.slug, side.value, quoted_stake,
-                         quote.amount_out, quote.average_price, quote.fee_usdt,
-                         stake, "no" if shares is None else f"{shares:.6f}")
+                         "%.4f (fee %.4f); confirmed %.4f USDT; venue "
+                         "delivered %s; recording %s shares", raw.slug,
+                         side.value, quoted_stake, quote.amount_out,
+                         quote.average_price, quote.fee_usdt, stake,
+                         "no count" if delivered is None else f"{delivered:.6f}",
+                         "no" if shares is None else f"{shares:.6f}")
             # Re-derive from the CONFIRMED fill. _place_leg can come back
             # with a different price and a smaller stake than the screen, and
             # a bracket around the wrong price is the one failure this whole

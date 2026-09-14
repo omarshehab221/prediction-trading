@@ -1242,6 +1242,38 @@ class TestLimitQuoting(unittest.TestCase):
             c.get_quote(make_round(), plan)
 
 
+class TestConfirmFillRemembersDeliveredShares(unittest.TestCase):
+    """
+    The shares an exit may sell are the ones the venue delivered.
+
+    Live, a BTC buy quoted amountOut 2.294 but the venue's record said
+    filledShareQty 2.29 -- it holds shares to two decimals -- and the stop's
+    sale of 2.294 was refused as exceeding the shares available.
+    """
+
+    def _client(self, history):
+        c = build_client(_wallet=m.WalletRef("0xabc", "w1"))
+        c._request = lambda name, params=None: (
+            {"orders": list(history)} if name == "order_history" else {})
+        return c
+
+    def test_a_confirmed_fill_reports_the_shares_the_venue_delivered(self):
+        c = self._client([{"orderId": "o1", "status": "FILLED",
+                           "filledUsdtAmount": "1.15",
+                           "filledShareQty": "2.29"}])
+        self.assertAlmostEqual(c.confirm_fill("o1", 1.15), 1.15)
+        self.assertAlmostEqual(c.delivered_shares("o1"), 2.29)
+
+    def test_a_record_without_shares_reports_none(self):
+        c = self._client([{"orderId": "o1", "status": "FILLED",
+                           "filledUsdtAmount": "1.15"}])
+        c.confirm_fill("o1", 1.15)
+        self.assertIsNone(c.delivered_shares("o1"))
+
+    def test_an_unconfirmed_order_reports_none(self):
+        self.assertIsNone(self._client([]).delivered_shares("o1"))
+
+
 class TestOrderStateAndCancel(unittest.TestCase):
     """A GTC order's ordinary answer is 'still resting', not an exception."""
 

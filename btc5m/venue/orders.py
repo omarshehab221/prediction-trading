@@ -266,6 +266,26 @@ class OrdersApiMixin:
                 return order
         return None
 
+    def _remember_delivered(self, order_id: str, order: dict) -> None:
+        """Keep the share count a confirmed fill's record reported."""
+        # Created on first use: this mixin has no __init__ of its own.
+        self.__dict__.setdefault("_delivered", {})[str(order_id)] = (
+            _as_float_or_none(order.get("filledShareQty")))
+
+    def delivered_shares(self, order_id: str) -> float | None:
+        """
+        The shares the venue delivered for an order confirm_fill confirmed.
+
+        The quote's amountOut is an estimate the venue does not honour to
+        the digit: it holds shares to two decimals, so a buy quoted at 2.294
+        shares delivered 2.29, and every exit sized from the quote -- stop,
+        take-profit and flatten alike -- was refused as exceeding the shares
+        available. None when the record carried no count, or the order was
+        never confirmed; the caller falls back to the quote. Handed over
+        once, so a long run does not accumulate one entry per order.
+        """
+        return self.__dict__.get("_delivered", {}).pop(str(order_id), None)
+
     def confirm_fill(self, order_id: str, requested_usdt: float) -> float:
         """
         Confirm an order filled, returning the USDT actually filled.
@@ -295,9 +315,11 @@ class OrdersApiMixin:
                     # from anything else has been refused as exceeding the
                     # shares available.
                     LOG.info("Order %s filled: venue record %s", order_id, order)
+                    self._remember_delivered(order_id, order)
                     return filled
                 if filled and filled >= requested_usdt * self._cfg.min_fill_fraction:
                     LOG.info("Order %s filled: venue record %s", order_id, order)
+                    self._remember_delivered(order_id, order)
                     return filled
             if attempt + 1 < self._cfg.fill_confirm_attempts:
                 time.sleep(self._cfg.fill_confirm_delay_s)
