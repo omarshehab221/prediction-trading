@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from decimal import ROUND_DOWN, Decimal
 
 import requests
 
-from btc5m.constants import EPS, LOG
+from btc5m.constants import EPS, LOG, SHARE_PRECISION
 from btc5m.domain import Action, OrderPlan, OrderType, PendingOrder, Side
 from btc5m.errors import ApiError
 from btc5m.pricing import digital_up_probability, sell_reservation_price
@@ -221,6 +222,26 @@ class ExitsMixin:
         if self._account_risk is not None:
             self._account_risk.record_result(pnl > 0, pnl=pnl)
 
+    @staticmethod
+    def _sellable_shares(held: float) -> float:
+        """
+        The share count to offer for a holding recorded as `held`.
+
+        Neither count the bot has is the exact holding. The quote's amountOut
+        overstates it when the fill slips, and the order record's
+        filledShareQty is rounded to two decimals -- sometimes up: a buy
+        quoted 1.447444 shares recorded 1.45, and a sale of 1.45 was refused
+        with -9000 "You have exceeded your available shares", then the
+        flatten, and the stake settled as a full loss. So half a unit comes
+        off before sizing down to the share precision. The remainder is dust
+        and settles with the round. Decimal, because float arithmetic would
+        turn 19.595 into 19.594999... and take a whole extra unit.
+        """
+        unit = Decimal(1).scaleb(-SHARE_PRECISION)
+        sized = (Decimal(str(held)) - unit / 2).quantize(unit,
+                                                         rounding=ROUND_DOWN)
+        return float(sized) if sized > 0 else 0.0
+
     def _sell_now(self, pos: Position, reason: str) -> bool:
         """
         Offer the whole position back to the market, to be filled now.
@@ -251,25 +272,38 @@ class ExitsMixin:
             LOG.error("%s: a sale through the bid prices at %.4f, which is "
                       "not tradable", pos.rnd.slug, price)
             return False
-        shares = pos.held_shares
-        if shares <= EPS:
+        shares = self._sellable_shares(pos.held_shares)
+        if shares <= 0:
             return False
-        plan = OrderPlan(side=pos.signal.side, action=Action.SELL,
-                         order_type=OrderType.LIMIT, amount=shares,
-                         price_limit=price)
-        try:
-            if self._live:
-                quote = self._client.get_quote(pos.rnd, plan)
-                order_id = str(self._client.place_order(pos.rnd, quote))
-            else:
-                order_id = str(self._paper_book.place(plan, pos.rnd))
-        except (ApiError, requests.RequestException) as exc:
-            LOG.error("%s: the %s sale of %.6f shares was refused (recorded "
-                      "shares %s, cost-implied %.6f): %s", pos.rnd.slug,
-                      reason, shares, pos.shares,
-                      pos.committed_usdt / max(pos.signal.fill_price, EPS),
-                      exc)
-            return False
+        unit = Decimal(1).scaleb(-SHARE_PRECISION)
+        for attempt in (1, 2):
+            plan = OrderPlan(side=pos.signal.side, action=Action.SELL,
+                             order_type=OrderType.LIMIT, amount=shares,
+                             price_limit=price)
+            try:
+                if self._live:
+                    quote = self._client.get_quote(pos.rnd, plan)
+                    order_id = str(self._client.place_order(pos.rnd, quote))
+                else:
+                    order_id = str(self._paper_book.place(plan, pos.rnd))
+                break
+            except (ApiError, requests.RequestException) as exc:
+                LOG.error("%s: the %s sale of %.6f shares was refused "
+                          "(recorded shares %s, cost-implied %.6f): %s",
+                          pos.rnd.slug, reason, shares, pos.shares,
+                          pos.committed_usdt / max(pos.signal.fill_price, EPS),
+                          exc)
+                # Only "more shares than are available" is worth asking
+                # again, and only once: a holding can sit further under the
+                # count than the margin allows, and a unit lower is the
+                # difference between a capped exit and a full-stake loss.
+                lower = float(Decimal(str(shares)) - unit)
+                if (attempt == 2 or not isinstance(exc, ApiError)
+                        or exc.code != -9000 or lower <= 0):
+                    return False
+                LOG.info("%s: retrying the %s sale at %.*f shares", pos.rnd.slug,
+                         reason, SHARE_PRECISION, lower)
+                shares = lower
         self._pending[order_id] = PendingOrder(
             order_id=order_id, rnd=pos.rnd, plan=plan, signal=pos.signal,
             expires_at_ms=pos.rnd.end_ms, filled_usdt=0.0, filled_shares=0.0,

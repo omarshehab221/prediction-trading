@@ -1662,19 +1662,105 @@ class TestScalpStops(unittest.TestCase):
         tp, _ = m.bracket_prices(0.50, 200, 0.05, 0.05)
         t, client, _ = self._armed(tp, shares=19.6)
         t._check_stops()
-        self.assertAlmostEqual(self._sells(client)[-1].amount, 19.6)
+        # Sized just under the count, for the reason the tests below give.
+        self.assertAlmostEqual(self._sells(client)[-1].amount, 19.59)
 
     def test_a_stop_sells_the_shares_held(self):
         _, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
         t, client, _ = self._armed(stop, shares=19.6)
         t._check_stops()
-        self.assertAlmostEqual(self._sells(client)[-1].amount, 19.6)
+        self.assertAlmostEqual(self._sells(client)[-1].amount, 19.59)
 
     def test_without_a_recorded_count_the_cost_implied_shares_are_sold(self):
         tp, _ = m.bracket_prices(0.50, 200, 0.05, 0.05)
         t, client, _ = self._armed(tp)
         t._check_stops()
-        self.assertAlmostEqual(self._sells(client)[-1].amount, 20.0)
+        self.assertAlmostEqual(self._sells(client)[-1].amount, 19.99)
+
+    # -- sizing a sale the venue will not refuse ----------------------------
+
+    def test_a_sale_is_sized_under_a_count_the_venue_rounded_up(self):
+        """
+        Live, a BTC buy was quoted 1.447444 shares and its order record said
+        filledShareQty 1.45 -- two decimals, rounded UP past what was held.
+        The stop's sale of 1.45 was refused with -9000 "exceeded your
+        available shares", so was the flatten, and the stake settled as a
+        full loss. Every sale is sized to the share precision with half a
+        unit taken off first, so a count rounded up by up to 0.005 still
+        sells.
+        """
+        _, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t, client, _ = self._armed(stop, shares=1.45)
+        t._check_stops()
+        self.assertAlmostEqual(self._sells(client)[-1].amount, 1.44)
+
+    def test_a_quote_count_above_the_holding_is_sized_under_it(self):
+        # Live: sold the quote's 2.294 against a record of 2.29; refused.
+        _, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t, client, _ = self._armed(stop, shares=2.294)
+        t._check_stops()
+        self.assertAlmostEqual(self._sells(client)[-1].amount, 2.28)
+
+    def _refuse_sells(self, client, times):
+        """The venue refuses the next `times` sale quotes with -9000."""
+        refused = []
+        base = client.get_quote
+
+        def refusing(r, plan):
+            if plan.action is m.Action.SELL and len(refused) < times:
+                refused.append(plan.amount)
+                client.plans.append(plan)
+                raise m.ApiError("You have exceeded your available shares",
+                                 code=-9000)
+            return base(r, plan)
+
+        client.get_quote = refusing
+        return refused
+
+    def test_a_refused_sale_is_retried_once_a_unit_lower(self):
+        """
+        A holding can sit further under the recorded count than the margin
+        allows for. One refusal steps the sale down a unit and asks again,
+        rather than leaving the position to run to settlement.
+        """
+        _, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t, client, key = self._armed(stop, shares=1.45)
+        self._refuse_sells(client, 1)
+        t._check_stops()
+        amounts = [p.amount for p in self._sells(client)]
+        self.assertEqual(len(amounts), 2)
+        self.assertAlmostEqual(amounts[0], 1.44)
+        self.assertAlmostEqual(amounts[1], 1.43)
+        self.assertTrue([p for p in t._pending.values()
+                         if p.plan.action is m.Action.SELL])
+
+    def test_a_sale_refused_twice_gives_up_and_reports_it(self):
+        _, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t, client, key = self._armed(stop, shares=1.45)
+        self._refuse_sells(client, 2)
+        pos = t._positions[key]
+        self.assertFalse(t._sell_now(pos, "stop"))
+        self.assertEqual(len(self._sells(client)), 2)
+        self.assertFalse([p for p in t._pending.values()
+                          if p.plan.action is m.Action.SELL])
+
+    def test_a_refusal_for_another_reason_is_not_retried(self):
+        _, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t, client, key = self._armed(stop, shares=1.45)
+        base = client.get_quote
+
+        def malformed(r, plan):
+            client.plans.append(plan)
+            raise m.ApiError("malformed", code=-1102)
+
+        client.get_quote = malformed
+        self.assertFalse(t._sell_now(t._positions[key], "stop"))
+        self.assertEqual(len(self._sells(client)), 1)
+
+    def test_a_count_too_small_to_size_down_asks_for_nothing(self):
+        t, client, key = self._armed(0.50, shares=0.004)
+        self.assertFalse(t._sell_now(t._positions[key], "stop"))
+        self.assertEqual(self._sells(client), [])
 
     def test_a_bid_at_the_take_profit_sells_the_position(self):
         tp, _ = m.bracket_prices(0.50, 200, 0.05, 0.05)

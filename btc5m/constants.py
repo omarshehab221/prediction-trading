@@ -53,3 +53,12 @@ WS_BOOK_VALIDATE_TOL = 0.02
 # partial exit can leave a remnant of a fraction of a cent, and the venue
 # refuses a sale that small with SYSTEM_ERROR (-9000).
 DUST_USDT = 0.01
+
+
+# The precision a sale's share count is sized to. Order records report
+# shares to two decimals, rounded either way: a buy quoted 1.447444 shares
+# recorded 1.45, and a sale of 1.45 was refused with -9000 "You have exceeded
+# your available shares". A sale is sized to this precision with half a unit
+# taken off first, so a count rounded up still sells; what is left is dust
+# that settles with the round.
+SHARE_PRECISION = 2
