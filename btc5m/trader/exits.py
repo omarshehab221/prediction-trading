@@ -7,7 +7,7 @@ from decimal import ROUND_DOWN, Decimal
 
 import requests
 
-from btc5m.constants import EPS, LOG, SHARE_PRECISION
+from btc5m.constants import DUST_USDT, EPS, LOG, SHARE_PRECISION
 from btc5m.domain import Action, OrderPlan, OrderType, PendingOrder, Side
 from btc5m.errors import ApiError
 from btc5m.pricing import digital_up_probability, sell_reservation_price
@@ -170,7 +170,13 @@ class ExitsMixin:
                 return replace(pending, filled_usdt=state.filled_usdt,
                                filled_shares=state.filled_shares)
             remaining = pos.committed_usdt - sold_cost
-        if remaining <= EPS:
+        # A remainder under DUST_USDT is closed with the sale, not kept open.
+        # Kept, a 0.0015 sliver blocked every further entry on the symbol
+        # until the round ended and then settled as though the whole stake
+        # had ridden -- "WIN P&L +1.06" on a position that had been sold.
+        # _sell_now sizes every sale a little under the holding, so every
+        # exit leaves one. Its cost is booked into this sale's P&L.
+        if remaining < DUST_USDT:
             pnl = state.filled_usdt - pos.committed_usdt
             self._journal.resolve_sold(pos.trade_id, state.filled_usdt,
                                        price, order_id, pos.committed_usdt)

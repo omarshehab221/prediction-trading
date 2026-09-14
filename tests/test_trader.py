@@ -1342,6 +1342,49 @@ class TestLimitExits(unittest.TestCase):
         self.assertAlmostEqual(row[0], 1.0)
         self.assertEqual(row[1], "sold")
 
+    def test_a_sale_that_leaves_only_dust_closes_the_position(self):
+        """
+        Live, a BTC scalp sold 1.1285 of its 1.13 USDT and kept the 0.0015
+        left open. That sliver blocked every further entry on the symbol
+        until the round ended, and then settled as though the whole stake
+        had ridden: "WIN P&L +1.06", "Redemption confirmed: 2.22 USDT", and
+        the difference was written off as an external balance movement.
+        Sales are now sized a little under the holding on purpose, so every
+        exit leaves a sliver like that. A remainder under DUST_USDT closes
+        the position as sold.
+        """
+        import dataclasses as _dc
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
+        tid = t._journal.record("PAPER", make_round(), make_signal(), 100.0,
+                                0.5, 50.0, "o1")
+        base = make_position(committed=5.0, trade_id=tid)
+        key = ("BTCUSDT", Side.UP)
+        t._positions[key] = _dc.replace(base, shares=8.0)
+        t._maybe_exit_all()
+        # 7.99 of 8 shares sold: 5.0 x 0.01 / 8 = 0.00625 USDT left.
+        self._fills(t, m.OrderState("FILLED", 5.6, 7.99, 0.70))
+        t._reap_pending()
+        self.assertNotIn(key, t._positions)
+        row = t._journal._conn.execute(
+            "SELECT pnl, settle_source FROM trades WHERE id=?",
+            (tid,)).fetchone()
+        self.assertAlmostEqual(row[0], 5.6 - 5.0)
+        self.assertEqual(row[1], "sold")
+
+    def test_a_cost_implied_sale_leaving_dust_closes_the_position(self):
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
+        tid = t._journal.record("PAPER", make_round(), make_signal(), 100.0,
+                                0.5, 50.0, "o1")
+        pos = make_position(committed=5.0, trade_id=tid)
+        key = ("BTCUSDT", Side.UP)
+        t._positions[key] = pos
+        t._maybe_exit_all()
+        # Sold all but 0.005 USDT of the cost basis.
+        shares = (pos.committed_usdt - 0.005) / pos.signal.fill_price
+        self._fills(t, m.OrderState("FILLED", 5.5, shares, 0.60))
+        t._reap_pending()
+        self.assertNotIn(key, t._positions)
+
     def test_a_partial_sell_leaves_the_remainder_to_settle(self):
         t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
         tid = t._journal.record("PAPER", make_round(), make_signal(), 100.0,
