@@ -264,8 +264,11 @@ class ExitsMixin:
             else:
                 order_id = str(self._paper_book.place(plan, pos.rnd))
         except (ApiError, requests.RequestException) as exc:
-            LOG.error("%s: the %s sale was refused: %s", pos.rnd.slug,
-                      reason, exc)
+            LOG.error("%s: the %s sale of %.6f shares was refused (recorded "
+                      "shares %s, cost-implied %.6f): %s", pos.rnd.slug,
+                      reason, shares, pos.shares,
+                      pos.committed_usdt / max(pos.signal.fill_price, EPS),
+                      exc)
             return False
         self._pending[order_id] = PendingOrder(
             order_id=order_id, rnd=pos.rnd, plan=plan, signal=pos.signal,

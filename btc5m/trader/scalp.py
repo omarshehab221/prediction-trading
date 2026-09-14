@@ -348,6 +348,14 @@ class ScalpMixin:
             # Scaled down if the confirmed fill came back smaller than quoted.
             shares = (quote.amount_out * min(1.0, stake / quoted_stake)
                       if quote is not None and quoted_stake > 0 else None)
+            if quote is not None:
+                # Every number an exit's size is built from, side by side, so
+                # a refused sale can be traced to the one that was wrong.
+                LOG.info("%s: bought %s | quoted %.4f USDT -> %.6f shares at "
+                         "%.4f (fee %.4f); confirmed %.4f USDT; recording %s "
+                         "shares", raw.slug, side.value, quoted_stake,
+                         quote.amount_out, quote.average_price, quote.fee_usdt,
+                         stake, "no" if shares is None else f"{shares:.6f}")
             # Re-derive from the CONFIRMED fill. _place_leg can come back
             # with a different price and a smaller stake than the screen, and
             # a bracket around the wrong price is the one failure this whole

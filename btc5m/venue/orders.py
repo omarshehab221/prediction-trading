@@ -285,13 +285,19 @@ class OrdersApiMixin:
                     filled = _as_float_or_none(order.get("filledShareQty"))
                 if last_status in self.DEAD_ORDER_STATUSES:
                     # The venue has answered, and the answer is no. Callers
-                    # must not record a position on this.
+                    # must not record a position on this. The whole record
+                    # travels with it: the status alone has never said why.
                     raise OrderNotFilled(
                         f"order {order_id} did not fill: status "
-                        f"{last_status}, filled {filled}")
+                        f"{last_status}, filled {filled}; venue record {order}")
                 if last_status in self.FILLED_ORDER_STATUSES and filled:
+                    # What the venue delivered, shares included. An exit sized
+                    # from anything else has been refused as exceeding the
+                    # shares available.
+                    LOG.info("Order %s filled: venue record %s", order_id, order)
                     return filled
                 if filled and filled >= requested_usdt * self._cfg.min_fill_fraction:
+                    LOG.info("Order %s filled: venue record %s", order_id, order)
                     return filled
             if attempt + 1 < self._cfg.fill_confirm_attempts:
                 time.sleep(self._cfg.fill_confirm_delay_s)
