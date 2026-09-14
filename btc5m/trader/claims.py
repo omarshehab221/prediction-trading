@@ -77,7 +77,7 @@ class ClaimsMixin:
         is what gets the balance freed up for re-entry as early as possible.
         """
         token_id = pos.rnd.token_for(pos.signal.side)
-        payout = pos.signal.stake_usdt / pos.signal.fill_price
+        payout = pos.held_shares      # 1 USDT per winning share still held
         chain_id = pos.rnd.chain_id
         deadline = time.time() + self._cfg.claim_timeout_s
         hashes: list[str] = []
@@ -177,7 +177,7 @@ class ClaimsMixin:
         actual redemption on its own schedule in the background.
         """
         token_id = pos.rnd.token_for(pos.signal.side)
-        payout = pos.signal.stake_usdt / pos.signal.fill_price
+        payout = pos.held_shares      # 1 USDT per winning share still held
         with self._claim_lock:
             self._unredeemed[token_id] = (payout, [], pos.rnd.chain_id)
         self._start_claim_worker()

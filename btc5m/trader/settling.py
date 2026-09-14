@@ -61,8 +61,12 @@ class SettlementMixin:
 
         won = winner is pos.signal.side
         if pnl is None:
-            pnl = settle_pnl(max(pos.committed_usdt, pos.signal.stake_usdt),
-                             pos.signal.fill_price, won, pos.rnd.fee_bps)
+            # What is still at risk, not the original stake. Every entry path
+            # keeps the two equal; only a partial sale shrinks committed_usdt,
+            # and max() with the stake then settled the sold part a second
+            # time -- a remnant logged "WIN P&L +1.06" after being sold.
+            pnl = settle_pnl(pos.committed_usdt, pos.signal.fill_price, won,
+                             pos.rnd.fee_bps)
         if not self._live:
             self._paper_bankroll += pnl
 
@@ -77,8 +81,9 @@ class SettlementMixin:
             # credit lands minutes later and may land light; declaring it is
             # what lets reconciliation read a shortfall as this trade's
             # result rather than as a stranger's withdrawal.
-            payout = max(pos.committed_usdt, pos.signal.stake_usdt) / max(
-                pos.signal.fill_price, EPS)
+            # A winning share redeems for 1 USDT, so the payout is the shares
+            # still held -- not the original stake over the entry price.
+            payout = pos.held_shares
             self._risk_for(key[0]).expect_credit(payout)
             if self._account_risk is not None:
                 self._account_risk.expect_credit(payout)

@@ -104,6 +104,58 @@ class TestSimulatedSession(unittest.TestCase):
         self.assertAlmostEqual(t._paper_bankroll, 100.0 - staked, places=9)
         self.assertEqual(t._account_risk.consecutive_losses, 1)
 
+    def test_a_partly_sold_position_settles_on_what_is_left(self):
+        """
+        A sale that leaves more than dust shrinks committed_usdt and leaves
+        signal.stake_usdt at the original stake. Settlement sized P&L from
+        max(committed, stake) -- the original stake -- so the sold part rode
+        to settlement a second time in the books. Live, a remnant logged
+        "WIN P&L +1.06" on a position that had been sold.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0),
+                (start + (m.DEFAULT_ROUND_SECONDS * 1000) + 3_000, 100_400.0)]
+        books = {(1, Side.UP): [(0.55, 10_000)],
+                 (1, Side.DOWN): [(0.95, 10_000)]}
+        client = FakeClient([rnd], path, books, {})
+        t = self._trader(client)
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        pos = t._position
+        key = (pos.rnd.symbol, pos.signal.side)
+        remaining = pos.committed_usdt * 0.4
+        t._positions[key] = replace(pos, committed_usdt=remaining)
+        before = t._paper_bankroll
+
+        client.t = 2
+        client._winners[1] = pos.signal.side
+        t._settle_open()
+
+        expected = settle_pnl(remaining, pos.signal.fill_price, True,
+                              pos.rnd.fee_bps)
+        self.assertAlmostEqual(t._paper_bankroll - before, expected, places=9)
+
+    def _claimed_payout(self, pos):
+        t = make_trader(live=True)
+        t._start_claim_worker = lambda: None     # the queue, not the chain
+        t._claim(pos)
+        return t._unredeemed[pos.rnd.token_for(pos.signal.side)][0]
+
+    def test_a_claim_is_sized_from_the_shares_held(self):
+        """
+        Each winning share redeems for 1 USDT. The claim declared
+        stake_usdt / fill_price -- the ORIGINAL stake -- so a remnant claimed
+        "Redemption confirmed: 2.22 USDT" for shares that had been sold.
+        """
+        pos = replace(make_position(committed=3.0), shares=1.44)
+        self.assertAlmostEqual(self._claimed_payout(pos), 1.44)
+
+    def test_a_claim_without_a_share_count_is_sized_from_what_is_left(self):
+        pos = make_position(committed=3.0)       # signal stake 5.0 at 0.55
+        self.assertAlmostEqual(self._claimed_payout(pos), 3.0 / 0.55)
+
     def test_the_concurrency_cap_is_what_governs(self):
         """
         Regression. The entry guard used to return whenever ANY position was
