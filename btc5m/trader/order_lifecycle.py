@@ -172,6 +172,11 @@ class OrderLifecycleMixin:
             if state.status in ("FILLED", "DEAD"):
                 self._pending.pop(order_id, None)
                 continue
+            # Keep what this pass booked. Left in the local only, the next pass
+            # read the order as having filled nothing yet: a sale's second fill
+            # was taken as selling the cumulative count against what the first
+            # had already sold, and refused -- the rest rode to settlement.
+            self._pending[order_id] = pending
 
             expired = (now_ms >= pending.expires_at_ms
                        or now_ms >= pending.rnd.end_ms

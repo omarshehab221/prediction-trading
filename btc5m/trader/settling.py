@@ -67,6 +67,11 @@ class SettlementMixin:
             # time -- a remnant logged "WIN P&L +1.06" after being sold.
             pnl = settle_pnl(pos.committed_usdt, pos.signal.fill_price, won,
                              pos.rnd.fee_bps)
+            # Plus what selling part of it already made; that sale booked
+            # nothing of its own. Only here, where the P&L is computed: the
+            # venue's realised figure may already include the sale, and adding
+            # it again would count it twice.
+            pnl += pos.realized_pnl
         if not self._live:
             self._paper_bankroll += pnl
 

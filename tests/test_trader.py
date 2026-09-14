@@ -1437,6 +1437,80 @@ class TestLimitExits(unittest.TestCase):
         t._reap_pending()
         self.assertNotIn(key, t._positions)
 
+    def _row_pnl(self, t, tid):
+        return t._journal._conn.execute(
+            "SELECT pnl FROM trades WHERE id=?", (tid,)).fetchone()[0]
+
+    def test_a_sale_filling_in_two_pieces_books_its_total_pnl_once(self):
+        """
+        The close booked the sale order's CUMULATIVE proceeds against a
+        committed_usdt already cut by the earlier fill: 5.00 of cost, half
+        sold for 3.00, the rest for 3.00 more, booked 6.00 - 2.50 = +3.50.
+        The trade made 6.00 - 5.00 = +1.00.
+        """
+        import dataclasses as _dc
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
+        tid = t._journal.record("PAPER", make_round(), make_signal(), 100.0,
+                                0.5, 50.0, "o1")
+        key = ("BTCUSDT", Side.UP)
+        base = make_position(committed=5.0, trade_id=tid)
+        t._positions[key] = _dc.replace(base, shares=8.0)
+        t._maybe_exit_all()
+        self._fills(t, m.OrderState("PARTIAL", 3.0, 4.0, 0.75))
+        t._reap_pending()
+        self.assertAlmostEqual(t._positions[key].committed_usdt, 2.5)
+        self._fills(t, m.OrderState("FILLED", 6.0, 8.0, 0.75))
+        t._reap_pending()
+        self.assertNotIn(key, t._positions)
+        self.assertAlmostEqual(self._row_pnl(t, tid), 1.0)
+
+    def test_a_cost_implied_sale_in_two_pieces_closes_on_its_total(self):
+        # Cumulative shares x entry price against the already-cut cost read as
+        # selling more than was held, so the second fill was refused outright.
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
+        tid = t._journal.record("PAPER", make_round(), make_signal(), 100.0,
+                                0.5, 50.0, "o1")
+        key = ("BTCUSDT", Side.UP)
+        pos = make_position(committed=5.0, trade_id=tid)
+        t._positions[key] = pos
+        t._maybe_exit_all()
+        all_shares = pos.committed_usdt / pos.signal.fill_price
+        self._fills(t, m.OrderState("PARTIAL", 3.0, all_shares / 2, 0.66))
+        t._reap_pending()
+        self._fills(t, m.OrderState("FILLED", 6.0, all_shares, 0.66))
+        t._reap_pending()
+        self.assertNotIn(key, t._positions)
+        self.assertAlmostEqual(self._row_pnl(t, tid), 1.0)
+
+    def test_a_partly_sold_position_settles_with_what_the_sale_made(self):
+        """
+        A sale leaving more than dust booked nothing for the part it sold;
+        only the remainder settled, and the sold part's P&L vanished.
+        """
+        import dataclasses as _dc
+        t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
+        rnd = make_round()
+        tid = t._journal.record("PAPER", rnd, make_signal(), 100.0, 0.5,
+                                50.0, "o1")
+        key = ("BTCUSDT", Side.UP)
+        base = make_position(committed=5.0, trade_id=tid)
+        t._positions[key] = _dc.replace(base, shares=8.0)
+        t._maybe_exit_all()
+        self._fills(t, m.OrderState("PARTIAL", 3.0, 4.0, 0.75))
+        t._reap_pending()
+        t._pending.clear()                   # the rest never sold
+        pos = t._positions[key]
+
+        t._client.now_ms = lambda: rnd.end_ms + 10_000_000
+        t._client._winners[rnd.topic_id] = Side.UP
+        t._settle_open()
+
+        expected = (settle_pnl(pos.committed_usdt, pos.signal.fill_price,
+                               True, pos.rnd.fee_bps)
+                    + (3.0 - 2.5))
+        self.assertNotIn(key, t._positions)
+        self.assertAlmostEqual(self._row_pnl(t, tid), expected)
+
     def test_a_partial_sell_leaves_the_remainder_to_settle(self):
         t = self._trader(exit_order_type="LIMIT", exit_trigger="RESTING")
         tid = t._journal.record("PAPER", make_round(), make_signal(), 100.0,

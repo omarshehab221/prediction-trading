@@ -278,6 +278,17 @@ class Position:
     # the holding -- and a sale of that many is refused by the venue as
     # exceeding the shares available.
     shares: float | None = None
+    # What sales of part of this position have already made: their proceeds
+    # and the cost basis they carried away. committed_usdt is only what is
+    # still held, so without these a partial sale's P&L had nowhere to live
+    # and vanished when the rest closed.
+    sold_proceeds_usdt: float = 0.0
+    sold_cost_usdt: float = 0.0
+
+    @property
+    def realized_pnl(self) -> float:
+        """P&L already made by selling part of the position."""
+        return self.sold_proceeds_usdt - self.sold_cost_usdt
 
     @property
     def held_shares(self) -> float:

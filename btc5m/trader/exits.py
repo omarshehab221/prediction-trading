@@ -159,17 +159,25 @@ class ExitsMixin:
             remaining = pos.committed_usdt - sold_cost if left > EPS else 0.0
             shrunk = {"shares": left}
         else:
-            sold_cost = state.filled_shares * pos.signal.fill_price
+            # This fill's shares only. The cumulative count, priced against a
+            # cost an earlier fill had already cut, read as selling more than
+            # was held, and the rest of the sale was refused.
+            new_shares = state.filled_shares - pending.filled_shares
+            sold_cost = new_shares * pos.signal.fill_price
             if sold_cost > pos.committed_usdt + EPS:
                 # Impossible: more shares came back than the position ever
                 # held. Netting it silently would report a profit made from
                 # nothing.
                 LOG.error("%s: sale of %.4f shares exceeds the %.4f USDT "
                           "held; refusing to net it", pending.rnd.slug,
-                          state.filled_shares, pos.committed_usdt)
+                          new_shares, pos.committed_usdt)
                 return replace(pending, filled_usdt=state.filled_usdt,
                                filled_shares=state.filled_shares)
             remaining = pos.committed_usdt - sold_cost
+        # This fill's proceeds, added to what earlier fills of the sale already
+        # made. The close books the TOTAL once: cumulative proceeds against a
+        # cost already cut by an earlier fill turned a +1.00 trade into +3.50.
+        proceeds = pos.sold_proceeds_usdt + new_usdt
         # A remainder under DUST_USDT is closed with the sale, not kept open.
         # Kept, a 0.0015 sliver blocked every further entry on the symbol
         # until the round ended and then settled as though the whole stake
@@ -177,18 +185,20 @@ class ExitsMixin:
         # _sell_now sizes every sale a little under the holding, so every
         # exit leaves one. Its cost is booked into this sale's P&L.
         if remaining < DUST_USDT:
-            pnl = state.filled_usdt - pos.committed_usdt
-            self._journal.resolve_sold(pos.trade_id, state.filled_usdt,
-                                       price, order_id, pos.committed_usdt)
+            cost = pos.sold_cost_usdt + pos.committed_usdt
+            pnl = proceeds - cost
+            self._journal.resolve_sold(pos.trade_id, proceeds, price,
+                                       order_id, cost)
             self._positions.pop(key, None)
             self._brackets.pop(key, None)
             self._record_sale(key[0], pnl)
             LOG.info("SOLD %s %s | %.4f USDT at %.4f (entry %.4f) P&L %+.4f",
                      pending.rnd.slug, pending.plan.side.value,
-                     state.filled_usdt, price, pos.signal.fill_price, pnl)
+                     proceeds, price, pos.signal.fill_price, pnl)
         else:
-            self._positions[key] = replace(pos, committed_usdt=remaining,
-                                           **shrunk)
+            self._positions[key] = replace(
+                pos, committed_usdt=remaining, sold_proceeds_usdt=proceeds,
+                sold_cost_usdt=pos.sold_cost_usdt + sold_cost, **shrunk)
             LOG.info("%s: sold %.4f of %.4f USDT at %.4f; %.4f left to settle",
                      pending.rnd.slug, sold_cost, pos.committed_usdt, price,
                      remaining)
