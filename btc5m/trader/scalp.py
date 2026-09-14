@@ -280,6 +280,7 @@ class ScalpMixin:
                 self._decline(raw, "the side has no tradable price",
                               f"signal {side.value} but its book is empty")
                 continue
+            screen = price                # the book's ask, before any quote
             if self._live:
                 fresh = self._live_bankroll("scalp entry")
                 if fresh is None:
@@ -297,6 +298,29 @@ class ScalpMixin:
                 # because the bracket is computed from that price and a
                 # bracket built on a screen price protects nothing.
                 price = quote.average_price
+                # A quote the book does not support. Live, an ETH UP buy was
+                # quoted and sent at 0.39 with the book asking 0.60; the venue
+                # answered "Failed to execute the market order" and the same
+                # side filled at 0.59 five seconds later. Half the session's
+                # buys failed that way, and one that filled executed at 0.36
+                # under a 0.43 bid, which put its stop above the real entry.
+                # Further from the ask than the order's own slippage cap, the
+                # quote is not what will execute, so nothing is sent.
+                tolerance = cfg.max_slippage_bps / 10_000.0
+                gap = abs(price - screen) / max(screen, EPS)
+                if gap > tolerance:
+                    bids = self._market_data.bids(raw, side)
+                    LOG.warning("%s: %s buy skipped: quote %.4f is %.1f%% "
+                                "from the book (ask %.4f, bid %s), past the "
+                                "%.1f%% slippage cap", raw.slug, side.value,
+                                price, gap * 100, screen,
+                                f"{bids[0][0]:.4f}" if bids else "none",
+                                tolerance * 100)
+                    self._explain(raw.symbol, "quote far from the book",
+                                  f"{raw.slug}: signal {side.value} but the "
+                                  f"quote {price:.4f} is {gap * 100:.1f}% "
+                                  f"from the ask {screen:.4f}")
+                    continue
                 if abs(quote.price_impact) > cfg.max_price_impact:
                     self._explain(raw.symbol, "price impact too high",
                                   f"{raw.slug}: signal {side.value} but a "
@@ -340,7 +364,18 @@ class ScalpMixin:
             quoted_stake = stake
             placed = self._place_leg(raw, side, price, stake, quote)
             if placed is None:
-                continue                  # killed by the venue; nothing open
+                # Killed by the venue; nothing open. Its record says only
+                # "Failed to execute the market order", so say what the order
+                # was sent on and what the book showed at that moment.
+                if quote is not None:
+                    bids = self._market_data.bids(raw, side)
+                    LOG.warning("%s: %s buy failed on quote %.4f (impact "
+                                "%.2f%%, %.6f shares) with the book at ask "
+                                "%.4f, bid %s", raw.slug, side.value,
+                                quote.average_price, quote.price_impact * 100,
+                                quote.amount_out, screen,
+                                f"{bids[0][0]:.4f}" if bids else "none")
+                continue
             price, stake, order_id = placed
             # The shares the buy actually returned. The fee comes out of
             # them, so cost / price overstates the holding, and every exit

@@ -1565,6 +1565,68 @@ class TestScalpEntry(unittest.TestCase):
         pos = t._positions[("BTCUSDT", Side.UP)]
         self.assertAlmostEqual(pos.signal.fill_price, 0.51)
 
+    # -- a quote the book does not support is not traded -------------------
+
+    def _quoting(self, client, avg):
+        """Every buy quote comes back at `avg`, whatever the book says."""
+        def quote(rnd, plan):
+            return m.Quote("q-far", avg, plan.amount / avg, 0.0, 0.0,
+                           action=plan.action, order_type=plan.order_type,
+                           price_limit=plan.price_limit)
+        client.get_quote = quote
+
+    def _buys(self, client):
+        return [o for o in client.orders if o[1] is m.Action.BUY]
+
+    def test_a_quote_far_below_the_book_is_not_traded(self):
+        """
+        Live, an ETH UP buy was quoted and sent at 0.39 while the book asked
+        0.60; the venue answered "Failed to execute the market order", and
+        five seconds later the same side filled at 0.59. Half the session's
+        buys failed like that, and one that did fill executed at 0.36 under
+        a 0.43 bid, which put its stop above the real entry. A quote further
+        from the book's ask than the order's own slippage cap is skipped.
+        """
+        t, client = self._trader(live=True, ask=0.50, bid=0.49)
+        self._quoting(client, 0.39)
+        with self.assertLogs(level="WARNING") as logs:
+            t._maybe_enter(100.0, "LIVE")
+        self.assertNotIn(("BTCUSDT", Side.UP), t._positions)
+        self.assertEqual(self._buys(client), [])
+        text = "\n".join(logs.output)
+        self.assertIn("0.3900", text)
+        self.assertIn("0.5000", text)
+
+    def test_a_quote_far_above_the_book_is_not_traded(self):
+        # A bid high enough that the spread-wider-than-the-stop gate passes:
+        # only the distance from the ask may stop this one.
+        t, client = self._trader(live=True, ask=0.50, bid=0.59)
+        self._quoting(client, 0.60)
+        t._maybe_enter(100.0, "LIVE")
+        self.assertNotIn(("BTCUSDT", Side.UP), t._positions)
+        self.assertEqual(self._buys(client), [])
+
+    def test_a_failed_buy_logs_its_quote_and_the_book(self):
+        """
+        The venue's record of a failed buy says only "Failed to execute the
+        market order". What the bot was quoted and what its book showed at
+        that moment are the two numbers that say which side was wrong.
+        """
+        t, client = self._trader(live=True, ask=0.50, bid=0.50)
+
+        def killed(order_id, requested_usdt):
+            raise m.OrderNotFilled(f"order {order_id} did not fill: status "
+                                   f"FAILED, filled 0.0")
+
+        client.confirm_fill = killed
+        with self.assertLogs(level="WARNING") as logs:
+            t._maybe_enter(100.0, "LIVE")
+        self.assertNotIn(("BTCUSDT", Side.UP), t._positions)
+        text = "\n".join(logs.output)
+        self.assertIn("quote 0.5100", text)
+        self.assertIn("ask 0.5000", text)
+        self.assertIn("bid 0.5000", text)
+
     # -- sizing: the fraction, floored at the venue minimum ---------------
 
     def test_the_stake_is_the_fraction_when_it_clears_the_minimum(self):
