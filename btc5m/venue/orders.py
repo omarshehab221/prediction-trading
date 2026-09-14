@@ -280,6 +280,11 @@ class OrdersApiMixin:
         # Created on first use: this mixin has no __init__ of its own.
         self.__dict__.setdefault("_delivered", {})[str(order_id)] = (
             _as_float_or_none(order.get("filledShareQty")))
+        # And the price it executed at. A value outside (0, 1) is not a fill
+        # price for this market, so it is not kept and the quote stands in.
+        price = _as_float_or_none(order.get("price"))
+        self.__dict__.setdefault("_executed", {})[str(order_id)] = (
+            price if price is not None and 0.0 < price < 1.0 else None)
 
     def delivered_shares(self, order_id: str) -> float | None:
         """
@@ -294,6 +299,19 @@ class OrdersApiMixin:
         once, so a long run does not accumulate one entry per order.
         """
         return self.__dict__.get("_delivered", {}).pop(str(order_id), None)
+
+    def executed_price(self, order_id: str) -> float | None:
+        """
+        The price the venue executed an order confirm_fill confirmed at.
+
+        The quote's averagePrice is an estimate made before the order went
+        out. Live, a BTC buy quoted at 0.49 executed at 0.36 -- 0.73 USDT for
+        2 shares, and the venue balance fell by exactly 0.73 -- and the bot,
+        having kept the quote's price, bracketed a stop at 0.475 above the
+        real entry. None when the record carried no usable price or the order
+        was never confirmed; the caller keeps the quote's. Handed over once.
+        """
+        return self.__dict__.get("_executed", {}).pop(str(order_id), None)
 
     def confirm_fill(self, order_id: str, requested_usdt: float) -> float:
         """

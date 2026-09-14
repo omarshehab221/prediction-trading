@@ -1317,6 +1317,38 @@ class TestConfirmFillRemembersDeliveredShares(unittest.TestCase):
     def test_an_unconfirmed_order_reports_none(self):
         self.assertIsNone(self._client([]).delivered_shares("o1"))
 
+    def test_a_confirmed_fill_reports_the_price_it_executed_at(self):
+        """
+        Live, a BTC buy was quoted at averagePrice 0.49 and executed at 0.36:
+        the record said filledUsdtAmount 0.73 for filledShareQty 2, and the
+        venue balance fell by exactly 0.73. Bracketed at the quote's 0.49,
+        the stop sat at 0.475 -- above the real entry -- and fired on a
+        position that was in profit.
+        """
+        c = self._client([{"orderId": "o1", "status": "FILLED",
+                           "filledUsdtAmount": "0.73",
+                           "filledShareQty": "2", "price": "0.36"}])
+        c.confirm_fill("o1", 1.0)
+        self.assertAlmostEqual(c.executed_price("o1"), 0.36)
+
+    def test_a_record_without_a_price_reports_none(self):
+        c = self._client([{"orderId": "o1", "status": "FILLED",
+                           "filledUsdtAmount": "1.15",
+                           "filledShareQty": "2.29"}])
+        c.confirm_fill("o1", 1.15)
+        self.assertIsNone(c.executed_price("o1"))
+
+    def test_an_implausible_recorded_price_reports_none(self):
+        # A price outside (0, 1) is not a fill price; the quote stands in.
+        c = self._client([{"orderId": "o1", "status": "FILLED",
+                           "filledUsdtAmount": "1.15",
+                           "filledShareQty": "2.29", "price": "0"}])
+        c.confirm_fill("o1", 1.15)
+        self.assertIsNone(c.executed_price("o1"))
+
+    def test_an_unconfirmed_order_reports_no_price(self):
+        self.assertIsNone(self._client([]).executed_price("o1"))
+
 
 class TestOrderStateAndCancel(unittest.TestCase):
     """A GTC order's ordinary answer is 'still resting', not an exception."""

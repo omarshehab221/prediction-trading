@@ -386,6 +386,10 @@ class FakeClient:
         # the quote. Tests that need one override this per-instance.
         return None
 
+    def executed_price(self, order_id):
+        # Likewise no recorded execution price: the quote's stands.
+        return None
+
     def list_rounds(self):
         return list(self._rounds)
 

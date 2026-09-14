@@ -95,6 +95,16 @@ class OrderLifecycleMixin:
             if self._cfg.confirm_fills:
                 try:
                     stake = self._client.confirm_fill(order_id, stake)
+                    # What the venue executed at, not what the quote
+                    # estimated. Live, a buy quoted at 0.49 executed at 0.36;
+                    # kept at 0.49, its stop sat above the real entry and
+                    # fired on a position that was up.
+                    executed = self._client.executed_price(order_id)
+                    if executed is not None:
+                        if executed != price:
+                            LOG.info("%s: %s executed at %.4f; quoted %.4f",
+                                     raw.slug, side.value, executed, price)
+                        price = executed
                 except OrderNotFilled as exc:
                     LOG.warning("%s: the %s order did not fill (%s); no "
                                 "position recorded", raw.slug, side.value,

@@ -1541,6 +1541,30 @@ class TestScalpEntry(unittest.TestCase):
         pos = t._positions[("BTCUSDT", Side.UP)]
         self.assertAlmostEqual(pos.shares, 1.23)
 
+    def test_a_live_entry_is_priced_and_bracketed_at_the_executed_price(self):
+        """
+        Live, a BTC buy quoted at 0.49 executed at 0.36 (0.73 USDT for 2
+        shares; the venue balance fell by exactly 0.73). The bot recorded the
+        quote's 0.49 and bracketed it: the stop landed at 0.475, above the
+        real entry, and fired on a position that was up. Entry price, P&L and
+        bracket all come from what the venue executed.
+        """
+        t, client = self._trader(live=True, bid=0.50)
+        client.executed_price = lambda order_id: 0.36
+        t._maybe_enter(100.0, "LIVE")
+        key = ("BTCUSDT", Side.UP)
+        pos = t._positions[key]
+        self.assertAlmostEqual(pos.signal.fill_price, 0.36)
+        bracket = t._brackets[key]
+        self.assertAlmostEqual(bracket.entry_price, 0.36)
+        self.assertLess(bracket.stop_price, 0.36)
+
+    def test_a_live_entry_without_an_executed_price_keeps_the_quote(self):
+        t, client = self._trader(live=True, bid=0.50)
+        t._maybe_enter(100.0, "LIVE")
+        pos = t._positions[("BTCUSDT", Side.UP)]
+        self.assertAlmostEqual(pos.signal.fill_price, 0.51)
+
     # -- sizing: the fraction, floored at the venue minimum ---------------
 
     def test_the_stake_is_the_fraction_when_it_clears_the_minimum(self):
