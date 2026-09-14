@@ -100,8 +100,17 @@ class OrdersApiMixin:
         # shares x price should equal the USDT. A SELL puts shares in and
         # takes USDT out, so the same product should equal the amount OUT.
         # Checking a sell the buy way rejects every well-formed sell quote.
+        #
+        # And a LIMIT sell's amountOut is priced at the LIMIT -- the least the
+        # sale can fetch -- not at the average. Live, a stop selling 1.67
+        # shares through the bid at 0.53 was quoted averagePrice 0.59 and
+        # amountOut 0.8851, exactly 1.67 x 0.53. Reconciled at the average it
+        # read as 11% off, the bot refused its own stop and then its flatten,
+        # and the position settled as a full-stake loss.
         if plan.action is Action.BUY:
             implied, reference = amount_out * avg_f, plan.amount
+        elif plan.price_limit is not None:
+            implied, reference = plan.amount * plan.price_limit, amount_out
         else:
             implied, reference = plan.amount * avg_f, amount_out
         tol = self._cfg.quote_consistency_tolerance

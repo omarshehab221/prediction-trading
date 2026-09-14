@@ -1241,6 +1241,50 @@ class TestLimitQuoting(unittest.TestCase):
         with self.assertRaises(m.ApiError):
             c.get_quote(make_round(), plan)
 
+    def _limit_sell(self, shares, limit, avg, out):
+        c = self._client({"quoteId": "q1", "averagePrice": str(avg),
+                          "amountOut": m.to_wei(out), "priceImpact": 0.0,
+                          "feeAmount": "0"})
+        plan = m.OrderPlan(side=m.Side.UP, action=m.Action.SELL,
+                           order_type=m.OrderType.LIMIT, amount=shares,
+                           price_limit=limit)
+        return c, plan
+
+    def test_a_limit_sell_is_reconciled_at_its_limit(self):
+        """
+        Live, a stop sold 1.67 shares through the bid with a 0.53 limit. The
+        venue quoted averagePrice 0.59 and amountOut 0.8851 -- exactly
+        1.67 x 0.53, the proceeds AT THE LIMIT. Reconciled at the average
+        (0.9853) it read as 11% off, over the 10% tolerance, and the bot
+        refused its own stop; the flatten was refused the same way and the
+        position settled as a full-stake loss.
+        """
+        c, plan = self._limit_sell(1.67, 0.53, 0.59, 0.8851)
+        self.assertAlmostEqual(c.get_quote(make_round(), plan).amount_out,
+                               0.8851)
+
+    def test_the_flatten_quote_that_was_refused_is_accepted(self):
+        # 1.67 x 0.48 = 0.8016; the average 0.54 would imply 0.9018.
+        c, plan = self._limit_sell(1.67, 0.48, 0.54, 0.8016)
+        self.assertAlmostEqual(c.get_quote(make_round(), plan).amount_out,
+                               0.8016)
+
+    def test_a_limit_sell_matching_no_price_is_still_rejected(self):
+        # Neither 1.67 x 0.53 (0.8851) nor 1.67 x 0.59 (0.9853) is 0.40.
+        c, plan = self._limit_sell(1.67, 0.53, 0.59, 0.40)
+        with self.assertRaises(m.ApiError):
+            c.get_quote(make_round(), plan)
+
+    def test_a_market_sell_is_still_reconciled_at_its_average(self):
+        # No limit to price the proceeds at, so the average governs.
+        c = self._client({"quoteId": "q1", "averagePrice": "0.59",
+                          "amountOut": m.to_wei(0.8851), "priceImpact": 0.0,
+                          "feeAmount": "0"})
+        plan = m.OrderPlan(side=m.Side.UP, action=m.Action.SELL,
+                           order_type=m.OrderType.MARKET, amount=1.67)
+        with self.assertRaises(m.ApiError):
+            c.get_quote(make_round(), plan)
+
 
 class TestConfirmFillRemembersDeliveredShares(unittest.TestCase):
     """
