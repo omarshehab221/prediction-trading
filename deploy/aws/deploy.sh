@@ -238,7 +238,8 @@ fi
 # --- Task definition ---------------------------------------------------------
 
 log "Task definition"
-# Mirrors render.yaml's envVars. SYMBOLS is omitted: unset means every market.
+# Mirrors render.yaml's envVars. SYMBOLS is pinned: with it empty the scalp
+# strategy's futures feed subscribed to nothing and the bot never traded.
 TASK_DEF="$(cat <<JSON
 {
   "family": "$APP",
@@ -265,6 +266,7 @@ TASK_DEF="$(cat <<JSON
       {"name": "DB_PATH", "value": "/var/data/btc5m_journal.db"},
       {"name": "PROFILE", "value": "scalp"},
       {"name": "TRADING_MODE", "value": "live"},
+      {"name": "SYMBOLS", "value": "BTCUSDT,ETHUSDT,BNBUSDT"},
       {"name": "PYTHONUNBUFFERED", "value": "1"},
       {"name": "SKIP_VERIFY", "value": "0"},
       {"name": "PREFLIGHT_REQUIRED", "value": "1"},
