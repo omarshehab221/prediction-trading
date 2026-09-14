@@ -192,7 +192,7 @@ class ScalpMixin:
         self._explained.pop("scalp", None)
 
         now_s = time.monotonic()
-        for raw in self._client.list_rounds():
+        for raw in self._list_rounds():
             secs = raw.seconds_remaining(now_ms)
             if not (cfg.entry_window_end_s <= secs <= cfg.entry_window_start_s):
                 self._explain(raw.symbol, "outside the entry window",

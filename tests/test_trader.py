@@ -1540,6 +1540,7 @@ class TestLoopSurvivesUnexpectedFailures(unittest.TestCase):
         t._missed = {}
         t._failed_claims = {}
         t._hydrated = {}
+        t._in_play = set()
 
         class _Client:
             def sync_clock(self):
@@ -1880,3 +1881,102 @@ class TestTrendBoost(unittest.TestCase):
         import inspect
         src = inspect.getsource(m.Trader._maybe_enter_model)
         self.assertIn("entry_window_start_s(self._cfg", src)
+
+
+class TestSubscriptionsFollowTheMarketsInPlay(unittest.TestCase):
+    """
+    A flat bot with no configured symbols must still subscribe to something.
+
+    Empty `symbols` means "trade every market the venue lists", so the set to
+    subscribe to is not knowable until the venue has been asked. It used to be
+    taken from `_hydrated`, which ONLY the model strategy ever writes. On the
+    scalp profile that made the subscription set permanently empty, and the
+    scalp signal comes only from the futures socket: no subscription, no perp
+    tick, no entry -- and no entry meant nothing was ever hydrated, so the
+    set stayed empty. The bot sat flat for nine hours declining every round
+    with "the futures feed shows no lead to trade".
+    """
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+
+    def tearDown(self):
+        _close_journals(self)
+        os.unlink(self.db)
+
+    def _trader(self, rounds):
+        from btc5m.errors import Shutdown
+        c = cfg(db_path=self.db, symbols=(), poll_interval_s=0.001)
+        t = m.Trader.__new__(m.Trader)
+        t._static_cfg = c
+        t._store = None
+        t._positions = {}
+        t._pending = {}
+        t._unredeemed = {}
+        t._claim_lock = threading.Lock()
+        t._errors = 0
+        t._stopping = False
+        t._seen = {}
+        t._active_live = False
+        t._pending_live = None
+        t._account_risk = None
+        t._risk = {}
+        t._missed = {}
+        t._failed_claims = {}
+        t._hydrated = {}
+        t._in_play = set()
+
+        class _Client:
+            def sync_clock(self):
+                return 0
+
+            def now_ms(self):
+                return 0
+
+            def list_rounds(self):
+                return list(rounds)
+
+        t._client = _Client()
+        self.tracked = []
+        t._market_data = types.SimpleNamespace(
+            start=lambda: None,
+            stop=lambda: None,
+            track=lambda symbols: self.tracked.append(set(symbols)),
+            status=lambda: {"spot": "off", "book": "off", "futures": "off"})
+        t._bankroll = lambda: 1000.0
+        t._install_signal_handlers = lambda: None
+        t._settle_open = lambda: None
+        t._tally_missed = lambda now_ms: None
+        t._apply_pending_mode = lambda: None
+        t._maybe_scale_in_all = lambda b: None
+        t._check_stops = lambda: None
+        t._flatten_scalps = lambda: None
+        t._maybe_exit_all = lambda: None
+        t._outstanding = lambda: 0.0
+        t._drain = lambda timeout_s=None: None
+
+        # The loop stops once the pass that matters has completed, so the
+        # subscription it made is the last thing recorded.
+        def _reap():
+            if self.tracked:
+                raise Shutdown("one pass is enough")
+
+        t._reap_pending = _reap
+
+        # What every entry strategy does: ask the venue what is live. The
+        # strategies go through the trader so the markets they saw are
+        # remembered; calling the client directly is what lost them.
+        def _enter(bankroll, mode):
+            t._list_rounds()
+
+        t._maybe_enter = _enter
+        return t
+
+    def test_flat_bot_subscribes_to_the_listed_markets(self):
+        rounds = [types.SimpleNamespace(symbol="BTCUSDT"),
+                  types.SimpleNamespace(symbol="ETHUSDT")]
+        t = self._trader(rounds)
+        t.run()
+        self.assertTrue(self.tracked, "the loop never subscribed at all")
+        self.assertEqual(self.tracked[-1], {"BTCUSDT", "ETHUSDT"})

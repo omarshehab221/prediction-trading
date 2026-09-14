@@ -91,7 +91,7 @@ class LastMinuteMixin:
                       self._cfg.reserve_pct * 100)
             return
 
-        for raw in self._client.list_rounds():
+        for raw in self._list_rounds():
             if raw.topic_id in self._seen:
                 continue
             # One position per market: a second on the same symbol is the

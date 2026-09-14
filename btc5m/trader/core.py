@@ -129,6 +129,9 @@ class Trader(
         # is waiting on right now; see _explain for when it is repeated.
         self._explained: dict[str, tuple[str, float]] = {}
         self._hydrated: dict[int, Round] = {}
+        # Symbols of the rounds the last pass actually saw. What the feeds
+        # subscribe to when no symbols are configured; see _list_rounds.
+        self._in_play: set[str] = set()
         self._errors = 0
         # token_id -> (expected payout USDT, tx hashes). Counted toward the
         # bankroll so an unclaimed win is not misread as a drawdown.
@@ -307,14 +310,13 @@ class Trader(
                     # before it. Config.symbols defaults to empty --
                     # meaning trade everything the venue lists -- so
                     # the set is not knowable until the venue has
-                    # been asked. Driving this off open positions
-                    # instead would subscribe to nothing whenever the
-                    # bot is flat, which is most of the time, and the
-                    # feed would never carry a price to be healthy
-                    # about.
+                    # been asked. It comes from the rounds this pass
+                    # listed, never from open positions: a flat bot
+                    # has none, and the scalp strategy cannot open one
+                    # until this subscription has brought the futures
+                    # socket up.
                     self._market_data.track(
-                        self._cfg.symbols
-                        or {r.symbol for r in self._hydrated.values()})
+                        self._cfg.symbols or self._in_play)
                     self._errors = 0
                 except (TradingHalted, Shutdown):
                     raise
@@ -374,6 +376,22 @@ class Trader(
                 except Exception:            # noqa: BLE001
                     LOG.exception("Drain failed; positions remain open")
             raise
+
+    def _list_rounds(self):
+        """
+        The venue's live rounds, remembering which markets they were.
+
+        Every entry strategy asks through here rather than calling the client
+        directly, because the answer is also the subscription set: with no
+        symbols configured, these are the only markets known to be in play.
+        Taken from open positions instead, a flat bot subscribed to nothing,
+        and the scalp strategy -- whose signal exists only on the futures
+        socket -- could never open the position that would have subscribed
+        it.
+        """
+        rounds = self._client.list_rounds()
+        self._in_play = {r.symbol for r in rounds}
+        return rounds
 
     def _maybe_enter(self, bankroll: float, mode: str) -> None:
         """Dispatch to whichever entry strategy the config selects."""

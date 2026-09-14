@@ -48,7 +48,7 @@ class ModelEntryMixin:
                       "(%.2f committed of %.2f)", self._committed(), bankroll)
             return
 
-        for raw in self._client.list_rounds():
+        for raw in self._list_rounds():
             if raw.topic_id in self._seen:
                 continue
             # One position per market: a second on the same symbol would be

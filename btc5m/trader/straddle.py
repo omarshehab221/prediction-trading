@@ -380,7 +380,7 @@ class StraddleMixin:
                       self._cfg.reserve_pct * 100, self._committed())
             return
 
-        for raw in self._client.list_rounds():
+        for raw in self._list_rounds():
             if raw.topic_id in self._seen:
                 continue
             # A market already holding a leg belongs to
