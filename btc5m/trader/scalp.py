@@ -275,11 +275,30 @@ class ScalpMixin:
                 continue
 
             quote = None
-            price = self._book_price(raw, side)
-            if price is None:
+            # Ask and bid from ONE REST snapshot. The ask used to be a REST
+            # read and the bid the stream's, two sources at two moments, and
+            # live logged books the venue never had -- ask 0.63 against bid
+            # 0.65, ask 0.54 against 0.59 -- while every gate below read them.
+            snap_asks, snap_bids = self._client.book_for(raw, side)
+            price = raw.round_price(snap_asks[0][0]) if snap_asks else None
+            if price is None or not 0.0 < price < 1.0:
                 self._decline(raw, "the side has no tradable price",
                               f"signal {side.value} but its book is empty")
                 continue
+            # Strictly over: a bid AT the ask is a locked book, and buying the
+            # ask with a bid right there to sell into is still a real price.
+            if snap_bids and snap_bids[0][0] > snap_asks[0][0]:
+                LOG.warning("%s: %s entry skipped: crossed book -- REST ask "
+                            "%.4f, bid %.4f; stream ask %s, bid %s", raw.slug,
+                            side.value, snap_asks[0][0], snap_bids[0][0],
+                            self._top_price(self._market_data.asks(raw, side)),
+                            self._top_price(self._market_data.bids(raw, side)))
+                self._explain(raw.symbol, "crossed book",
+                              f"{raw.slug}: signal {side.value} but the book "
+                              f"is crossed (ask {snap_asks[0][0]:.4f}, bid "
+                              f"{snap_bids[0][0]:.4f})")
+                continue
+            self._log_book_disagreement(raw, side, snap_asks, snap_bids)
             screen = price                # the book's ask, before any quote
             if self._live:
                 fresh = self._live_bankroll("scalp entry")
@@ -350,7 +369,7 @@ class ScalpMixin:
             # or under the stop means the position is stopped the moment it
             # opens. Live, every early loss was exactly that -- entries on a
             # spread wider than the stop, stopped out within three seconds.
-            bids = self._market_data.bids(raw, side)
+            bids = snap_bids              # the same snapshot as the ask
             if not bids or bids[0][0] <= stop_price:
                 self._decline(raw, "the spread is wider than the stop",
                               f"signal {side.value}: ask {price:.4f}, bid "
@@ -449,6 +468,33 @@ class ScalpMixin:
                     or self._available(bankroll) < cfg.min_stake_usdt):
                 return
 
+    @staticmethod
+    def _top_price(levels) -> str:
+        """The touch of a ladder for a log line, or "none"."""
+        return f"{levels[0][0]:.4f}" if levels else "none"
+
+    def _log_book_disagreement(self, raw, side, rest_asks, rest_bids) -> None:
+        """
+        Say when the REST snapshot and the stream disagree about the touch.
+
+        Evidence, not a gate: which of the two drifts is what decides the fix
+        for the crossed books, and this is where both are in hand at once.
+        """
+        if not self._cfg.ws_enabled:
+            return
+        from btc5m.constants import WS_BOOK_VALIDATE_TOL
+        stream_asks = self._market_data.asks(raw, side)
+        stream_bids = self._market_data.bids(raw, side)
+        pairs = ((rest_asks, stream_asks), (rest_bids, stream_bids))
+        if any(rest and stream
+               and abs(rest[0][0] - stream[0][0]) > WS_BOOK_VALIDATE_TOL
+               for rest, stream in pairs):
+            LOG.info("%s: %s book sources disagree -- REST ask %s, bid %s; "
+                     "stream ask %s, bid %s", raw.slug, side.value,
+                     self._top_price(rest_asks), self._top_price(rest_bids),
+                     self._top_price(stream_asks),
+                     self._top_price(stream_bids))
+
     def _arm_bracket(self, key: tuple[str, Side], entry: float,
                      tp_price: float, stop_price: float) -> None:
         """
@@ -502,6 +548,12 @@ class ScalpMixin:
                          bracket.entry_price, bracket.tp_price)
             else:
                 continue
+            # The leg fired on the stream's bid. Whether that bid was real is
+            # what the crossed books put in doubt, so a REST bid read at the
+            # same moment is recorded beside it.
+            LOG.info("%s: %s fired on the stream bid %.4f; REST bid %s",
+                     pos.rnd.slug, leg, bid, self._top_price(
+                         self._client.bids_for(pos.rnd, pos.signal.side)))
             # Both legs are watched prices, so nothing rests and there is
             # nothing to cancel first: the sale goes out on the pass that
             # sees the price.

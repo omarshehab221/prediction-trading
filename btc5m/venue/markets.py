@@ -82,3 +82,24 @@ class MarketsApiMixin:
             LOG.debug("order book unavailable: %s", exc)
             return None
         return self._parse_levels(payload, "bids")
+
+    def book_for(self, rnd: Round, side: Side
+                 ) -> tuple[list[tuple[float, float]] | None,
+                            list[tuple[float, float]] | None]:
+        """
+        (asks, bids) for one outcome, both from ONE response.
+
+        An entry screened on an ask read here and a bid read from the stream
+        compared two moments from two sources, and live logged books the
+        venue never had: ask 0.63 against bid 0.65, ask 0.54 against 0.59.
+        The order-book call already returns both ladders, so both come from
+        the same read. (None, None) when the book cannot be read.
+        """
+        try:
+            payload = self._request("order_book", {
+                "vendor": rnd.vendor, "marketId": rnd.market_id,
+                "tokenId": rnd.token_for(side)})
+        except ApiError as exc:
+            LOG.debug("order book unavailable: %s", exc)
+            return None, None
+        return self._parse_asks(payload), self._parse_levels(payload, "bids")

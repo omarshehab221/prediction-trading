@@ -42,6 +42,17 @@ REGION="${AWS_REGION:-ap-northeast-1}"
 CLUSTER="${CLUSTER:-precdiction-trading}"
 APP="btc-5m-predictor"
 SECRET_NAME="${SECRET_NAME:-btc5m/binance}"
+# live by default. TRADING_MODE=shadow runs the live code path on live data
+# with no order, cancel or redeem sent, and journals to its own file so a
+# shadow session never mixes with the live calibration record.
+TRADING_MODE="${TRADING_MODE:-live}"
+case "$TRADING_MODE" in
+  live)   DEFAULT_DB="btc5m_journal.db" ;;
+  shadow) DEFAULT_DB="shadow_journal.db" ;;
+  *) echo "FATAL: TRADING_MODE must be live or shadow, got '$TRADING_MODE'" >&2
+     exit 1 ;;
+esac
+DB_PATH="${DB_PATH:-/var/data/$DEFAULT_DB}"
 
 export AWS_DEFAULT_REGION="$REGION"
 
@@ -263,9 +274,9 @@ TASK_DEF="$(cat <<JSON
     "mountPoints": [{"sourceVolume": "data", "containerPath": "/var/data"}],
     "environment": [
       {"name": "CONFIG_PATH", "value": "/var/data/config.json"},
-      {"name": "DB_PATH", "value": "/var/data/btc5m_journal.db"},
+      {"name": "DB_PATH", "value": "$DB_PATH"},
       {"name": "PROFILE", "value": "scalp"},
-      {"name": "TRADING_MODE", "value": "live"},
+      {"name": "TRADING_MODE", "value": "$TRADING_MODE"},
       {"name": "SYMBOLS", "value": "BTCUSDT,ETHUSDT,BNBUSDT"},
       {"name": "PYTHONUNBUFFERED", "value": "1"},
       {"name": "SKIP_VERIFY", "value": "0"},

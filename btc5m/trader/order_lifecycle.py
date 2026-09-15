@@ -252,7 +252,7 @@ class OrderLifecycleMixin:
                           fill_price=price)
             if trade_id is None:
                 trade_id = self._journal.record(
-                    "LIVE" if self._live else "PAPER", pending.rnd, sig,
+                    self._mode_label, pending.rnd, sig,
                     self._market_data.spot(pending.rnd.symbol),
                     self._vol.sigma_annual(pending.rnd.symbol),
                     self._bankroll(), order_id,

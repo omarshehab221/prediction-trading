@@ -16,6 +16,10 @@ class Config:
     api_key: str
     api_secret: str
     live: bool = True
+    # Shadow mode: the live path -- the real balance, books and quotes --
+    # with every order, cancel and redeem simulated instead of sent. Pinned by
+    # TRADING_MODE=shadow, and only meaningful with live.
+    shadow: bool = False
 
     # --- Edge --------------------------------------------------------------
     # Two thresholds, both of which must clear. The absolute floor stops us

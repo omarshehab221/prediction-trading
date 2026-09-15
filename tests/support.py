@@ -396,6 +396,12 @@ class FakeClient:
     def asks_for(self, rnd, side):
         return self._books.get((rnd.topic_id, side))
 
+    def book_for(self, rnd, side):
+        # Both ladders from one read, as the venue's order-book call gives.
+        bids_for = getattr(self, "bids_for", None)
+        return (self.asks_for(rnd, side),
+                bids_for(rnd, side) if bids_for else None)
+
     def resolved_winner(self, rnd):
         return self._winners.get(rnd.topic_id)
 

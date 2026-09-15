@@ -25,6 +25,30 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Iterable
 
+def mode_from_env(flag_live: bool | None,
+                  env_mode: str) -> tuple[bool | None, bool]:
+    """
+    (live, shadow) from the --live/--paper flag and TRADING_MODE.
+
+    live and paper keep their meaning, and an explicit flag still wins over
+    either. shadow runs the live path with no order sent, so a flag beside it
+    is refused rather than resolved: --live next to TRADING_MODE=shadow
+    silently winning would trade real money in a session meant to spend none.
+    """
+    mode = (env_mode or "").strip().lower()
+    if mode and mode not in ("live", "paper", "shadow"):
+        raise ValueError("TRADING_MODE must be 'live', 'paper' or 'shadow', "
+                         f"got {mode!r}")
+    if mode == "shadow":
+        if flag_live is not None:
+            raise ValueError("--live/--paper cannot be combined with "
+                             "TRADING_MODE=shadow")
+        return True, True
+    if flag_live is not None or not mode:
+        return flag_live, False
+    return mode == "live", False
+
+
 def _parse_symbols_arg(raw: str) -> tuple[str, ...]:
     """
     Comma-separated tickers -> a normalised tuple, e.g. "btc,eth" -> BTC,ETH.
@@ -143,14 +167,13 @@ def main(argv: Iterable[str] | None = None) -> int:
     # hosted deployments where the command line is fixed by the platform.
     # An explicit flag wins over it. Validated here, before any subcommand
     # returns, so a typo is caught even by a command that ignores the mode.
-    live = args.live
     env_mode = os.environ.get("TRADING_MODE", "").strip().lower()
-    if env_mode and env_mode not in ("live", "paper"):
-        print(f"TRADING_MODE must be 'live' or 'paper', got {env_mode!r}",
-              file=sys.stderr)
+    try:
+        live, shadow = mode_from_env(args.live, env_mode)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
         return 1
-    if live is None and env_mode:
-        live = env_mode == "live"
+    if args.live is None and env_mode:
         LOG.info("Mode pinned to %s by TRADING_MODE", env_mode.upper())
 
     # SYMBOLS is the environment equivalent of --symbols, same reasoning and
@@ -285,6 +308,10 @@ def main(argv: Iterable[str] | None = None) -> int:
                  ", ".join(overrides["symbols"]) or "(empty -> every market)")
     if args.max_concurrent is not None:
         overrides["max_concurrent_positions"] = args.max_concurrent
+    if shadow:
+        # Pinned over the file, like the mode itself: a config edit must not
+        # turn a shadow session into a real one.
+        overrides["shadow"] = True
 
     try:
         config_path = args.config if os.path.exists(args.config) else None
@@ -338,7 +365,10 @@ def main(argv: Iterable[str] | None = None) -> int:
             print("\nInterrupted.", file=sys.stderr)
             return 130
 
-    if cfg.live:
+    if cfg.live and cfg.shadow:
+        print("\n*** SHADOW MODE: the live path on live data and quotes; no "
+              "order, cancel or redeem is sent. ***")
+    elif cfg.live:
         print("\n*** LIVE MODE: this will spend real USDT. ***")
         print("Confirm you have (1) run --preflight clean, and (2) reviewed")
         print("--calibration-report over several hundred paper rounds.")

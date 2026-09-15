@@ -1286,6 +1286,42 @@ class TestLimitQuoting(unittest.TestCase):
             c.get_quote(make_round(), plan)
 
 
+class TestBookSnapshot(unittest.TestCase):
+    """
+    Both sides of the touch from ONE response.
+
+    The scalp screened its entry on a REST ask and a stream bid read at
+    different moments from different sources, and live logged books the
+    venue never had: ask 0.63 against bid 0.65, ask 0.54 against bid 0.59.
+    """
+
+    def test_both_ladders_come_from_one_request(self):
+        c = build_client(_wallet=m.WalletRef("0xabc", "w1"))
+        calls = []
+
+        def fake(name, params=None):
+            calls.append(name)
+            return {"asks": [{"price": "0.52", "size": "10"},
+                             {"price": "0.50", "size": "5"}],
+                    "bids": [{"price": "0.47", "size": "8"},
+                             {"price": "0.49", "size": "3"}]}
+
+        c._request = fake
+        asks, bids = c.book_for(make_round(), m.Side.UP)
+        self.assertEqual(calls, ["order_book"])
+        self.assertEqual(asks[0][0], 0.50)
+        self.assertEqual(bids[0][0], 0.49)
+
+    def test_an_unavailable_book_is_two_nones(self):
+        c = build_client(_wallet=m.WalletRef("0xabc", "w1"))
+
+        def down(name, params=None):
+            raise m.ApiError("order book unavailable")
+
+        c._request = down
+        self.assertEqual(c.book_for(make_round(), m.Side.UP), (None, None))
+
+
 class TestConfirmFillRemembersDeliveredShares(unittest.TestCase):
     """
     The shares an exit may sell are the ones the venue delivered.

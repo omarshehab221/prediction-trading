@@ -1627,6 +1627,30 @@ class TestScalpEntry(unittest.TestCase):
         self.assertIn("ask 0.5000", text)
         self.assertIn("bid 0.5000", text)
 
+    # -- the book an entry is screened on ------------------------------------
+
+    def test_a_crossed_book_is_not_traded(self):
+        """
+        Live logged books the venue never had -- ask 0.63 against bid 0.65,
+        ask 0.54 against bid 0.59 -- and every entry gate reads that touch.
+        A bid over the ask is not a price anyone can trade, so the entry is
+        skipped and both sources are logged.
+        """
+        t, client = self._trader(live=True, ask=0.50, bid=0.55)
+        with self.assertLogs(level="WARNING") as logs:
+            t._maybe_enter(100.0, "LIVE")
+        self.assertNotIn(("BTCUSDT", Side.UP), t._positions)
+        self.assertEqual(self._buys(client), [])
+        self.assertIn("crossed", "\n".join(logs.output))
+
+    def test_entry_is_screened_on_one_rest_snapshot_not_the_stream(self):
+        # A stale stream bid far under the stop would refuse this entry if
+        # the spread gate still read it; the snapshot's bid clears the stop.
+        t, client = self._trader(live=True, ask=0.50, bid=0.50)
+        t._market_data.bids = lambda rnd, side: [(0.10, 100.0)]
+        t._maybe_enter(100.0, "LIVE")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
     # -- sizing: the fraction, floored at the venue minimum ---------------
 
     def test_the_stake_is_the_fraction_when_it_clears_the_minimum(self):
@@ -1823,6 +1847,20 @@ class TestScalpStops(unittest.TestCase):
         t, client, key = self._armed(0.50, shares=0.004)
         self.assertFalse(t._sell_now(t._positions[key], "stop"))
         self.assertEqual(self._sells(client), [])
+
+    def test_a_fired_stop_logs_the_rest_bid_beside_the_stream_bid(self):
+        """
+        Stops fire on the stream's bid. Whether that bid was real is the
+        question the crossed books raised, so every trigger records a REST
+        bid read at the same moment.
+        """
+        _, stop = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        t, client, key = self._armed(stop)
+        with self.assertLogs(level="INFO") as logs:
+            t._check_stops()
+        text = "\n".join(logs.output)
+        self.assertIn("stream bid", text)
+        self.assertIn("REST bid", text)
 
     def test_a_bid_at_the_take_profit_sells_the_position(self):
         tp, _ = m.bracket_prices(0.50, 200, 0.05, 0.05)

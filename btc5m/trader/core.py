@@ -32,6 +32,7 @@ from btc5m.trader.scalp import ScalpMixin
 from btc5m.trader.settling import SettlementMixin
 from btc5m.trader.straddle import StraddleMixin
 from btc5m.venue.client import PredictionClient
+from btc5m.venue.shadow import ShadowClient
 from btc5m.volatility import VolatilityEstimator
 
 from typing import TYPE_CHECKING
@@ -73,7 +74,11 @@ class Trader(
         # its own, so reading cfg.db_path off the argument would fail; every
         # later read goes through the _cfg property and sees reloads.
         config = self._resolve(cfg)
-        self._client = PredictionClient(cfg)
+        # Shadow runs the live path with its writes simulated, so the choice
+        # is made once, here, and every live branch below stays the live one.
+        client_type = (ShadowClient if config.live and config.shadow
+                       else PredictionClient)
+        self._client = client_type(cfg)
         self._market_data = ws_feeds.MarketData(
             self._client, self._store or self._static_cfg)
         self._vol = VolatilityEstimator(cfg, self._market_data)
@@ -162,6 +167,13 @@ class Trader(
     def _orders(self):
         """The venue in live mode, the simulator in paper mode."""
         return self._client if self._live else self._paper_book
+
+    @property
+    def _mode_label(self) -> str:
+        """LIVE, SHADOW or PAPER -- what the journal and the log call a trade."""
+        if not self._live:
+            return "PAPER"
+        return "SHADOW" if isinstance(self._client, ShadowClient) else "LIVE"
 
     @property
     def _position(self) -> Position | None:
@@ -256,7 +268,7 @@ class Trader(
 
         self._account_risk = RiskManager(self._store or self._cfg, bankroll)
         LOG.info("Starting %s mode. Bankroll %.2f USDT. Markets: %s",
-                 "LIVE" if self._live else "PAPER",
+                 self._mode_label,
                  bankroll, ", ".join(self._cfg.symbols) or
                  "every 5m up/down market (auto-discovered)")
         last_sync = time.time()
@@ -304,7 +316,7 @@ class Trader(
                     self._apply_pending_mode()
                     self._maybe_scale_in_all(bankroll)
                     self._maybe_enter(bankroll,
-                                      "LIVE" if self._live else "PAPER")
+                                      self._mode_label)
                     # Subscriptions follow the markets actually in
                     # play, and are set AFTER discovery rather than
                     # before it. Config.symbols defaults to empty --
