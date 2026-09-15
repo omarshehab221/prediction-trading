@@ -137,9 +137,31 @@ PROFILES: dict[str, dict] = {
               # cannot drift into disagreeing about the same number. 10% of
               # bankroll, floored at min_stake_usdt when that falls short.
               "scalp_stake_pct": 0.10, "max_stake_pct": 0.10,
-              # The bracket: 5% profit or 5% loss on the position -- a
-              # different number from the stake above, not a second stake.
-              "scalp_take_profit_pct": 0.05, "scalp_stop_loss_pct": 0.05,
+              # The bracket: 12% profit or 5% loss on the position -- P&L
+              # targets, not price moves, and a different number from the
+              # stake above rather than a second stake.
+              #
+              # ASYMMETRIC BECAUSE THE TWO LEGS DO NOT COST THE SAME.
+              # Both sell through the bid, but the take-profit fires into a
+              # rising book and lands on its target, while the stop fires
+              # into a falling one and overshoots. Measured over 29 sales in
+              # the 2026-09-15 shadow session: wins averaged +5.2% against a
+              # 5% target, losses -11.7% against a 5% one, at a 52% hit rate
+              # -- about -3% a trade. A win has to be worth roughly a
+              # realised loss for that to break even.
+              #
+              # This widens the target rather than fixing the overshoot, so
+              # it is a measurement, not a cure: a 12% target is reached less
+              # often than a 5% one, and the arithmetic says the hit rate
+              # falls about as fast as the size grows. The overshoot itself
+              # -- max_slippage_bps on the exit, or resting the exit inside
+              # the spread instead of crossing it -- is the number that
+              # actually decides whether this profile can pay for itself.
+              #
+              # It also loosens signal_edge_required: 0.118 hit-rate points
+              # over a coin flip at 200 bps, where the symmetric pair needed
+              # 0.20, so markets the fee gate used to refuse now pass it.
+              "scalp_take_profit_pct": 0.12, "scalp_stop_loss_pct": 0.05,
               "scalp_lookback_ms": 1500.0, "scalp_min_move_bps": 1.0,
               "scalp_min_basis_bps": 0.0, "scalp_max_tick_age_ms": 2000.0,
               "scalp_cooldown_s": 2.0, "scalp_max_entries_per_round": 20,

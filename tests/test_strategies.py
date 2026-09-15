@@ -1364,10 +1364,15 @@ class TestScalpEntry(unittest.TestCase):
         self.assertEqual(t._positions, {})
 
     def test_the_bracket_is_armed_at_the_prices_the_fill_implies(self):
+        # From the profile's own pair rather than a literal: the bracket is
+        # asymmetric now and will be tuned again, and a hardcoded target
+        # tests the number that was true when it was written.
+        c = scalp_cfg()
         t, _ = self._trader()
         t._maybe_enter(100.0, "PAPER")
         bracket = t._brackets[("BTCUSDT", Side.UP)]
-        expected = m.bracket_prices(0.50, 200, 0.05, 0.05)
+        expected = m.bracket_prices(0.50, 200, c.scalp_take_profit_pct,
+                                    c.scalp_stop_loss_pct)
         self.assertAlmostEqual(bracket.tp_price, round(expected[0], 4))
         self.assertAlmostEqual(bracket.stop_price, expected[1])
         self.assertAlmostEqual(bracket.entry_price, 0.50)
@@ -1454,8 +1459,16 @@ class TestScalpEntry(unittest.TestCase):
         self.assertEqual(t._positions, {})
 
     def test_a_fee_that_demands_too_much_signal_is_refused(self):
-        """The gate the whole profile's economics hang on."""
-        rnd = make_round(fee_bps=400)
+        """
+        The gate the whole profile's economics hang on.
+
+        450 bps, not 400: the asymmetric bracket needs a smaller edge than
+        the symmetric one did -- 0.118 hit-rate points at 200 bps where 5/5
+        needed 0.20 -- so 400 now passes the 0.25 ceiling and the entry is
+        refused further down instead. Above 500 the stop stops existing at
+        all and the gate answers "no reachable", which is a different branch.
+        """
+        rnd = make_round(fee_bps=450)
         now = rnd.end_ms - 200_000
         client = ScalpClient([rnd], [(now, 100_000.0)],
                              {(1, Side.UP): [(0.50, 10_000)]}, {})
@@ -1578,33 +1591,44 @@ class TestScalpEntry(unittest.TestCase):
     def _buys(self, client):
         return [o for o in client.orders if o[1] is m.Action.BUY]
 
-    def test_a_quote_far_below_the_book_is_not_traded(self):
+    def test_a_quote_below_the_book_is_traded(self):
         """
-        Live, an ETH UP buy was quoted and sent at 0.39 while the book asked
-        0.60; the venue answered "Failed to execute the market order", and
-        five seconds later the same side filled at 0.59. Half the session's
-        buys failed like that, and one that did fill executed at 0.36 under
-        a 0.43 bid, which put its stop above the real entry. A quote further
-        from the book's ask than the order's own slippage cap is skipped.
+        A quote under the ask is a BETTER price, and the measurements say so.
+
+        The first guard refused any quote further from the ask than the
+        slippage cap, in either direction. Across 86 skips in the shadow
+        session 77 were quotes below the ask, median 11% below, on all three
+        markets; and in the live session every buy that passed the guard
+        filled, while the one that failed had been quoted at 0.5400 with the
+        ask also 0.5400 -- no gap at all. The gap does not predict the
+        failure, and the asks themselves jump (0.32 to 0.46 in two seconds)
+        on books this thin. Nothing downstream depends on the quote either:
+        the entry price and its bracket come from the executed fill.
         """
         t, client = self._trader(live=True, ask=0.50, bid=0.49)
         self._quoting(client, 0.39)
-        with self.assertLogs(level="WARNING") as logs:
-            t._maybe_enter(100.0, "LIVE")
-        self.assertNotIn(("BTCUSDT", Side.UP), t._positions)
-        self.assertEqual(self._buys(client), [])
-        text = "\n".join(logs.output)
-        self.assertIn("0.3900", text)
-        self.assertIn("0.5000", text)
+        t._maybe_enter(100.0, "LIVE")
+        pos = t._positions[("BTCUSDT", Side.UP)]
+        self.assertAlmostEqual(pos.signal.fill_price, 0.39)
+        self.assertEqual(len(self._buys(client)), 1)
 
-    def test_a_quote_far_above_the_book_is_not_traded(self):
-        # A bid high enough that the spread-wider-than-the-stop gate passes:
-        # only the distance from the ask may stop this one.
-        t, client = self._trader(live=True, ask=0.50, bid=0.59)
+    def test_a_quote_above_the_book_is_refused_by_the_stop_gate(self):
+        """
+        Overpaying is refused by the gate that was always going to refuse it.
+
+        A quote over the ask carries its stop up with it -- stop is
+        quote x (1 - stop_loss) / net -- and the bid sits under the ask by
+        definition, so anything more than about 3% above the book puts the
+        stop over the whole book. Live, a UP buy quoted 0.1400 against a
+        0.0600 ask was exactly that shape. A separate gate on the same
+        distance added nothing but a second name for it.
+        """
+        t, client = self._trader(live=True, ask=0.50, bid=0.49)
         self._quoting(client, 0.60)
         t._maybe_enter(100.0, "LIVE")
         self.assertNotIn(("BTCUSDT", Side.UP), t._positions)
         self.assertEqual(self._buys(client), [])
+        self.assertIn("spread", t._watching[1][1])
 
     def test_a_failed_buy_logs_its_quote_and_the_book(self):
         """

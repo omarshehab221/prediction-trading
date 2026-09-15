@@ -632,11 +632,17 @@ class TestScalpProfile(unittest.TestCase):
         c = self._c()
         self.assertLessEqual(c.scalp_flatten_s, 60.0)
 
-    def test_the_bracket_is_the_five_percent_that_was_asked_for(self):
+    def test_the_bracket_is_the_asymmetric_pair_that_was_asked_for(self):
+        """
+        12 up, 5 down. Both legs sell through the bid, but the stop fires
+        into a falling book and overshoots: live, wins landed on their 5%
+        target while losses averaged 11.7% against the same 5%.
+        """
         c = self._c()
-        self.assertAlmostEqual(c.scalp_take_profit_pct, 0.05)
+        self.assertAlmostEqual(c.scalp_take_profit_pct, 0.12)
         self.assertAlmostEqual(c.scalp_stop_loss_pct, 0.05)
-        # The stake is 10% of bankroll; the 5% above is the bracket.
+        self.assertGreater(c.scalp_take_profit_pct, c.scalp_stop_loss_pct)
+        # The stake is 10% of bankroll; the pair above is the bracket.
         self.assertAlmostEqual(c.scalp_stake_pct, 0.10)
 
     def test_the_stake_cap_and_the_scalp_stake_agree(self):
