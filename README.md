@@ -231,6 +231,7 @@ the model; `straddle`, `scalp` and `lastminute` do not consult it at all.
 | `straddle` | both sides | 20% per leg | — | 60s from open | $100 |
 | `scalp` | 0.15–0.85 | 5% per round trip | — | 300–75s, flat at 60s | $100 |
 | `lastminute` *(default)* | any | 10% per round | — | 60–5s | $100 |
+| `hybrid` | straddle, else 0.55–0.80 | 20% per leg / 10%, floored at $1 | ≥0.75σ | 60s from open, then 240–30s | $10 |
 
 **`buffer`** encodes "wait for a buffer to open, back the side it favours,
 press it while the market has inertia — and refuse any price whose win is too
@@ -260,6 +261,15 @@ about the fee before running it.
 
 **`lastminute`** is described in §6.3. It is the only profile that reads
 nothing but the price.
+
+**`hybrid`** layers three profiles in one round. The first minute is
+`straddle`'s, unchanged. A market with no leg after that is offered to
+`buffer`'s gates, unchanged. Anything open that can still lose, whether a buffer
+position or a first leg whose partner never came, carries a stop 25% under its
+executed price, disarmed in the last 45 seconds. A completed pair is never
+stopped. There is no take-profit. Both stakes floor at the $1 minimum instead of
+refusing a small balance, which at $3 means betting a third of it. See
+`docs/superpowers/specs/2026-09-16-hybrid-profile-design.md`.
 
 ### 6.1 The return floor (`buffer` only)
 

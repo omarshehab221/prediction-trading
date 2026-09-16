@@ -58,7 +58,7 @@ DB_PATH="${DB_PATH:-/var/data/$DEFAULT_DB}"
 # regenerating /var/data/config.json as well as setting this.
 PROFILE="${PROFILE:-scalp}"
 case "$PROFILE" in
-  scalp|straddle|last_minute|model|buffer) ;;
+  scalp|straddle|last_minute|model|buffer|hybrid) ;;
   *) echo "FATAL: unknown PROFILE '$PROFILE'" >&2; exit 1 ;;
 esac
 
