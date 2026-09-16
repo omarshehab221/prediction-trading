@@ -57,6 +57,12 @@ def kelly_stake(bankroll: float, model_prob: float, price: float,
     if stake >= cfg.min_stake_usdt:
         return stake
 
+    if cfg.hybrid:
+        # Asked for: the hybrid profile trades a balance whose stake fraction
+        # sizes under the venue minimum, at the minimum, even where that is
+        # past the hard cap and 2x Kelly. The caller logs the over-bet.
+        return cfg.min_stake_usdt if bankroll >= cfg.min_stake_usdt else 0.0
+
     if not cfg.round_up_to_minimum:
         return 0.0
 
@@ -137,7 +143,13 @@ def boosted_stake(stake: float, bankroll: float, model_prob: float,
         full_kelly = (model_prob * b - (1.0 - model_prob)) / b
         if full_kelly > 0:
             ceiling = min(ceiling, bankroll * 2.0 * full_kelly)
-    return min(stake * cfg.trend_stake_multiple, ceiling)
+    boosted = min(stake * cfg.trend_stake_multiple, ceiling)
+    if cfg.hybrid:
+        # The ceiling is the ruin bound on the BOOST. Below a floored stake
+        # it would cut the order under the venue minimum, which is not a
+        # smaller bet but no bet.
+        return max(boosted, stake)
+    return boosted
 
 
 def max_topup_within_blend(committed: float, avg_price: float,

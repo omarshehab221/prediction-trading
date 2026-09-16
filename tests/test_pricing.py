@@ -19,7 +19,7 @@ from btc_5m_predictor import (
     settle_pnl,
     walk_book,
 )
-from tests.support import cfg, convex_cfg
+from tests.support import cfg, convex_cfg, hybrid_cfg
 
 class TestDigitalPricing(unittest.TestCase):
 
@@ -734,3 +734,37 @@ class TestSmallAccountSizing(unittest.TestCase):
         b = (1 - p) / p
         g = q * math.log(1 + b * f) + (1 - q) * math.log(1 - f)
         self.assertGreater(g, 0.0)
+
+
+class TestHybridStakeFloor(unittest.TestCase):
+    """10% of a balance under 10.00 is under the 1.00 minimum; hybrid floors."""
+
+    def test_a_small_balance_stakes_the_minimum(self):
+        c = hybrid_cfg()
+        # 6.00 x 10% = 0.60 < 1.00
+        self.assertEqual(m.kelly_stake(6.0, 0.80, 0.65, c, 0), 1.0)
+
+    def test_the_floor_ignores_the_hard_cap_and_the_two_kelly_limit(self):
+        c = hybrid_cfg()
+        # At 3.00, 1.00 is 33% -- past the 25% hard cap. The buffer profile
+        # refuses this; hybrid is asked to take it.
+        buffer = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        self.assertEqual(m.kelly_stake(3.0, 0.72, 0.65, buffer, 0), 0.0)
+        self.assertEqual(m.kelly_stake(3.0, 0.72, 0.65, c, 0), 1.0)
+
+    def test_no_edge_is_still_no_stake(self):
+        c = hybrid_cfg()
+        self.assertEqual(m.kelly_stake(6.0, 0.60, 0.65, c, 0), 0.0)
+
+    def test_a_balance_under_the_minimum_stakes_nothing(self):
+        c = hybrid_cfg()
+        self.assertEqual(m.kelly_stake(0.90, 0.90, 0.65, c, 0), 0.0)
+
+    def test_a_large_balance_is_sized_by_kelly_as_before(self):
+        c = hybrid_cfg()
+        self.assertGreater(m.kelly_stake(100.0, 0.80, 0.65, c, 0), 1.0)
+
+    def test_a_trend_boost_never_shrinks_a_floored_stake(self):
+        c = hybrid_cfg()
+        boosted = m.boosted_stake(1.0, 3.0, 0.72, 0.65, c, 0)
+        self.assertGreaterEqual(boosted, 1.0)

@@ -231,7 +231,10 @@ class ModelEntryMixin:
             if mult is not None and mult > 1.0:
                 LOG.warning("Staking %.2fx the full-Kelly fraction because the "
                             "venue minimum exceeds the Kelly size on a %.2f "
-                            "bankroll", mult, bankroll)
+                            "bankroll%s", mult, bankroll,
+                            f" (stake floored to {sig.stake_usdt:.2f}, "
+                            f"{sig.stake_usdt / bankroll:.0%} of it)"
+                            if self._cfg.hybrid else "")
             LOG.info("ENTER %s %s | fill %.3f model %.3f edge %+.3f "
                      "pays %+.0f%% stake %.2f%s (%.0fs left)%s",
                      rnd.slug, sig.side.value,
