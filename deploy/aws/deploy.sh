@@ -57,11 +57,8 @@ DB_PATH="${DB_PATH:-/var/data/$DEFAULT_DB}"
 # -- entrypoint.sh keeps an existing one -- so switching profiles means
 # regenerating /var/data/config.json as well as setting this.
 PROFILE="${PROFILE:-scalp}"
-# The config is kept once written, so a different profile needs its own file
-# (e.g. CONFIG_PATH=/var/data/config-lock.json) rather than a deleted one.
-CONFIG_PATH="${CONFIG_PATH:-/var/data/config.json}"
 case "$PROFILE" in
-  scalp|straddle|lock|lastminute|balanced|buffer|convex|favorite|micro) ;;
+  scalp|straddle|last_minute|model|buffer) ;;
   *) echo "FATAL: unknown PROFILE '$PROFILE'" >&2; exit 1 ;;
 esac
 
@@ -284,7 +281,7 @@ TASK_DEF="$(cat <<JSON
     "linuxParameters": {"initProcessEnabled": true},
     "mountPoints": [{"sourceVolume": "data", "containerPath": "/var/data"}],
     "environment": [
-      {"name": "CONFIG_PATH", "value": "$CONFIG_PATH"},
+      {"name": "CONFIG_PATH", "value": "/var/data/config.json"},
       {"name": "DB_PATH", "value": "$DB_PATH"},
       {"name": "PROFILE", "value": "$PROFILE"},
       {"name": "TRADING_MODE", "value": "$TRADING_MODE"},
