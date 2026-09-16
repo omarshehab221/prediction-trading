@@ -150,8 +150,18 @@ The EFS `config.json` embeds `PROFILES`, so a deploy must regenerate it.
 * `btc5m/config.py`: fields, validation.
 * `btc5m/profiles.py`: `hybrid` entry, commented like its neighbours.
 * `btc5m/trader/hybrid.py` (new): `HybridMixin._maybe_enter_hybrid` calls
-  straddle entry, then model entry; `_arm_hybrid_stop` / `_disarm_hybrid_stop`;
-  the small-balance floor helpers.
+  straddle entry, then model entry. `_sync_hybrid_stops` runs once per loop
+  pass and makes the brackets match the positions: it arms any unpaired
+  position, re-arms after a top-up, drops completed pairs, and never re-arms a
+  stop that has already fired. That replaces separate arm/disarm calls at four
+  entry points.
+* Two existing behaviours would starve the buffer layer and are gated off for
+  hybrid. First, the straddle path writes every round past its opening minute
+  into `_seen`, which the model path skips. Second, a trend widens buffer's
+  window past 240 s into the straddle minute, so the model path also refuses a
+  round younger than `straddle_entry_window_s`.
+* `max_consecutive_losses: 30`, not buffer's 6: every completed pair settles
+  one leg as a loss.
 * `btc5m/trader/core.py`: a `hybrid` branch first in `_maybe_enter`; mixin
   added.
 * `btc5m/trader/scalp.py`: `_check_stops` runs for hybrid and honours the
@@ -160,8 +170,11 @@ The EFS `config.json` embeds `PROFILES`, so a deploy must regenerate it.
   `2 x min` first-leg check, floored completion stake. All gated on
   `cfg.hybrid`, so the `straddle` profile's behaviour does not change. Arm the
   stop on first-leg fill and disarm it on completion.
-* `btc5m/sizing.py`: `kelly_stake` gains a `floor_to_minimum` path used only
-  by hybrid; the default path is unchanged.
+* `btc5m/sizing.py`: `kelly_stake` floors to the minimum when `cfg.hybrid`
+  (it is reached through `assess`, so a flag on the config is the only seam
+  that needs no signature change). `boosted_stake` never shrinks a hybrid
+  stake below its input. `straddle_completion_band` is extracted, so a floored
+  completion can be re-tested. Other profiles' paths are unchanged.
 * `btc5m/trader/model_entry.py`, `btc5m/trader/scale_in.py`: record delivered
   shares; arm or re-arm the stop from the executed or blended price.
 * `btc5m/probes.py`: hybrid preflight lines.
