@@ -2258,3 +2258,114 @@ class TestHybridStraddleFloor(unittest.TestCase):
         self.assertIn(("BTCUSDT", Side.DOWN), t._positions)
         self.assertAlmostEqual(
             t._positions[("BTCUSDT", Side.DOWN)].committed_usdt, 1.0)
+
+
+class TestHybridStops(unittest.TestCase):
+
+    START = 1_700_000_000_000
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+
+    def tearDown(self):
+        _close_journals(self)
+        os.unlink(self.db)
+
+    def _trader(self, bid, now_offset_s=100, **kw):
+        rnd = make_round(start_ms=self.START,
+                         end_ms=self.START + m.DEFAULT_ROUND_SECONDS * 1000)
+        now = self.START + now_offset_s * 1000
+        client = ScalpClient([rnd], [(now, 100_000.0)], {}, {},
+                             bids={(1, Side.UP): [(bid, 10_000)],
+                                   (1, Side.DOWN): [(bid, 10_000)]})
+        t = build_trader(client, hybrid_cfg(db_path=self.db, **kw), self.db)
+        return t, client, rnd
+
+    def _hold(self, t, rnd, side, price, prob=0.80, stake=1.0):
+        sig = Signal(side, prob, price, 0.02, stake, 200.0)
+        tid = t._journal.record("PAPER", rnd, sig, 0.0, 0.0, 10.0)
+        t._positions[("BTCUSDT", side)] = Position(tid, rnd, sig, stake, 1)
+        return ("BTCUSDT", side)
+
+    def _sold(self, t):
+        return [p for p in t._pending.values()
+                if p.plan.action is m.Action.SELL]
+
+    def test_a_buffer_position_is_stopped_25_percent_under_entry(self):
+        t, _, rnd = self._trader(bid=0.52)
+        key = self._hold(t, rnd, Side.UP, 0.70)
+        t._sync_hybrid_stops()
+        self.assertAlmostEqual(t._brackets[key].stop_price, 0.525, places=3)
+        t._check_stops()
+        self.assertEqual(len(self._sold(t)), 1)
+
+    def test_a_bid_above_the_stop_sells_nothing(self):
+        t, _, rnd = self._trader(bid=0.60)
+        self._hold(t, rnd, Side.UP, 0.70)
+        t._sync_hybrid_stops()
+        t._check_stops()
+        self.assertEqual(self._sold(t), [])
+
+    def test_there_is_no_take_profit(self):
+        t, _, rnd = self._trader(bid=0.99)
+        self._hold(t, rnd, Side.UP, 0.70)
+        t._sync_hybrid_stops()
+        t._check_stops()
+        self.assertEqual(self._sold(t), [])
+
+    def test_an_unpaired_straddle_leg_is_stopped(self):
+        t, _, rnd = self._trader(bid=0.25)
+        key = self._hold(t, rnd, Side.UP, 0.35, prob=0.5)
+        t._sync_hybrid_stops()
+        self.assertIn(key, t._brackets)
+        t._check_stops()
+        self.assertEqual(len(self._sold(t)), 1)
+
+    def test_a_completed_pair_is_never_stopped(self):
+        t, _, rnd = self._trader(bid=0.05)
+        up = self._hold(t, rnd, Side.UP, 0.35, prob=0.5)
+        t._sync_hybrid_stops()
+        self.assertIn(up, t._brackets)           # armed while unpaired
+        self._hold(t, rnd, Side.DOWN, 0.30, prob=0.5)
+        t._sync_hybrid_stops()
+        self.assertEqual(t._brackets, {})        # disarmed once paired
+        t._check_stops()
+        self.assertEqual(self._sold(t), [])
+
+    def test_no_stop_fires_inside_the_disarm_window(self):
+        # 260s into a 300s round: 40s left, inside the 45s window.
+        t, _, rnd = self._trader(bid=0.10, now_offset_s=260)
+        self._hold(t, rnd, Side.UP, 0.70)
+        t._sync_hybrid_stops()
+        t._check_stops()
+        self.assertEqual(self._sold(t), [])
+
+    def test_a_fired_stop_is_not_re_armed(self):
+        t, _, rnd = self._trader(bid=0.50)
+        self._hold(t, rnd, Side.UP, 0.70)
+        t._sync_hybrid_stops()
+        t._check_stops()
+        t._sync_hybrid_stops()
+        t._check_stops()
+        self.assertEqual(len(self._sold(t)), 1)
+
+    def test_a_top_up_re_arms_from_the_blended_price(self):
+        t, _, rnd = self._trader(bid=0.60)
+        key = self._hold(t, rnd, Side.UP, 0.70)
+        t._sync_hybrid_stops()
+        pos = t._positions[key]
+        t._positions[key] = replace(
+            pos, signal=replace(pos.signal, fill_price=0.74),
+            committed_usdt=2.0, tranches=2)
+        t._sync_hybrid_stops()
+        self.assertAlmostEqual(t._brackets[key].entry_price, 0.74)
+        self.assertAlmostEqual(t._brackets[key].stop_price, 0.555, places=3)
+
+    def test_the_scalp_profile_arms_nothing_through_this_path(self):
+        rnd = make_round()
+        client = ScalpClient([rnd], [(rnd.end_ms - 200_000, 1.0)], {}, {})
+        t = build_trader(client, scalp_cfg(db_path=self.db), self.db)
+        self._hold(t, rnd, Side.UP, 0.70)
+        t._sync_hybrid_stops()
+        self.assertEqual(t._brackets, {})

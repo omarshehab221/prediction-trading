@@ -512,12 +512,19 @@ class ScalpMixin:
         the "cancel the other one" half of the pair, in the direction where
         there is nothing to cancel.
         """
-        if not self._cfg.scalp:
+        if not (self._cfg.scalp or self._cfg.hybrid):
             return
+        now_ms = self._client.now_ms()
         for key, bracket in list(self._brackets.items()):
             pos = self._positions.get(key)
             if pos is None:
                 self._brackets.pop(key, None)
+                continue
+            if (self._cfg.hybrid and pos.rnd.seconds_remaining(now_ms)
+                    <= self._cfg.hybrid_stop_disarm_s):
+                # The last seconds of a round have the thinnest book; a sale
+                # there turns a coin flip into a certain loss. The bracket
+                # stays so nothing re-arms it, and the position settles.
                 continue
             bids = self._market_data.bids(pos.rnd, pos.signal.side)
             if not bids:
@@ -545,6 +552,8 @@ class ScalpMixin:
             # Both legs are watched prices, so nothing rests and there is
             # nothing to cancel first: the sale goes out on the pass that
             # sees the price.
+            if self._cfg.hybrid:
+                self._hybrid_stopped.add(pos.trade_id)
             self._brackets.pop(key, None)
             self._sell_now(pos, leg)
 

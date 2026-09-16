@@ -122,6 +122,10 @@ class Trader(
         # _seen, and doing that here would cap this profile at one trade in
         # the five minutes it exists to trade repeatedly.
         self._brackets: dict[tuple[str, Side], Bracket] = {}
+        # Hybrid: trade ids whose stop has already fired. A stop sells once;
+        # re-arming it on the next pass would send a second sale of shares
+        # the first one is still selling.
+        self._hybrid_stopped: set[int] = set()
         # topic_id -> (end_ms, entries taken on this round).
         self._scalp_entries: dict[int, tuple[int, int]] = {}
         self._flattened: set[int] = set()
@@ -302,6 +306,7 @@ class Trader(
                     # own stop; before the flatten, so a stop that is due
                     # fires at its own price rather than at whatever the
                     # deadline can reach.
+                    self._sync_hybrid_stops()
                     self._check_stops()
                     self._flatten_scalps()
                     self._maybe_exit_all()
