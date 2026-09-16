@@ -407,7 +407,12 @@ class StraddleMixin:
             runway = self._cfg.straddle_hedge_deadline_s * 2.0
             if (since_open > self._cfg.straddle_entry_window_s
                     or raw.seconds_remaining(now_ms) <= runway):
-                self._seen[raw.topic_id] = raw.end_ms
+                # Hybrid hands this round to the buffer layer, which reads
+                # the same _seen: writing it off here would mean buffer never
+                # sees a round at all. A round a leg was OPENED on is still
+                # written off, by _open_first_leg, and stays off to both.
+                if not self._cfg.hybrid:
+                    self._seen[raw.topic_id] = raw.end_ms
                 continue
 
             priced = {side: self._book_price(raw, side)

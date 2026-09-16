@@ -24,6 +24,7 @@ from btc5m.trader.accounting import AccountingMixin
 from btc5m.trader.bookkeeping import BookkeepingMixin
 from btc5m.trader.claims import ClaimsMixin
 from btc5m.trader.exits import ExitsMixin
+from btc5m.trader.hybrid import HybridMixin
 from btc5m.trader.last_minute import LastMinuteMixin
 from btc5m.trader.model_entry import ModelEntryMixin
 from btc5m.trader.order_lifecycle import OrderLifecycleMixin
@@ -49,6 +50,7 @@ class Trader(
         ExitsMixin,
         SettlementMixin,
         ScaleInMixin,
+        HybridMixin,
         StraddleMixin,
         ModelEntryMixin,
         LastMinuteMixin,
@@ -407,7 +409,9 @@ class Trader(
 
     def _maybe_enter(self, bankroll: float, mode: str) -> None:
         """Dispatch to whichever entry strategy the config selects."""
-        if self._cfg.straddle:
+        if self._cfg.hybrid:
+            self._maybe_enter_hybrid(bankroll, mode)
+        elif self._cfg.straddle:
             self._maybe_enter_straddle(bankroll, mode)
         elif self._cfg.last_minute:
             self._maybe_enter_last_minute(bankroll, mode)

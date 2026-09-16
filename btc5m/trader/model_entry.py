@@ -55,6 +55,12 @@ class ModelEntryMixin:
             # the same bet twice, not diversification.
             if any(k[0] == raw.symbol for k in self._positions):
                 continue
+            # The first straddle_entry_window_s of a round are the straddle
+            # layer's. A trend widens buffer's own window past 240s, so the
+            # window setting alone cannot keep the two apart.
+            if (self._cfg.hybrid and (now_ms - raw.start_ms) / 1000.0
+                    <= self._cfg.straddle_entry_window_s):
+                continue
             try:
                 self._risk_for(raw.symbol).check(bankroll)
             except TradingHalted as exc:

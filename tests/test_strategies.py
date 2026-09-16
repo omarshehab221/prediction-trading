@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from dataclasses import replace
 
 import btc_5m_predictor as m
 from btc_5m_predictor import Position, Side, Signal, breakeven_probability
@@ -15,6 +16,7 @@ from tests.support import (
     _close_journals,
     build_trader,
     cfg,
+    hybrid_cfg,
     lastminute_cfg,
     make_pending,
     make_round,
@@ -2084,3 +2086,91 @@ class TestScalpFlatten(unittest.TestCase):
         t._static_cfg = cfg(db_path=self.db)
         t._flatten_scalps()
         self.assertEqual(client.cancelled, [])
+
+
+class TestHybridEntry(unittest.TestCase):
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+
+    def tearDown(self):
+        _close_journals(self)
+        os.unlink(self.db)
+
+    def _trader(self, client, **kw):
+        return build_trader(client, hybrid_cfg(db_path=self.db, **kw),
+                            self.db)
+
+    def test_dispatch_runs_straddle_then_model(self):
+        t = self._trader(FakeClient([], [(0, 100_000.0)], {}, {}))
+        calls = []
+        t._maybe_enter_straddle = lambda *a: calls.append("straddle")
+        t._maybe_enter_model = lambda *a: calls.append("model")
+        t._maybe_enter_scalp = lambda *a: calls.append("scalp")
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(calls, ["straddle", "model"])
+
+    def test_a_round_past_the_straddle_window_is_not_marked_seen(self):
+        """
+        The straddle path writes a round off once its opening minute has
+        passed. In hybrid that write would also hide the round from buffer,
+        which reads the same _seen, so buffer would never trade.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(start_ms=start,
+                         end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
+        books = {(1, Side.UP): [(0.70, 10_000)],
+                 (1, Side.DOWN): [(0.70, 10_000)]}
+        client = FakeClient([rnd], [(start + 90_000, 100_000.0)], books, {})
+        t = self._trader(client)
+        t._maybe_enter_straddle(100.0, "PAPER")
+        self.assertNotIn(1, t._seen)
+
+    def test_the_straddle_profile_still_writes_that_round_off(self):
+        start = 1_700_000_000_000
+        rnd = make_round(start_ms=start,
+                         end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
+        books = {(1, Side.UP): [(0.70, 10_000)],
+                 (1, Side.DOWN): [(0.70, 10_000)]}
+        client = FakeClient([rnd], [(start + 90_000, 100_000.0)], books, {})
+        t = build_trader(client, straddle_cfg(db_path=self.db), self.db)
+        t._maybe_enter_straddle(100.0, "PAPER")
+        self.assertIn(1, t._seen)
+
+    def test_buffer_does_not_enter_inside_the_straddle_minute(self):
+        """
+        entry_window_start_s is widened to the whole round so the window
+        cannot be what refuses -- as a trend widening it would -- leaving
+        the straddle-minute guard as the only thing that can. The same round
+        30s later (90s in) must enter, which proves the fixture really is a
+        buffer signal and the first assertion is not passing vacuously.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=65_000.0, start_ms=start, fee_bps=0,
+                         end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
+        books = {(1, Side.UP): [(0.70, 1e6)], (1, Side.DOWN): [(0.75, 1e6)]}
+        client = FakeClient([rnd], [(start + 30_000, 65_400.0),
+                                    (start + 90_000, 65_400.0)], books, {})
+        t = self._trader(client, entry_window_start_s=300)
+        t._maybe_enter_model(100.0, "PAPER")
+        self.assertEqual(t._positions, {})
+        client.t = 1
+        t._maybe_enter_model(100.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.UP), t._positions)
+
+    def test_a_market_holding_a_straddle_leg_gets_no_buffer_entry(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=65_000.0, start_ms=start, fee_bps=0,
+                         end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
+        books = {(1, Side.UP): [(0.30, 1e6)], (1, Side.DOWN): [(0.72, 1e6)]}
+        client = FakeClient([rnd], [(start + 5_000, 65_000.0),
+                                    (start + 120_000, 64_600.0)], books, {})
+        t = self._trader(client)
+        t._maybe_enter(100.0, "PAPER")          # opens the UP leg at 0.30
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+        client.t = 1                             # DOWN now a buffer candidate
+        t._maybe_enter(100.0, "PAPER")
+        self.assertNotIn(("BTCUSDT", Side.DOWN),
+                         {k for k, p in t._positions.items()
+                          if p.signal.model_prob != 0.5})
