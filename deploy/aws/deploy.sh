@@ -58,10 +58,10 @@ DB_PATH="${DB_PATH:-/var/data/$DEFAULT_DB}"
 # regenerating /var/data/config.json as well as setting this.
 PROFILE="${PROFILE:-scalp}"
 # The config is kept once written, so a different profile needs its own file
-# (e.g. CONFIG_PATH=/var/data/config-lock.json) rather than a deleted one.
+# (e.g. CONFIG_PATH=/var/data/config-straddle.json) rather than a deleted one.
 CONFIG_PATH="${CONFIG_PATH:-/var/data/config.json}"
 case "$PROFILE" in
-  scalp|straddle|lock|lastminute|balanced|buffer|convex|favorite|micro) ;;
+  scalp|straddle|lastminute|balanced|buffer|convex|favorite|micro) ;;
   *) echo "FATAL: unknown PROFILE '$PROFILE'" >&2; exit 1 ;;
 esac
 
