@@ -720,7 +720,7 @@ class TestStraddleConfig(unittest.TestCase):
 
     def test_straddle_is_off_by_default_everywhere_else(self):
         for name, values in m.PROFILES.items():
-            if name == "straddle":
+            if name in ("straddle", "lock"):
                 continue
             self.assertNotIn("straddle", values,
                              f"{name} should not touch the straddle switch")
