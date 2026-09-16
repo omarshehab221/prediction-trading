@@ -1123,3 +1123,24 @@ class TestHybridConfig(unittest.TestCase):
         for name, values in m.PROFILES.items():
             if name != "hybrid":
                 self.assertNotIn("hybrid", values, name)
+
+
+class TestHybridHedgeConfig(unittest.TestCase):
+
+    def test_the_profile_carries_the_hedge_numbers(self):
+        c = hybrid_cfg()
+        self.assertEqual(c.hybrid_hedge_min_sigmas, 1.5)
+        self.assertEqual(c.hybrid_hedge_max_stake_pct, 0.20)
+
+    def test_the_hedge_bar_is_stricter_than_buffers_own(self):
+        c = hybrid_cfg()
+        self.assertGreater(c.hybrid_hedge_min_sigmas, c.min_buffer_sigmas)
+
+    def test_hedge_sigmas_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            hybrid_cfg(hybrid_hedge_min_sigmas=0.0)
+
+    def test_hedge_stake_pct_must_be_in_range(self):
+        for bad in (0.0, -0.1, 0.36):
+            with self.assertRaises(ValueError, msg=bad):
+                hybrid_cfg(hybrid_hedge_max_stake_pct=bad)

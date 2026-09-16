@@ -42,7 +42,12 @@ class ScaleInMixin:
             # toward, which is also why straddle+scale_in cannot both be
             # enabled (see Config.__post_init__).
             return
-        for key in list(self._positions):
+        for key, pos in list(self._positions.items()):
+            if (self._cfg.hybrid
+                    and pos.trade_id in self._hybrid_straddle_legs):
+                # A straddle leg or its hedge is sized against its partner;
+                # topping one up toward a model target breaks that sizing.
+                continue
             self._maybe_scale_in(bankroll, key)
 
     def _maybe_scale_in(self, bankroll: float,

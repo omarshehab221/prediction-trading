@@ -201,6 +201,12 @@ class StraddleMixin:
             other = side.other
             if (symbol, other) in self._positions:
                 continue
+            if (self._cfg.hybrid
+                    and pos.trade_id not in self._hybrid_straddle_legs):
+                # A buffer position is one-sided by design, not half of a
+                # pair. "Completing" a 0.70 buffer bet whose other side fell
+                # to 0.20 turns a +43% winner into a small locked profit.
+                continue
             raw = pos.rnd
             seconds_left = raw.seconds_remaining(now_ms)
             if seconds_left <= 0:

@@ -2171,9 +2171,12 @@ class TestHybridEntry(unittest.TestCase):
         self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
         client.t = 1                             # DOWN now a buffer candidate
         t._maybe_enter(100.0, "PAPER")
-        self.assertNotIn(("BTCUSDT", Side.DOWN),
-                         {k for k, p in t._positions.items()
-                          if p.signal.model_prob != 0.5})
+        # DOWN may arrive as the stranded leg's hedge -- this is exactly its
+        # case -- but never as an ordinary buffer entry, which would carry a
+        # stop and be scaled into.
+        down = t._positions.get(("BTCUSDT", Side.DOWN))
+        if down is not None:
+            self.assertIn(down.trade_id, t._hybrid_straddle_legs)
 
 
 class TestHybridStraddleFloor(unittest.TestCase):
@@ -2390,3 +2393,193 @@ class TestHybridStops(unittest.TestCase):
         self._hold(t, rnd, Side.UP, 0.70)
         t._sync_hybrid_stops()
         self.assertEqual(t._brackets, {})
+
+
+class TestHybridHedge(unittest.TestCase):
+    """
+    A straddle leg whose partner never came, hedged on the other side when
+    the buffer there is large -- priced by the buffer gates, not at the
+    deadline.
+    """
+
+    START = 1_700_000_000_000
+    STRIKE = 65_000.0
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+
+    def tearDown(self):
+        _close_journals(self)
+        os.unlink(self.db)
+
+    def _trader(self, spot, down_ask, secs_left=150, leg_price=0.35,
+                leg_stake=2.0, **kw):
+        rnd = make_round(strike=self.STRIKE, start_ms=self.START, fee_bps=0,
+                         end_ms=self.START + m.DEFAULT_ROUND_SECONDS * 1000)
+        now = rnd.end_ms - secs_left * 1000
+        books = {(1, Side.DOWN): [(down_ask, 1e6)],
+                 (1, Side.UP): [(leg_price, 1e6)]}
+        client = FakeClient([rnd], [(now, spot)], books, {})
+        t = build_trader(client, hybrid_cfg(db_path=self.db, **kw), self.db)
+        sig = Signal(Side.UP, 0.5, leg_price, 0.0, leg_stake, 280.0)
+        tid = t._journal.record("PAPER", rnd, sig, 0.0, 0.0, 100.0)
+        t._positions[("BTCUSDT", Side.UP)] = Position(tid, rnd, sig,
+                                                      leg_stake, 1)
+        t._hybrid_straddle_legs.add(tid)
+        return t
+
+    def _hedge(self, t):
+        return t._positions.get(("BTCUSDT", Side.DOWN))
+
+    # -- when it fires ------------------------------------------------------
+
+    def test_a_strong_opposite_buffer_hedges_the_stranded_leg(self):
+        # 64,850 against 65,000 with 150s left is about 2.1 sigmas for DOWN.
+        t = self._trader(spot=64_850.0, down_ask=0.72)
+        t._hedge_stranded_legs(100.0, "PAPER")
+        self.assertIsNotNone(self._hedge(t))
+
+    def test_a_buffer_only_ordinary_buffer_would_take_does_not_hedge(self):
+        # About 1.0 sigma: clears buffer's 0.75, not the hedge's 1.5.
+        t = self._trader(spot=64_930.0, down_ask=0.72)
+        t._hedge_stranded_legs(100.0, "PAPER")
+        self.assertIsNone(self._hedge(t))
+
+    def test_a_buffer_on_the_legs_own_side_does_not_hedge(self):
+        t = self._trader(spot=65_150.0, down_ask=0.72)
+        t._hedge_stranded_legs(100.0, "PAPER")
+        self.assertIsNone(self._hedge(t))
+
+    def test_a_hedge_priced_outside_the_buffer_band_does_not_fire(self):
+        t = self._trader(spot=64_850.0, down_ask=0.85)
+        t._hedge_stranded_legs(100.0, "PAPER")
+        self.assertIsNone(self._hedge(t))
+
+    def test_a_price_that_would_lock_the_round_is_left_to_the_straddle(self):
+        # 0.35 + 0.60 < 1: a completion, which the straddle path owns.
+        t = self._trader(spot=64_850.0, down_ask=0.60)
+        t._hedge_stranded_legs(100.0, "PAPER")
+        self.assertIsNone(self._hedge(t))
+
+    def test_nothing_fires_in_the_last_30_seconds(self):
+        t = self._trader(spot=64_950.0, down_ask=0.72, secs_left=20)
+        t._hedge_stranded_legs(100.0, "PAPER")
+        self.assertIsNone(self._hedge(t))
+
+    def test_nothing_fires_inside_the_straddle_minute(self):
+        t = self._trader(spot=64_700.0, down_ask=0.72, secs_left=270)
+        t._hedge_stranded_legs(100.0, "PAPER")
+        self.assertIsNone(self._hedge(t))
+
+    def test_a_buffer_position_is_never_hedged(self):
+        t = self._trader(spot=64_850.0, down_ask=0.72)
+        t._hybrid_straddle_legs.clear()
+        t._hedge_stranded_legs(100.0, "PAPER")
+        self.assertIsNone(self._hedge(t))
+
+    # -- how big ------------------------------------------------------------
+
+    def test_the_hedge_is_sized_to_pay_back_the_leg(self):
+        t = self._trader(spot=64_850.0, down_ask=0.72)
+        t._hedge_stranded_legs(100.0, "PAPER")
+        wins = m.win_return(0.72, 0)
+        self.assertAlmostEqual(self._hedge(t).committed_usdt, 2.0 / wins,
+                               places=6)
+
+    def test_the_hedge_is_capped_at_20_percent_of_bankroll(self):
+        t = self._trader(spot=64_850.0, down_ask=0.72)
+        t._hedge_stranded_legs(10.0, "PAPER")
+        self.assertAlmostEqual(self._hedge(t).committed_usdt, 2.0)
+
+    def test_a_small_cover_is_floored_at_the_minimum(self):
+        t = self._trader(spot=64_850.0, down_ask=0.72, leg_stake=0.30)
+        t._hedge_stranded_legs(100.0, "PAPER")
+        self.assertAlmostEqual(self._hedge(t).committed_usdt, 1.0)
+
+    def test_no_hedge_when_free_funds_cannot_reach_the_minimum(self):
+        # 3.00 x 0.90 = 2.70 spendable, 2.00 already on the leg: 0.70 free.
+        t = self._trader(spot=64_850.0, down_ask=0.72)
+        t._hedge_stranded_legs(3.0, "PAPER")
+        self.assertIsNone(self._hedge(t))
+
+    # -- after it fills -----------------------------------------------------
+
+    def test_neither_side_of_a_hedged_leg_is_ever_stopped(self):
+        t = self._trader(spot=64_850.0, down_ask=0.72)
+        t._hedge_stranded_legs(100.0, "PAPER")
+        self.assertIsNotNone(self._hedge(t))
+        t._sync_hybrid_stops()
+        self.assertEqual(t._brackets, {})
+
+    def test_the_hybrid_pass_hedges_between_straddle_and_buffer(self):
+        t = self._trader(spot=64_850.0, down_ask=0.72)
+        calls = []
+        t._maybe_enter_straddle = lambda *a: calls.append("straddle")
+        t._hedge_stranded_legs = lambda *a: calls.append("hedge")
+        t._maybe_enter_model = lambda *a: calls.append("model")
+        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(calls, ["straddle", "hedge", "model"])
+
+
+class TestHybridLegsAreLeftAlone(unittest.TestCase):
+    """Two paths that used to reach positions hybrid never meant them to."""
+
+    START = 1_700_000_000_000
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+
+    def tearDown(self):
+        _close_journals(self)
+        os.unlink(self.db)
+
+    def _one_sided(self, as_leg, up_price=0.35, down_ask=0.20, secs_left=100,
+                   spot=65_000.0, model_prob=None):
+        rnd = make_round(strike=65_000.0, start_ms=self.START, fee_bps=0,
+                         end_ms=self.START + m.DEFAULT_ROUND_SECONDS * 1000)
+        now = rnd.end_ms - secs_left * 1000
+        books = {(1, Side.DOWN): [(down_ask, 1e6)],
+                 (1, Side.UP): [(up_price, 1e6)]}
+        client = FakeClient([rnd], [(now, spot)], books, {})
+        t = build_trader(client, hybrid_cfg(db_path=self.db), self.db)
+        prob = model_prob if model_prob is not None else (
+            0.5 if as_leg else 0.80)
+        # 4.00, so the completion's ideal stake clears the 1.00 floor and
+        # sits inside the lock band -- at 2.00 the floored stake overshoots
+        # the band and nothing is bought whatever the fix does.
+        sig = Signal(Side.UP, prob, up_price, 0.0, 4.0, 200.0)
+        tid = t._journal.record("PAPER", rnd, sig, 0.0, 0.0, 100.0)
+        t._positions[("BTCUSDT", Side.UP)] = Position(tid, rnd, sig, 4.0, 1)
+        if as_leg:
+            t._hybrid_straddle_legs.add(tid)
+        return t
+
+    def test_a_straddle_leg_is_still_completed(self):
+        t = self._one_sided(as_leg=True)
+        t._complete_half_straddles(100.0, "PAPER", t._client.now_ms())
+        self.assertIn(("BTCUSDT", Side.DOWN), t._positions)
+
+    def test_a_buffer_position_is_never_completed_as_a_straddle(self):
+        """
+        Before: a buffer bet at 0.70 whose other side fell to 0.20 was
+        "completed", turning a +43% winner into a small locked profit.
+        """
+        t = self._one_sided(as_leg=False, up_price=0.70)
+        t._complete_half_straddles(100.0, "PAPER", t._client.now_ms())
+        self.assertNotIn(("BTCUSDT", Side.DOWN), t._positions)
+
+    def test_a_straddle_leg_is_never_scaled_into(self):
+        # Spot well above strike and UP now in buffer's band: scale-in would
+        # top it up if it were a buffer position.
+        t = self._one_sided(as_leg=True, up_price=0.70, spot=65_300.0,
+                            model_prob=0.70)
+        t._maybe_scale_in_all(100.0)
+        self.assertEqual(t._positions[("BTCUSDT", Side.UP)].tranches, 1)
+
+    def test_a_buffer_position_is_still_scaled_into(self):
+        t = self._one_sided(as_leg=False, up_price=0.70, spot=65_300.0,
+                            model_prob=0.70)
+        t._maybe_scale_in_all(100.0)
+        self.assertEqual(t._positions[("BTCUSDT", Side.UP)].tranches, 2)

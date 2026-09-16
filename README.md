@@ -266,8 +266,10 @@ nothing but the price.
 `straddle`'s, unchanged. A market with no leg after that is offered to
 `buffer`'s gates, unchanged. A buffer position carries a stop 25% under its
 executed price, disarmed in the last 45 seconds. Straddle legs are never stopped,
-paired or not: a first leg that never finds its partner rides to settlement, as
-in `straddle`. There is no take-profit. Both stakes floor at the $1 minimum instead of
+paired or not. A first leg that never finds its partner rides to settlement, unless
+the other side's buffer reaches 1.5σ while it still clears buffer's gates. Then it
+is hedged there, sized to pay the leg back (capped at 20% of bankroll). There is no
+take-profit. Both stakes floor at the $1 minimum instead of
 refusing a small balance, which at $3 means betting a third of it. See
 `docs/superpowers/specs/2026-09-16-hybrid-profile-design.md`.
 

@@ -47,8 +47,31 @@ Seconds are "remaining in the 5-minute round".
    completion. A leg that never finds its partner now rides to settlement, as
    it does in the `straddle` profile.
 
-One market therefore holds either a straddle or a buffer position in a round,
-never both.
+4. **Between the two: the strategic hedge.** *Added 2026-09-17.* A straddle
+   leg whose partner never came is hedged on the other side when the market
+   has all but decided against it, not at the deadline. It fires when all of
+   these hold:
+   * the leg is unpaired, and the straddle's own completion could not lock the
+     round. A hedge price that would lock it is left to the straddle path,
+     which runs first;
+   * the round is past the straddle minute and outside the last 30 s;
+   * every buffer gate passes on the other side (band, 25% return, edge), with
+     the buffer at least `hybrid_hedge_min_sigmas` (1.5, twice buffer's 0.75)
+     in that side's favour.
+
+   It is sized so a hedge win pays back the leg's stake, capped at
+   `hybrid_hedge_max_stake_pct` (20%) of bankroll and at free funds, floored at
+   the $1 minimum. A capped hedge still covers part of the loss. The hedge and
+   the leg are a pair afterwards: neither is stopped or scaled into.
+
+   The same change fixed two paths that reached positions hybrid never meant
+   them to. Straddle completion treated a one-sided *buffer* position as half
+   a straddle and would buy its other side, turning a +43% winner into a small
+   locked profit. Scale-in topped up straddle legs once the model favoured
+   them. Both now act only on the positions they were written for.
+
+One market therefore holds either a straddle pair (legs, completion or hedge)
+or a buffer position in a round, never both.
 
 ## The stop
 

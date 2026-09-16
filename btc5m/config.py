@@ -518,6 +518,17 @@ class Config:
     # Inside this many seconds before settlement no stop fires. The book is
     # thinnest there, and a sale turns a coin flip into a certain loss.
     hybrid_stop_disarm_s: float = 45.0
+    # A straddle leg whose partner never came is hedged on the other side --
+    # before the deadline, at a price the buffer gates chose -- when the
+    # buffer there is at least this many sigmas. Stricter than
+    # min_buffer_sigmas on purpose: this bets against a position already
+    # held, so it wants the market to have all but decided.
+    hybrid_hedge_min_sigmas: float = 1.5
+    # The hedge is sized so a win pays back the stranded leg's stake, and
+    # capped at this fraction of bankroll -- a leg bought at 0.37 needs about
+    # three times its stake at 0.75 to break even, which on a small account
+    # is most of it. A capped hedge still covers part of the loss.
+    hybrid_hedge_max_stake_pct: float = 0.20
 
     # --- Claiming (background, non-blocking) --------------------------
     # A win must be claimed (on-chain redemption) before its proceeds are
@@ -843,6 +854,14 @@ class Config:
             raise ValueError("hybrid_stop_loss_pct must be in (0, 1)")
         if self.hybrid_stop_disarm_s < 0:
             raise ValueError("hybrid_stop_disarm_s must be non-negative")
+        if self.hybrid_hedge_min_sigmas <= 0:
+            # At zero every stranded leg is hedged on any buffer at all,
+            # including one pointing the leg's own way.
+            raise ValueError("hybrid_hedge_min_sigmas must be positive")
+        if not 0 < self.hybrid_hedge_max_stake_pct <= self.hard_stake_ceiling:
+            raise ValueError(
+                f"hybrid_hedge_max_stake_pct must be in (0, "
+                f"{self.hard_stake_ceiling}]")
         if self.scalp:
             if self.entry_window_end_s <= self.scalp_flatten_s:
                 # A scalp opened at the entry deadline is flattened the same

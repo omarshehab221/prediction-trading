@@ -523,6 +523,10 @@ PROFILES: dict[str, dict] = {
     # negative. That is asked for, and logged on every floored entry.
     "hybrid": {"hybrid": True,
                "hybrid_stop_loss_pct": 0.25, "hybrid_stop_disarm_s": 45.0,
+               # Twice buffer's 0.75: a hedge bets against a leg already
+               # held, so it waits for the market to have all but decided.
+               "hybrid_hedge_min_sigmas": 1.5,
+               "hybrid_hedge_max_stake_pct": 0.20,
                # -- the straddle layer: the straddle profile's own numbers --
                "straddle_stake_pct": 0.20, "straddle_entry_window_s": 60.0,
                "straddle_require_positive_worst_case": True,
