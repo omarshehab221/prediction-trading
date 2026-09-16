@@ -335,6 +335,8 @@ class StraddleMixin:
                       if self._live and order_id else None)
             self._positions[(raw.symbol, side)] = Position(
                 tid, raw, sig, stake, 1, shares=shares)
+            if self._cfg.hybrid:
+                self._hybrid_straddle_legs.add(tid)
 
     def _maybe_enter_straddle(self, bankroll: float, mode: str) -> None:
         """

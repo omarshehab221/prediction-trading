@@ -2314,24 +2314,45 @@ class TestHybridStops(unittest.TestCase):
         t._check_stops()
         self.assertEqual(self._sold(t), [])
 
-    def test_an_unpaired_straddle_leg_is_stopped(self):
-        t, _, rnd = self._trader(bid=0.25)
-        key = self._hold(t, rnd, Side.UP, 0.35, prob=0.5)
+    def _hold_leg(self, t, rnd, side, price):
+        key = self._hold(t, rnd, side, price, prob=0.5)
+        t._hybrid_straddle_legs.add(t._positions[key].trade_id)
+        return key
+
+    def test_an_unpaired_straddle_leg_is_never_stopped(self):
+        """
+        Shadow, 2026-09-16: nine unpaired legs were stopped 20-60s after
+        entry for -5.33 USDT. A cheap first leg falling is the strategy
+        waiting, not failing, and selling it forecloses the completion.
+        """
+        t, _, rnd = self._trader(bid=0.05)
+        key = self._hold_leg(t, rnd, Side.UP, 0.35)
         t._sync_hybrid_stops()
-        self.assertIn(key, t._brackets)
+        self.assertNotIn(key, t._brackets)
         t._check_stops()
-        self.assertEqual(len(self._sold(t)), 1)
+        self.assertEqual(self._sold(t), [])
 
     def test_a_completed_pair_is_never_stopped(self):
         t, _, rnd = self._trader(bid=0.05)
-        up = self._hold(t, rnd, Side.UP, 0.35, prob=0.5)
+        self._hold_leg(t, rnd, Side.UP, 0.35)
+        self._hold_leg(t, rnd, Side.DOWN, 0.30)
         t._sync_hybrid_stops()
-        self.assertIn(up, t._brackets)           # armed while unpaired
-        self._hold(t, rnd, Side.DOWN, 0.30, prob=0.5)
-        t._sync_hybrid_stops()
-        self.assertEqual(t._brackets, {})        # disarmed once paired
+        self.assertEqual(t._brackets, {})
         t._check_stops()
         self.assertEqual(self._sold(t), [])
+
+    def test_a_leg_opened_by_the_straddle_path_is_marked_as_one(self):
+        books = {(1, Side.UP): [(0.35, 10_000)],
+                 (1, Side.DOWN): [(0.70, 10_000)]}
+        rnd = make_round(start_ms=self.START, fee_bps=0,
+                         end_ms=self.START + m.DEFAULT_ROUND_SECONDS * 1000)
+        client = FakeClient([rnd], [(self.START + 5_000, 1.0)], books, {})
+        t = build_trader(client, hybrid_cfg(db_path=self.db), self.db)
+        t._maybe_enter_straddle(10.0, "PAPER")
+        pos = t._positions[("BTCUSDT", Side.UP)]
+        self.assertIn(pos.trade_id, t._hybrid_straddle_legs)
+        t._sync_hybrid_stops()
+        self.assertEqual(t._brackets, {})
 
     def test_no_stop_fires_inside_the_disarm_window(self):
         # 260s into a 300s round: 40s left, inside the 45s window.

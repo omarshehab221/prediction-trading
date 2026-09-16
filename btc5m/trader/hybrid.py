@@ -1,6 +1,6 @@
 """
 The hybrid profile: a locked straddle when a round offers one, a buffer
-entry when it does not, and a stop under anything that can still lose.
+entry when it does not, and a stop under every buffer position.
 """
 
 from __future__ import annotations
@@ -30,23 +30,25 @@ class HybridMixin:
         """
         Make the brackets say what the positions are, every pass.
 
-        Declarative rather than armed at each entry point, because four
-        paths change what a stop should be -- a buffer entry, a first
-        straddle leg, its completion, and a top-up -- and arming at each is
-        four places for one to be forgotten. Here there is one rule:
-        anything that can still lose carries a stop; a locked pair does not.
+        Declarative rather than armed at each entry point, because a buffer
+        entry and each of its top-ups change what a stop should be, and
+        arming at each is several places for one to be forgotten. The rule:
+        a buffer position carries a stop; a straddle leg never does.
+
+        Straddle legs were stopped too, until the 2026-09-16 shadow session:
+        nine unpaired first legs were stopped 20-60s after entry for -5.33
+        USDT while the two pairs that completed made +1.43. A cheap first
+        leg falling is the strategy waiting for its partner, not failing,
+        and selling it forecloses the completion. A leg that never finds
+        its partner rides to settlement, as it does in the straddle profile.
         """
         if not self._cfg.hybrid:
             return
         held = {pos.trade_id for pos in self._positions.values()}
         self._hybrid_stopped &= held
-        sides_by_symbol: dict[str, int] = {}
-        for symbol, _side in self._positions:
-            sides_by_symbol[symbol] = sides_by_symbol.get(symbol, 0) + 1
+        self._hybrid_straddle_legs &= held
         for key, pos in self._positions.items():
-            if sides_by_symbol[key[0]] > 1:
-                # Both sides held: the payout is locked whichever way the
-                # round settles, and selling either leg would unlock it.
+            if pos.trade_id in self._hybrid_straddle_legs:
                 self._brackets.pop(key, None)
                 continue
             if pos.trade_id in self._hybrid_stopped:

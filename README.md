@@ -264,10 +264,10 @@ nothing but the price.
 
 **`hybrid`** layers three profiles in one round. The first minute is
 `straddle`'s, unchanged. A market with no leg after that is offered to
-`buffer`'s gates, unchanged. Anything open that can still lose, whether a buffer
-position or a first leg whose partner never came, carries a stop 25% under its
-executed price, disarmed in the last 45 seconds. A completed pair is never
-stopped. There is no take-profit. Both stakes floor at the $1 minimum instead of
+`buffer`'s gates, unchanged. A buffer position carries a stop 25% under its
+executed price, disarmed in the last 45 seconds. Straddle legs are never stopped,
+paired or not: a first leg that never finds its partner rides to settlement, as
+in `straddle`. There is no take-profit. Both stakes floor at the $1 minimum instead of
 refusing a small balance, which at $3 means betting a third of it. See
 `docs/superpowers/specs/2026-09-16-hybrid-profile-design.md`.
 

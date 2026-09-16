@@ -510,12 +510,12 @@ PROFILES: dict[str, dict] = {
     #
     # The first minute belongs to the straddle path, unchanged: a pair is
     # taken only when both payouts beat what it cost. A market holding no leg
-    # after that minute is offered to the buffer path, unchanged too. Whatever
-    # is open and can still lose -- a buffer position, or a first leg whose
-    # partner never came -- carries a stop 25% under its executed price. A
-    # completed pair carries none: its outcome is already locked, and selling
-    # one leg would unlock it. No take-profit: buffer's winners pay 25%+ at
-    # settlement, and scalp's 12% target would sell them for half that.
+    # after that minute is offered to the buffer path, unchanged too. A buffer
+    # position carries a stop 25% under its executed price. A straddle leg
+    # carries none, paired or not: in shadow, stops on unpaired first legs
+    # fired on ordinary noise and lost more than the completed pairs made.
+    # No take-profit: buffer's winners pay 25%+ at settlement, and scalp's
+    # 12% target would sell them for half that.
     #
     # SMALL BALANCES. Both stakes are floored at the 1.00 venue minimum rather
     # than refused -- straddle legs under 5.00, buffer under 10.00. At 3.00 a

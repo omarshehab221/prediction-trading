@@ -126,6 +126,10 @@ class Trader(
         # re-arming it on the next pass would send a second sale of shares
         # the first one is still selling.
         self._hybrid_stopped: set[int] = set()
+        # Hybrid: trade ids the straddle layer opened. They are never
+        # stopped -- a cheap first leg falling is the strategy waiting for its
+        # partner, and selling it forecloses the completion.
+        self._hybrid_straddle_legs: set[int] = set()
         # topic_id -> (end_ms, entries taken on this round).
         self._scalp_entries: dict[int, tuple[int, int]] = {}
         self._flattened: set[int] = set()

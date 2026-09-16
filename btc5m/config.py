@@ -509,7 +509,7 @@ class Config:
     # docs/superpowers/specs/2026-09-16-hybrid-profile-design.md.
     #
     # Not a fifth entry path: it runs the straddle path, then the model path,
-    # and puts a watched stop under whatever those opened that can still lose.
+    # and puts a watched stop under every buffer position it opened.
     hybrid: bool = False
     # A P&L fraction below the executed entry price, not a price move. Wide on
     # purpose: buffer enters at 0.55-0.80, where a 5% stop fires on noise, and

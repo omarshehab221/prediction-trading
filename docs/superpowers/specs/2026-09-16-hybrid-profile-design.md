@@ -36,14 +36,16 @@ Seconds are "remaining in the 5-minute round".
    The existing one-position-per-symbol rule already enforces that, because a
    straddle leg is a position on the symbol. Buffer's `entry_window_start_s` is
    set to 240 so the two windows cannot overlap.
-3. **Always: the stop.** Every position that can still lose carries a watched
-   stop:
-   * a buffer position (including after scale-in top-ups);
-   * a straddle first leg whose partner has not filled.
+3. **Always: the stop, on buffer positions only** (including after scale-in
+   top-ups). **Straddle legs are never stopped**, paired or not.
 
-   A **completed straddle pair is never stopped**. Its outcome is already
-   locked, and selling one leg would unlock it. When the second leg fills,
-   the first leg's stop is removed on the same pass.
+   *Revised 2026-09-16 after shadow.* This originally stopped unpaired first
+   legs too. In a 20-minute shadow session nine of twelve first legs were
+   stopped 20-60 s after entry for -5.33 USDT, realised at -25% to -42%, while
+   the two pairs that completed made +1.43. A cheap first leg falling is the
+   strategy waiting for its partner, and the stop sold it and foreclosed the
+   completion. A leg that never finds its partner now rides to settlement, as
+   it does in the `straddle` profile.
 
 One market therefore holds either a straddle or a buffer position in a round,
 never both.
