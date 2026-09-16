@@ -658,19 +658,35 @@ class TestNewLimitsActuallyBind(unittest.TestCase):
 
 
 class TestOnlyBufferScalesIn(unittest.TestCase):
-    """The sizing change was requested for buffer; it must not leak."""
+    """
+    The sizing change was requested for buffer; it must not leak.
+
+    hybrid is the one sanctioned carrier: its buffer layer IS buffer, gates
+    and scale-in alike, so it is held to buffer's exact values below rather
+    than exempted from the rule.
+    """
+
+    SCALES_IN = {"buffer", "hybrid"}
+    SCALE_IN_KEYS = ("scale_in", "scale_in_initial_pct", "scale_in_min_topup",
+                     "max_blended_price")
 
     def test_scale_in_is_enabled_only_for_buffer(self):
         for name, prof in m.PROFILES.items():
             c = Config(api_key="k", api_secret="s", **prof)
-            self.assertEqual(c.scale_in, name == "buffer", name)
+            self.assertEqual(c.scale_in, name in self.SCALES_IN, name)
+
+    def test_hybrid_scales_in_exactly_as_buffer_does(self):
+        buf = Config(api_key="k", api_secret="s", **m.PROFILES["buffer"])
+        hyb = Config(api_key="k", api_secret="s", **m.PROFILES["hybrid"])
+        for key in self.SCALE_IN_KEYS:
+            self.assertEqual(getattr(hyb, key), getattr(buf, key), key)
 
     def test_only_buffer_opens_below_full_kelly(self):
         for name, prof in m.PROFILES.items():
             c = Config(api_key="k", api_secret="s", **prof)
             mid = (c.min_entry_price + c.max_entry_price) / 2
             full = m.kelly_stake(100.0, min(mid * 1.5, 0.99), mid, c, 200)
-            if name == "buffer":
+            if name in self.SCALES_IN:
                 self.assertLess(c.scale_in_initial_pct, 1.0)
             else:
                 opener = full
@@ -678,7 +694,7 @@ class TestOnlyBufferScalesIn(unittest.TestCase):
 
     def test_other_profiles_keep_the_standard_opener_fraction(self):
         for name, prof in m.PROFILES.items():
-            if name == "buffer":
+            if name in self.SCALES_IN:
                 continue
             c = Config(api_key="k", api_secret="s", **prof)
             self.assertAlmostEqual(c.scale_in_initial_pct, 0.4, msg=name)
