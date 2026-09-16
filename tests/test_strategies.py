@@ -496,6 +496,33 @@ class TestStraddleEntry(unittest.TestCase):
 
         self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
 
+    def test_a_live_leg_records_the_shares_the_venue_delivered(self):
+        """
+        A straddle leg is never sold -- it rides to settlement and is
+        redeemed -- and the claim is sized from the shares held. With no
+        count recorded the cost-implied one stands in, and the buy's fee
+        comes out of the shares, so that count overstates the holding and
+        the claim declares a credit the venue never owes.
+        """
+        start = 1_700_000_000_000
+        rnd = make_round(strike=100_000.0, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
+                         fee_bps=0)
+        books = {(1, Side.UP): [(0.45, 10_000)],
+                 (1, Side.DOWN): [(0.45, 10_000)]}
+        client = QuotingClient([rnd], [(start, 100_000.0)], books, {},
+                               quotes={Side.UP: 0.45, Side.DOWN: 0.45})
+        client.delivered_shares = lambda order_id: 1.23
+        t = self._trader(client, live=True)
+        t._active_live = True
+
+        t._maybe_enter(100.0, "LIVE")
+
+        opened = [p for p in t._positions.values()]
+        self.assertTrue(opened, "no leg opened")
+        for pos in opened:
+            self.assertAlmostEqual(pos.shares, 1.23)
+
     def test_both_legs_settle_independently_and_correctly(self):
         start = 1_700_000_000_000
         end = start + (m.DEFAULT_ROUND_SECONDS * 1000)

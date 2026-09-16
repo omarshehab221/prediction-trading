@@ -307,8 +307,15 @@ class StraddleMixin:
             tid = self._journal.record(mode, raw, sig, spot=math.nan,
                                        sigma=math.nan, bankroll=bankroll,
                                        order_id=order_id)
+            # The shares the venue delivered, when it says. A straddle leg is
+            # never sold -- it rides to settlement and is redeemed -- and the
+            # claim is sized from the shares held, so without this the
+            # cost-implied count stands in and declares a credit larger than
+            # the venue owes by the buy's fee.
+            shares = (self._client.delivered_shares(order_id)
+                      if self._live and order_id else None)
             self._positions[(raw.symbol, side)] = Position(
-                tid, raw, sig, stake, 1)
+                tid, raw, sig, stake, 1, shares=shares)
 
     def _maybe_enter_straddle(self, bankroll: float, mode: str) -> None:
         """

@@ -53,6 +53,14 @@ case "$TRADING_MODE" in
      exit 1 ;;
 esac
 DB_PATH="${DB_PATH:-/var/data/$DEFAULT_DB}"
+# The strategy the bot runs. Only used when the config file is first written
+# -- entrypoint.sh keeps an existing one -- so switching profiles means
+# regenerating /var/data/config.json as well as setting this.
+PROFILE="${PROFILE:-scalp}"
+case "$PROFILE" in
+  scalp|straddle|last_minute|model|buffer) ;;
+  *) echo "FATAL: unknown PROFILE '$PROFILE'" >&2; exit 1 ;;
+esac
 
 export AWS_DEFAULT_REGION="$REGION"
 
@@ -275,7 +283,7 @@ TASK_DEF="$(cat <<JSON
     "environment": [
       {"name": "CONFIG_PATH", "value": "/var/data/config.json"},
       {"name": "DB_PATH", "value": "$DB_PATH"},
-      {"name": "PROFILE", "value": "scalp"},
+      {"name": "PROFILE", "value": "$PROFILE"},
       {"name": "TRADING_MODE", "value": "$TRADING_MODE"},
       {"name": "SYMBOLS", "value": "BTCUSDT,ETHUSDT,BNBUSDT"},
       {"name": "PYTHONUNBUFFERED", "value": "1"},
