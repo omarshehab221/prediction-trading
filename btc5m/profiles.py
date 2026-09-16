@@ -506,6 +506,65 @@ PROFILES: dict[str, dict] = {
                    # 30% held back leaves 70% spendable against a 10% stake,
                    # which funds both slots with room to spare.
                    "reserve_pct": 0.30},
+    # STRADDLE WHEN IT LOCKS, BUFFER WHEN IT DOESN'T, A STOP UNDER EITHER.
+    #
+    # The first minute belongs to the straddle path, unchanged: a pair is
+    # taken only when both payouts beat what it cost. A market holding no leg
+    # after that minute is offered to the buffer path, unchanged too. Whatever
+    # is open and can still lose -- a buffer position, or a first leg whose
+    # partner never came -- carries a stop 25% under its executed price. A
+    # completed pair carries none: its outcome is already locked, and selling
+    # one leg would unlock it. No take-profit: buffer's winners pay 25%+ at
+    # settlement, and scalp's 12% target would sell them for half that.
+    #
+    # SMALL BALANCES. Both stakes are floored at the 1.00 venue minimum rather
+    # than refused -- straddle legs under 5.00, buffer under 10.00. At 3.00 a
+    # 1.00 stake is 33% of bankroll, past where Kelly says growth turns
+    # negative. That is asked for, and logged on every floored entry.
+    "hybrid": {"hybrid": True,
+               "hybrid_stop_loss_pct": 0.25, "hybrid_stop_disarm_s": 45.0,
+               # -- the straddle layer: the straddle profile's own numbers --
+               "straddle_stake_pct": 0.20, "straddle_entry_window_s": 60.0,
+               "straddle_require_positive_worst_case": True,
+               "straddle_min_worst_case_return": 0.0,
+               "straddle_force_hedge": False,
+               # -- the buffer layer: the buffer profile's own gates --
+               "max_entry_price": 0.80, "min_entry_price": 0.55,
+               "min_edge": 0.012, "min_edge_ratio": 0.010,
+               "min_win_return": 0.25, "min_buffer_sigmas": 0.75,
+               # The buffer cap. Straddle legs size off straddle_stake_pct
+               # and never read this; the two are different layers' stakes,
+               # not one number disagreeing with itself.
+               "max_stake_pct": 0.10, "min_stake_usdt": 1.0,
+               "max_price_impact": 0.05, "assumed_spread_pct": 0.03,
+               "kelly_fraction": 0.25, "min_liquidity": 150.0,
+               "scale_in": True, "scale_in_initial_pct": 0.25,
+               "scale_in_min_topup": 1.0, "max_blended_price": 0.78,
+               "trend_follow": True,
+               "trend_min_impulse": 1.2, "trend_min_run": 1,
+               "trend_max_run": 5, "trend_decay_floor": 0.55,
+               "trend_min_rounds_left": 1.0, "trend_min_z": 0.8,
+               "trend_min_efficiency": 0.40,
+               "trend_stake_multiple": 1.5, "trend_early_entry_s": 90,
+               "trend_lookback_min": 30,
+               # 240, not buffer's 270: the first 60s of a round are the
+               # straddle's. The model path also refuses any round still
+               # inside straddle_entry_window_s, because a trend widens this
+               # window by trend_early_entry_s.
+               "entry_window_start_s": 240, "entry_window_end_s": 30,
+               # -- shared risk --
+               # A floored 1.00 loss is a large share of a small bankroll and
+               # a straddle's worst leg is 20%; 50% leaves room for both.
+               "daily_loss_limit_pct": 0.50,
+               # 30, not buffer's 6: every completed straddle pair settles
+               # one leg as a LOSS (the pair still wins), so a few pairs
+               # settling back to back read as a losing streak that is not.
+               "max_consecutive_losses": 30, "max_rounds_per_day": 400,
+               # Two slots per straddle round; four lets a second round open
+               # while the first settles. 10% reserve funds both.
+               "max_concurrent_positions": 4, "reserve_pct": 0.10,
+               "entry_order_type": "MARKET", "exit_order_type": "NONE",
+               "paper_start_bankroll": 10.0},
 }
 
 

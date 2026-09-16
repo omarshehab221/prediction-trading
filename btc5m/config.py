@@ -505,6 +505,20 @@ class Config:
     # market is skipped loudly rather than traded quietly.
     scalp_max_edge_required: float = 0.25
 
+    # Straddle, buffer and a stop, layered per round. See
+    # docs/superpowers/specs/2026-09-16-hybrid-profile-design.md.
+    #
+    # Not a fifth entry path: it runs the straddle path, then the model path,
+    # and puts a watched stop under whatever those opened that can still lose.
+    hybrid: bool = False
+    # A P&L fraction below the executed entry price, not a price move. Wide on
+    # purpose: buffer enters at 0.55-0.80, where a 5% stop fires on noise, and
+    # a stop sells into a falling bid and has overshot about 2x live.
+    hybrid_stop_loss_pct: float = 0.25
+    # Inside this many seconds before settlement no stop fires. The book is
+    # thinnest there, and a sale turns a coin flip into a certain loss.
+    hybrid_stop_disarm_s: float = 45.0
+
     # --- Claiming (background, non-blocking) --------------------------
     # A win must be claimed (on-chain redemption) before its proceeds are
     # real, spendable balance, and that can take anywhere from about a
@@ -825,6 +839,10 @@ class Config:
             # required edge exceed half, so it would read as a safety limit
             # and behave as nothing.
             raise ValueError("scalp_max_edge_required must be in [0, 0.5)")
+        if not 0 < self.hybrid_stop_loss_pct < 1.0:
+            raise ValueError("hybrid_stop_loss_pct must be in (0, 1)")
+        if self.hybrid_stop_disarm_s < 0:
+            raise ValueError("hybrid_stop_disarm_s must be non-negative")
         if self.scalp:
             if self.entry_window_end_s <= self.scalp_flatten_s:
                 # A scalp opened at the entry deadline is flattened the same
@@ -857,11 +875,24 @@ class Config:
         # silently run whichever branch happens to be tested first.
         chosen = [n for n, on in (("straddle", self.straddle),
                                   ("last_minute", self.last_minute),
-                                  ("scalp", self.scalp)) if on]
+                                  ("scalp", self.scalp),
+                                  ("hybrid", self.hybrid)) if on]
         if len(chosen) > 1:
             raise ValueError(
                 f"only one entry strategy may be enabled, got: "
                 f"{', '.join(chosen)}")
+        if self.hybrid and self.exit_order_type != "NONE":
+            # The stop is hybrid's own mechanism. A model-priced exit would
+            # offer a straddle leg back to the book, and unlock the pair.
+            raise ValueError(
+                f"hybrid requires exit_order_type NONE, got "
+                f"{self.exit_order_type!r}")
+        if self.hybrid and self.entry_order_type != "MARKET":
+            # A resting buffer entry that fills after the straddle window
+            # reopens the market would put two strategies on one symbol.
+            raise ValueError(
+                f"hybrid requires entry_order_type MARKET, got "
+                f"{self.entry_order_type!r}")
         if self.scalp and self.scale_in:
             # Scale-in tops a position up toward the Kelly stake for a rising
             # model probability. This strategy has no model probability, and

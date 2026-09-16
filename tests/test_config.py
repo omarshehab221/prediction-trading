@@ -27,6 +27,7 @@ from tests.support import (
     _close_journals,
     cfg,
     convex_cfg,
+    hybrid_cfg,
     lastminute_cfg,
     make_round,
     scalp_cfg,
@@ -1069,3 +1070,56 @@ class TestHostingReadiness(unittest.TestCase):
     def test_shutdown_is_not_a_trading_halt(self):
         """A restart must not be recorded as a risk-limit breach."""
         self.assertFalse(issubclass(m.Shutdown, TradingHalted))
+
+
+class TestHybridConfig(unittest.TestCase):
+
+    def test_the_profile_builds(self):
+        c = hybrid_cfg()
+        self.assertTrue(c.hybrid)
+        self.assertFalse(c.straddle or c.scalp or c.last_minute)
+
+    def test_the_profile_carries_the_agreed_numbers(self):
+        c = hybrid_cfg()
+        self.assertEqual(c.hybrid_stop_loss_pct, 0.25)
+        self.assertEqual(c.hybrid_stop_disarm_s, 45.0)
+        self.assertEqual(c.straddle_stake_pct, 0.20)
+        self.assertEqual(c.max_stake_pct, 0.10)
+        self.assertEqual(c.min_stake_usdt, 1.0)
+        self.assertEqual(c.entry_window_start_s, 240)
+        self.assertEqual(c.straddle_entry_window_s, 60.0)
+        self.assertEqual(c.daily_loss_limit_pct, 0.50)
+        self.assertEqual(c.reserve_pct, 0.10)
+        self.assertEqual(c.max_concurrent_positions, 4)
+        self.assertTrue(c.straddle_require_positive_worst_case)
+        self.assertFalse(c.straddle_force_hedge)
+        self.assertTrue(c.scale_in)
+        self.assertTrue(c.trend_follow)
+
+    def test_hybrid_excludes_every_other_entry_strategy(self):
+        for flag in ("straddle", "scalp", "last_minute"):
+            with self.assertRaises(ValueError, msg=flag):
+                hybrid_cfg(**{flag: True})
+
+    def test_hybrid_refuses_any_exit_but_none(self):
+        for exit_type in ("MARKET", "LIMIT", "BRACKET"):
+            with self.assertRaises(ValueError, msg=exit_type):
+                hybrid_cfg(exit_order_type=exit_type)
+
+    def test_hybrid_refuses_limit_entries(self):
+        with self.assertRaises(ValueError):
+            hybrid_cfg(entry_order_type="LIMIT")
+
+    def test_stop_loss_pct_must_be_in_zero_one(self):
+        for bad in (0.0, 1.0, -0.1):
+            with self.assertRaises(ValueError, msg=bad):
+                hybrid_cfg(hybrid_stop_loss_pct=bad)
+
+    def test_disarm_window_must_be_non_negative(self):
+        with self.assertRaises(ValueError):
+            hybrid_cfg(hybrid_stop_disarm_s=-1.0)
+
+    def test_hybrid_is_off_everywhere_else(self):
+        for name, values in m.PROFILES.items():
+            if name != "hybrid":
+                self.assertNotIn("hybrid", values, name)

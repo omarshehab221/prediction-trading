@@ -182,6 +182,13 @@ def scalp_cfg(**kw) -> Config:
     return Config(**base)
 
 
+def hybrid_cfg(**kw) -> Config:
+    base = dict(api_key="k", api_secret="s", live=False,
+                **m.PROFILES["hybrid"])
+    base.update(kw)
+    return Config(**base)
+
+
 def _close_journals(case=None) -> None:
     """
     Close every open Journal before a test unlinks its file.
