@@ -128,6 +128,7 @@ class ScaleInMixin:
         if not clears_return(avg, pos.rnd.fee_bps, self._cfg):
             return
 
+        delivered = None
         if self._live:
             fresh = self._live_bankroll("scale-in")
             if fresh is None or topup > fresh:
@@ -166,6 +167,9 @@ class ScaleInMixin:
                     LOG.warning("Top-up filled %.4f of %.4f on %s",
                                 filled, topup, pos.rnd.slug)
                     topup = filled
+            # Added to the opener's count, so a sale of the whole position
+            # asks for what the venue holds rather than what cost implies.
+            delivered = self._client.delivered_shares(topup_order)
             if quote.fee_usdt > 0:
                 LOG.debug("Top-up fee %.4f USDT on %.2f staked",
                           quote.fee_usdt, topup)
@@ -182,4 +186,10 @@ class ScaleInMixin:
             signal=replace(pos.signal, model_prob=prob, fill_price=blended,
                            stake_usdt=pos.committed_usdt + topup),
             committed_usdt=pos.committed_usdt + topup,
-            tranches=pos.tranches + 1)
+            tranches=pos.tranches + 1,
+            # No recorded count on the opener means none is known for the
+            # whole: leave it to the cost-implied figure rather than mix one
+            # venue count with one estimate.
+            shares=(None if pos.shares is None
+                    else pos.shares + (delivered if delivered is not None
+                                       else topup / avg)))

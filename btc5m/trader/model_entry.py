@@ -148,6 +148,7 @@ class ModelEntryMixin:
                 continue
 
             order_id = None
+            shares = None
             if self._live:
                 # Re-read the balance immediately before committing. The
                 # figure from the top of the loop is seconds old and may
@@ -224,6 +225,11 @@ class ModelEntryMixin:
                 sig = replace(sig, fill_price=quote.average_price, edge=edge)
                 LOG.info("Order %s filled at %.4f for %.4f shares", order_id,
                          quote.average_price, quote.amount_out)
+                # The venue's count, not the quote's. Holdings are kept to two
+                # decimals and the buy's fee comes out of the shares, so a
+                # sale sized from the quote was refused as exceeding what is
+                # held -- which is the one thing a stop cannot survive.
+                shares = self._client.delivered_shares(order_id)
 
             mult = kelly_multiple(sig.stake_usdt, bankroll, sig.model_prob,
                                   sig.fill_price, rnd.fee_bps)
@@ -248,7 +254,7 @@ class ModelEntryMixin:
                                        order_id)
             self._seen[rnd.topic_id] = rnd.end_ms
             self._positions[(rnd.symbol, sig.side)] = Position(
-                tid, rnd, sig, sig.stake_usdt, 1)
+                tid, rnd, sig, sig.stake_usdt, 1, shares=shares)
             available -= sig.stake_usdt
             if (len(self._positions) >= self._cfg.max_concurrent_positions
                     or available < self._cfg.min_stake_usdt):

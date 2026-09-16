@@ -2149,3 +2149,62 @@ class TestSubscriptionsFollowTheMarketsInPlay(unittest.TestCase):
         t.run()
         self.assertTrue(self.tracked, "the loop never subscribed at all")
         self.assertEqual(self.tracked[-1], {"BTCUSDT", "ETHUSDT"})
+
+
+class TestDeliveredSharesOnModelEntries(unittest.TestCase):
+    """A buffer stop sells pos.held_shares; it has to be the venue's count."""
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+
+    def tearDown(self):
+        _close_journals(self)
+        os.unlink(self.db)
+
+    def _entry_client(self):
+        start = 1_700_000_000_000
+        rnd = make_round(strike=None, start_ms=start,
+                         end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000))
+        path = [(start, 100_000.0), (start + 240_000, 100_400.0)]
+        books = {(1, Side.UP): [(0.55, 10_000)]}
+        return FakeClient([rnd], path, books, {})
+
+    def test_a_live_model_entry_records_the_delivered_shares(self):
+        client = self._entry_client()
+        client.delivered_shares = lambda order_id: 3.21
+        t = build_trader(client, cfg(db_path=self.db, live=True), self.db)
+        client.t = 1
+        t._maybe_enter(100.0, "LIVE")
+        self.assertIsNotNone(t._position)
+        self.assertAlmostEqual(t._position.shares, 3.21)
+
+    def test_paper_entries_still_record_no_count(self):
+        client = self._entry_client()
+        t = build_trader(client, cfg(db_path=self.db), self.db)
+        client.t = 1
+        t._maybe_enter(100.0, "PAPER")
+        self.assertIsNotNone(t._position)
+        self.assertIsNone(t._position.shares)
+
+    def test_a_live_top_up_adds_its_delivered_shares(self):
+        settings = dict(m.PROFILES["buffer"])
+        c = cfg(db_path=self.db, live=True, **settings)
+        start = 1_700_000_000_000
+        rnd = make_round(strike=65_000.0, start_ms=start, fee_bps=0,
+                         end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
+        path = [(start, 65_000.0), (start + 120_000, 65_260.0),
+                (start + m.DEFAULT_ROUND_SECONDS * 1000 + 3_000, 65_260.0)]
+        book = {(1, Side.UP): [(0.72, 1e6)], (1, Side.DOWN): [(0.75, 1e6)]}
+        client = FakeClient([rnd], path, book, {})
+        client.get_quote = lambda r, p: m.Quote("q", 0.72, p.amount / 0.72,
+                                                0.0, 0.0)
+        client.delivered_shares = lambda order_id: 2.50
+        t = build_trader(client, c, self.db)
+        sig = Signal(Side.UP, 0.90, 0.68, 0.02, 2.0, 120.0, 1.8)
+        tid = t._journal.record("LIVE", rnd, sig, 65_000, 0.5, 100.0)
+        t._position = Position(tid, rnd, sig, 2.0, 1, shares=2.90)
+        client.t = 1
+        t._maybe_scale_in(100.0)
+        self.assertEqual(t._position.tranches, 2)
+        self.assertAlmostEqual(t._position.shares, 2.90 + 2.50)
