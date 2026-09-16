@@ -7,7 +7,7 @@ import tempfile
 import unittest
 
 import btc_5m_predictor as m
-from tests.support import ROOT, _close_journals
+from tests.support import ROOT, _close_journals, hybrid_cfg
 
 class TestMainEntryPoint(unittest.TestCase):
     """
@@ -322,3 +322,26 @@ class TestPreflightGate(unittest.TestCase):
             [ApiError("Signature for this request is not valid.")])
         with self.assertRaises(ApiError):
             _probe_quote(client, [], "r1", 1.0)
+
+
+class TestHybridBalanceNotes(unittest.TestCase):
+
+    def test_a_small_balance_is_reported_as_floored_not_untradeable(self):
+        from btc5m.probes import hybrid_balance_notes
+        notes = "\n".join(hybrid_balance_notes(hybrid_cfg(), 4.0))
+        self.assertIn("straddle legs 1.00", notes)
+        self.assertIn("buffer stakes 1.00", notes)
+        self.assertIn("floored", notes)
+        self.assertNotIn("UNTRADEABLE", notes)
+
+    def test_a_balance_that_cannot_fund_a_straddle_pair_says_so(self):
+        from btc5m.probes import hybrid_balance_notes
+        notes = "\n".join(hybrid_balance_notes(hybrid_cfg(), 1.80))
+        self.assertIn("no straddle", notes)
+        self.assertIn("buffer stakes 1.00", notes)
+
+    def test_a_large_balance_reports_the_fractions(self):
+        from btc5m.probes import hybrid_balance_notes
+        notes = "\n".join(hybrid_balance_notes(hybrid_cfg(), 50.0))
+        self.assertIn("straddle legs 10.00", notes)
+        self.assertIn("buffer stakes up to 5.00", notes)

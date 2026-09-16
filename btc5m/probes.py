@@ -140,6 +140,41 @@ def _probe_quote(client, rounds, first, stake: float) -> str:
     return f"reachable; every live book is too thin to quote right now ({refused})"
 
 
+def hybrid_balance_notes(cfg: Config, bal: float) -> list[str]:
+    """
+    What the hybrid profile will stake on this balance, and what it cannot.
+
+    Neither layer calls the Kelly probe's refusal path -- both floor at the
+    venue minimum -- so the generic probe would call a small hybrid account
+    untradeable when it is not.
+    """
+    minimum = cfg.min_stake_usdt
+    free = bal * (1.0 - cfg.reserve_pct)
+    leg = bal * cfg.straddle_stake_pct
+    cap = bal * cfg.max_stake_pct
+    notes = []
+    if free >= 2 * minimum:
+        notes.append(f"  -> straddle legs {max(leg, minimum):.2f}"
+                     + (f" (floored from {leg:.2f})" if leg < minimum else "")
+                     + f"; {free:.2f} free after the {cfg.reserve_pct:.0%} "
+                     f"reserve")
+    else:
+        notes.append(f"  <-- no straddle: {free:.2f} free cannot fund a leg "
+                     f"and its partner at the {minimum:.2f} minimum")
+    if free >= minimum:
+        if cap < minimum:
+            notes.append(f"  -> buffer stakes {minimum:.2f}, floored from "
+                         f"{cap:.2f} ({minimum / bal:.0%} of bankroll, past "
+                         f"the Kelly limits by design)")
+        else:
+            notes.append(f"  -> buffer stakes up to {cap:.2f} "
+                         f"({cfg.max_stake_pct:.0%} of bankroll, Kelly-sized)")
+    else:
+        notes.append(f"  <-- no buffer entry: {free:.2f} free is under the "
+                     f"{minimum:.2f} minimum")
+    return notes
+
+
 def preflight(cfg: Config) -> int:
     """Probe every endpoint and report which ones actually work."""
     client = PredictionClient(cfg)
@@ -215,6 +250,8 @@ def preflight(cfg: Config) -> int:
         if bal < cfg.min_stake_usdt:
             notes.append(f"  <-- below the {cfg.min_stake_usdt:.2f} minimum "
                          f"order size; no order can be placed")
+        elif cfg.hybrid:
+            notes.extend(hybrid_balance_notes(cfg, bal))
         elif cfg.scalp:
             # The scalp path sizes a fixed fraction floored at the venue
             # minimum and never calls kelly_stake, so the Kelly probe below
