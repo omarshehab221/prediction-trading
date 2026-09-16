@@ -81,27 +81,6 @@ class TestStraddleEntry(unittest.TestCase):
         # later poll inside the window re-prices it.
         self.assertNotIn(1, t._seen)
 
-    def test_lock_never_legs_in_and_takes_only_a_locked_pair(self):
-        # UP alone at 0.20 opens a first leg under `straddle`; `lock` must
-        # refuse it, and take 0.40/0.50 (be sum ~0.91, ~9.9% locked).
-        start = 1_700_000_000_000
-        for down, legs in ((0.95, []),
-                           (0.50, [("BTCUSDT", Side.DOWN),
-                                   ("BTCUSDT", Side.UP)])):
-            up = 0.20 if down == 0.95 else 0.40
-            rnd = make_round(strike=100_000.0, start_ms=start,
-                             end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
-                             fee_bps=200)
-            books = {(1, Side.UP): [(up, 10_000)],
-                     (1, Side.DOWN): [(down, 10_000)]}
-            client = FakeClient([rnd], [(start, 100_000.0)], books, {})
-            t = build_trader(client, m.Config(
-                api_key="k", api_secret="s", live=False, db_path=self.db,
-                **m.PROFILES["lock"]), self.db)
-            t._maybe_enter(100.0, "PAPER")
-            self.assertEqual(sorted(t._positions), legs, (up, down))
-            t._journal._conn.close()
-
     def test_a_break_even_pair_is_refused(self):
         """
         0.50/0.50 with no fee returns exactly what it cost. "More than the

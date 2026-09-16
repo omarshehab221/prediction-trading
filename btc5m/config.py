@@ -743,15 +743,13 @@ class Config:
             raise ValueError("straddle_entry_window_s must be positive")
         if not 0 < self.straddle_max_leg_price <= 1.0:
             raise ValueError("straddle_max_leg_price must be in (0, 1]")
-        if not 0 <= self.straddle_first_leg_max_price < 0.5:
-            # 0 turns legging in off: no leg is ever opened alone, so only a
-            # pair that clears together is traded (the `lock` profile).
+        if not 0 < self.straddle_first_leg_max_price < 0.5:
             # At 0.5 the first leg's payout only just covers an equal-sized
             # pair, leaving no room at all for the second leg to be worth
             # buying -- the strategy needs the first fill to be genuinely
             # cheap, not merely the better half of a coin flip.
             raise ValueError(
-                "straddle_first_leg_max_price must be in [0, 0.5)")
+                "straddle_first_leg_max_price must be in (0, 0.5)")
         if self.straddle_hedge_deadline_s < 0:
             raise ValueError("straddle_hedge_deadline_s must be "
                              "non-negative")

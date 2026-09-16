@@ -431,47 +431,6 @@ PROFILES: dict[str, dict] = {
                  # warnings: if they are common, the entry window and the
                  # ceiling are wrong, not this switch.
                  "straddle_force_hedge": False},
-    # Straddle with legging in switched OFF. A round is bought only when UP
-    # and DOWN, quoted at the size about to execute, together cost less than
-    # the payout -- both legs in the same poll -- so a completed pair wins
-    # whichever way the round settles. Its only losses are execution: the
-    # second FOK leg failing after the first filled.
-    #
-    # Why not the legging-in straddle: a 14-day BTC 1s backtest
-    # (first-leg ceiling 0.20-0.40, window 60-180s, deadline 30/60, hedge
-    # on/off) never passed ~62% round wins; 40-60% of opened legs were
-    # stranded. Every stranded leg is a loss or a coin flip, so a high hit
-    # rate cannot come from that path.
-    #
-    # Big wins are the uncapped side: the locked return is
-    # 1/(be_up + be_down) - 1, so a dislocated book (one side stale after a
-    # spot jump) pays far more than the usual sliver. Frequency is the
-    # unknown -- run TRADING_MODE=shadow first and count STRADDLE lines.
-    "lock": {"straddle": True, "straddle_stake_pct": 0.20,
-             # Legging in off: _open_first_leg never finds price <= 0.
-             "straddle_first_leg_max_price": 0.0,
-             "straddle_require_positive_worst_case": True,
-             # Redemption lands ~0.03-0.04 USDT under the booked payout per
-             # round (straddle live 09-16). At ~2 USDT a pair that is ~2%,
-             # so a thinner lock books a "win" the wallet shows as a loss.
-             "straddle_min_worst_case_return": 0.03,
-             # A pair can appear at any second, not just at the open. The
-             # runway floor (2 x deadline) still ends opening at 60s left.
-             "straddle_entry_window_s": 300.0,
-             # Only reached when the second leg of a pair was killed. The
-             # completion pass retries at a locking price until 30s left,
-             # then buys the other side anyway: a bounded loss, not a
-             # full-stake coin flip.
-             "straddle_hedge_deadline_s": 30.0,
-             "straddle_force_hedge": True,
-             "min_entry_price": 0.01, "max_entry_price": 0.99,
-             "max_stake_pct": 0.20, "min_edge": 0.02, "min_edge_ratio": 0.0,
-             "reserve_pct": 0.10, "daily_loss_limit_pct": 0.50,
-             "assumed_spread_pct": 0.10, "kelly_fraction": 0.25,
-             "min_liquidity": 0.0, "max_rounds_per_day": 400,
-             "paper_start_bankroll": 100.0, "min_win_return": 0.0,
-             "max_blended_price": 0.5, "scale_in": False,
-             "max_concurrent_positions": 4},
     # ONE RULE. With a minute left, buy whichever side is dearer -- the one
     # the book has already picked -- provided it is quoted at 0.75 or better.
     # Inside the last 45 seconds, buy it whatever it costs. Nothing else is

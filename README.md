@@ -229,7 +229,6 @@ the model; `straddle`, `scalp` and `lastminute` do not consult it at all.
 | `balanced` | 0.10–0.90 | 5% | — | 150–25s | $100 |
 | `convex` | 0.05–0.35 | 2% | — | 280–30s | $100 |
 | `straddle` | both sides | 20% per leg | — | 60s from open | $100 |
-| `lock` | both sides, same poll only | 20% per leg | — | whole round | $100 |
 | `scalp` | 0.15–0.85 | 5% per round trip | — | 300–75s, flat at 60s | $100 |
 | `lastminute` *(default)* | any | 10% per round | — | 60–5s | $100 |
 
@@ -253,11 +252,6 @@ not chosen.
 **`straddle`** buys *both* sides of a round, at two different moments, and only
 when the pair's worst case still pays back more than it cost. No side is ever
 picked, so direction stops mattering.
-
-**`lock`** is `straddle` with legging in off: it buys only a pair whose
-quoted prices lock at least 3% whichever way the round settles. Its only
-losses are a failed second leg. Run it in shadow mode first to see how often
-such a pair exists.
 
 **`scalp`** follows the perpetual future instead of the model, and trades the
 token's price over a few seconds rather than the round's outcome: many small
