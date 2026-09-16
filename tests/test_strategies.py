@@ -2174,3 +2174,87 @@ class TestHybridEntry(unittest.TestCase):
         self.assertNotIn(("BTCUSDT", Side.DOWN),
                          {k for k, p in t._positions.items()
                           if p.signal.model_prob != 0.5})
+
+
+class TestHybridStraddleFloor(unittest.TestCase):
+    """20% of a balance under 5.00 is under the 1.00 minimum; hybrid floors."""
+
+    START = 1_700_000_000_000
+
+    def setUp(self):
+        fd, self.db = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+
+    def tearDown(self):
+        _close_journals(self)
+        os.unlink(self.db)
+
+    def _round(self):
+        return make_round(start_ms=self.START, fee_bps=0,
+                          end_ms=self.START + m.DEFAULT_ROUND_SECONDS * 1000)
+
+    def test_a_first_leg_on_4_00_stakes_the_minimum(self):
+        books = {(1, Side.UP): [(0.35, 10_000)],
+                 (1, Side.DOWN): [(0.70, 10_000)]}
+        client = FakeClient([self._round()], [(self.START + 5_000, 1.0)],
+                            books, {})
+        t = build_trader(client, hybrid_cfg(db_path=self.db), self.db)
+        t._maybe_enter_straddle(4.0, "PAPER")    # 20% = 0.80
+        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+        self.assertAlmostEqual(
+            t._positions[("BTCUSDT", Side.UP)].committed_usdt, 1.0)
+
+    def test_the_straddle_profile_still_refuses_that_balance(self):
+        books = {(1, Side.UP): [(0.35, 10_000)],
+                 (1, Side.DOWN): [(0.70, 10_000)]}
+        client = FakeClient([self._round()], [(self.START + 5_000, 1.0)],
+                            books, {})
+        t = build_trader(client, straddle_cfg(db_path=self.db), self.db)
+        t._maybe_enter_straddle(4.0, "PAPER")
+        self.assertEqual(t._positions, {})
+
+    def test_no_first_leg_without_the_money_for_its_partner(self):
+        # 1.80 x 0.90 = 1.62 free: one leg fits, its partner does not.
+        books = {(1, Side.UP): [(0.35, 10_000)],
+                 (1, Side.DOWN): [(0.70, 10_000)]}
+        client = FakeClient([self._round()], [(self.START + 5_000, 1.0)],
+                            books, {})
+        t = build_trader(client, hybrid_cfg(db_path=self.db), self.db)
+        t._maybe_enter_straddle(1.80, "PAPER")
+        self.assertEqual(t._positions, {})
+
+    def test_a_both_now_pair_scales_its_cheap_leg_up_to_the_minimum(self):
+        # 0.20 / 0.70 sums to 0.90: a lock. At 10.00 each leg is 2.00, and
+        # splitting that 4.00 pair by payout puts UP at 0.89 -- under the
+        # minimum -- so the pair is scaled to 4.50, where UP is 1.00.
+        books = {(1, Side.UP): [(0.20, 10_000)],
+                 (1, Side.DOWN): [(0.70, 10_000)]}
+        client = FakeClient([self._round()], [(self.START + 5_000, 1.0)],
+                            books, {})
+        t = build_trader(client, hybrid_cfg(db_path=self.db), self.db)
+        t._maybe_enter_straddle(10.0, "PAPER")   # 9.00 free
+        self.assertEqual(len(t._positions), 2)
+        up = t._positions[("BTCUSDT", Side.UP)].committed_usdt
+        down = t._positions[("BTCUSDT", Side.DOWN)].committed_usdt
+        self.assertAlmostEqual(min(up, down), 1.0)
+        for side, stake in ((Side.UP, up), (Side.DOWN, down)):
+            price = 0.20 if side is Side.UP else 0.70
+            self.assertGreater(stake / price, up + down)
+
+    def test_a_cheap_completion_floors_to_the_minimum_when_it_still_locks(self):
+        # Leg 1: 1.00 at 0.40. Leg 2 at 0.30: ideal 0.75, floored to 1.00.
+        # Band for 0.40/0.30 is (0.43, 1.50): 1.00 locks, so it is taken.
+        books = {(1, Side.UP): [(0.40, 10_000)],
+                 (1, Side.DOWN): [(0.75, 10_000)]}
+        client = FakeClient([self._round()],
+                            [(self.START + 5_000, 1.0),
+                             (self.START + 200_000, 1.0)], books, {})
+        t = build_trader(client, hybrid_cfg(db_path=self.db), self.db)
+        t._maybe_enter_straddle(4.0, "PAPER")
+        books[(1, Side.UP)] = [(0.75, 10_000)]
+        books[(1, Side.DOWN)] = [(0.30, 10_000)]
+        client.t = 1
+        t._maybe_enter_straddle(4.0, "PAPER")
+        self.assertIn(("BTCUSDT", Side.DOWN), t._positions)
+        self.assertAlmostEqual(
+            t._positions[("BTCUSDT", Side.DOWN)].committed_usdt, 1.0)

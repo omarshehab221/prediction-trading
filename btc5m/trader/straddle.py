@@ -11,7 +11,8 @@ from btc5m.constants import LOG
 from btc5m.domain import Position, Side, Signal, _market_buy
 from btc5m.pnl import straddle_worst_case_pnl
 from btc5m.pricing import breakeven_probability
-from btc5m.sizing import straddle_completion_stake, straddle_split
+from btc5m.sizing import (straddle_completion_band,
+                          straddle_completion_stake, straddle_split)
 
 from typing import TYPE_CHECKING
 
@@ -131,8 +132,16 @@ class StraddleMixin:
                       self._cfg.straddle_max_leg_price)
         if not 0.0 < price <= ceiling:
             return False
-        stake = min(per_side, self._available(bankroll))
+        free = self._available(bankroll)
+        stake = min(per_side, free)
         if stake < self._cfg.min_stake_usdt:
+            return False
+        if self._cfg.hybrid and free < 2 * self._cfg.min_stake_usdt:
+            # A leg the bankroll cannot complete is a directional bet from
+            # the moment it fills. Hybrid has a buffer layer for those.
+            LOG.debug("%s: %.2f free cannot fund a leg and its partner at "
+                      "the %.2f minimum", raw.slug, free,
+                      self._cfg.min_stake_usdt)
             return False
 
         quote = None
@@ -208,6 +217,16 @@ class StraddleMixin:
             stake, guaranteed = straddle_completion_stake(
                 pos.committed_usdt, pos.signal.fill_price, price,
                 raw.fee_bps, budget)
+            if (self._cfg.hybrid and stake < self._cfg.min_stake_usdt
+                    <= budget):
+                # Floored to the minimum -- and re-tested, because a larger
+                # second leg can overshoot the band's ceiling, and then it is
+                # not a lock but a second directional bet.
+                stake = self._cfg.min_stake_usdt
+                lo, hi = straddle_completion_band(
+                    pos.committed_usdt, pos.signal.fill_price, price,
+                    raw.fee_bps)
+                guaranteed = lo < stake < hi
             past_deadline = seconds_left <= self._cfg.straddle_hedge_deadline_s
 
             if guaranteed:
@@ -363,6 +382,14 @@ class StraddleMixin:
 
         available = self._available(bankroll)
         per_side = bankroll * self._cfg.straddle_stake_pct
+        if self._cfg.hybrid and per_side < self._cfg.min_stake_usdt:
+            # Floored, not refused: see the hybrid profile. The warning below
+            # can then only fire for the plain straddle profile.
+            LOG.debug("Straddle leg %.2f (%.0f%% of %.2f) floored to the "
+                      "%.2f minimum", per_side,
+                      self._cfg.straddle_stake_pct * 100, bankroll,
+                      self._cfg.min_stake_usdt)
+            per_side = self._cfg.min_stake_usdt
         # Two different conditions, and conflating them is what hid the
         # original bug. Sizing below the venue minimum is a configuration
         # fault that will never clear on its own, so it is loud. Capital
@@ -433,6 +460,21 @@ class StraddleMixin:
             stakes = dict(zip((Side.UP, Side.DOWN),
                               straddle_split(total, legs[Side.UP],
                                              legs[Side.DOWN], raw.fee_bps)))
+            if self._cfg.hybrid:
+                cheap = min(stakes.values())
+                if 0 < cheap < self._cfg.min_stake_usdt:
+                    # The payout weighting put the cheap leg under the
+                    # minimum. Scale the pair, not the leg -- scaling one leg
+                    # breaks the equal payouts the split exists for. A pair
+                    # the free balance cannot scale stays as it was, and the
+                    # payout check refuses it for the leg under the minimum.
+                    scaled = total * self._cfg.min_stake_usdt / cheap
+                    if scaled <= free:
+                        total = scaled
+                        stakes = dict(zip((Side.UP, Side.DOWN),
+                                          straddle_split(total, legs[Side.UP],
+                                                         legs[Side.DOWN],
+                                                         raw.fee_bps)))
             ok, worst, reason = self._straddle_payouts_clear(
                 raw, legs, stakes, total)
             if not ok:

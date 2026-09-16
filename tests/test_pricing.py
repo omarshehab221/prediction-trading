@@ -768,3 +768,13 @@ class TestHybridStakeFloor(unittest.TestCase):
         c = hybrid_cfg()
         boosted = m.boosted_stake(1.0, 3.0, 0.72, 0.65, c, 0)
         self.assertGreaterEqual(boosted, 1.0)
+
+
+class TestStraddleCompletionBand(unittest.TestCase):
+
+    def test_the_band_is_what_the_stake_function_tests_against(self):
+        lo, hi = m.straddle_completion_band(1.0, 0.40, 0.45, 0)
+        stake, guaranteed = m.straddle_completion_stake(1.0, 0.40, 0.45, 0,
+                                                        10.0)
+        self.assertEqual(guaranteed, lo < stake < hi)
+        self.assertAlmostEqual(hi, 1.0 * 0.60 / 0.40)

@@ -221,6 +221,25 @@ def straddle_split(total: float, price_up: float, price_down: float,
     return total * be_up / weight, total * be_down / weight
 
 
+def straddle_completion_band(stake_open: float, price_open: float,
+                             price_other: float,
+                             fee_bps: int) -> tuple[float, float]:
+    """
+    (floor, ceiling): a second-leg stake strictly between them locks the round.
+
+    Below the floor the other leg's payout cannot cover the pair; above the
+    ceiling the open leg's cannot. Strict at both ends, because at either
+    edge a payout merely equals what the round cost. See
+    straddle_completion_stake for the derivation.
+    """
+    be_open = breakeven_probability(price_open, fee_bps)
+    be_other = breakeven_probability(price_other, fee_bps)
+    floor = (math.inf if be_other >= 1.0
+             else stake_open * be_other / (1.0 - be_other))
+    ceiling = stake_open * (1.0 - be_open) / be_open
+    return floor, ceiling
+
+
 def straddle_completion_stake(stake_open: float, price_open: float,
                               price_other: float, fee_bps: int,
                               budget: float) -> tuple[float, bool]:
@@ -262,9 +281,6 @@ def straddle_completion_stake(stake_open: float, price_open: float,
 
     ideal = stake_open * be_other / be_open
     stake = min(ideal, budget)
-    # Strict bounds: at either edge a payout merely equals what the round
-    # cost, which is capital at risk for nothing.
-    floor = (math.inf if be_other >= 1.0
-             else stake_open * be_other / (1.0 - be_other))
-    ceiling = stake_open * (1.0 - be_open) / be_open
+    floor, ceiling = straddle_completion_band(stake_open, price_open,
+                                              price_other, fee_bps)
     return stake, floor < stake < ceiling

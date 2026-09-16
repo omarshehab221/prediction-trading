@@ -130,6 +130,7 @@ from btc5m.sizing import (
     kelly_multiple,
     kelly_stake,
     max_topup_within_blend,
+    straddle_completion_band,
     straddle_completion_stake,
     straddle_split,
     walk_book,
