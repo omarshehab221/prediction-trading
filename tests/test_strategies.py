@@ -549,14 +549,16 @@ class TestStraddleEntry(unittest.TestCase):
         # Net vs the 100.0 start: +180 - 20 = +160.0.
         self.assertAlmostEqual(t._paper_bankroll, 260.0, places=9)
 
-    def test_the_opening_window_is_the_first_minute(self):
+    def test_the_opening_window_is_the_first_two_minutes(self):
         """
-        A first leg opened at t=240 of a 300s round has 60 seconds to find
-        its hedge, and usually does not. The window buys RUNWAY, not
-        cheapness: open early and the rest of the round is completion time.
+        The window is a straight trade between a cheaper entry and a likelier
+        hedge. A leg opened at t=240 of a 300s round has 60 seconds to find
+        its other half and usually does not; one opened at t=10 can only be
+        bought near 0.50, because at round open spot IS the strike. 120
+        splits the round roughly evenly.
         """
         c = straddle_cfg()
-        self.assertEqual(c.straddle_entry_window_s, 60.0)
+        self.assertEqual(c.straddle_entry_window_s, 120.0)
         self.assertEqual(m.Config.straddle_entry_window_s, 60.0)
 
     def test_the_profile_holds_out_for_a_four_times_payout(self):
@@ -610,14 +612,22 @@ class TestStraddleEntry(unittest.TestCase):
 
         self.assertEqual(t._positions, {})
 
-    def test_a_round_already_a_minute_old_is_left_alone(self):
+    def test_the_profiles_own_window_refuses_a_cheap_side_after_it(self):
+        """
+        150s in: the 0.15 on UP is exactly the cheap side this profile wants,
+        and it is refused anyway. What is left of the round is completion
+        time, and a leg opened into it has too little of that left.
+
+        The window here is the profile's own 120s, not one passed in -- which
+        is what separates this from the test below.
+        """
         start = 1_700_000_000_000
         rnd = make_round(strike=100_000.0, start_ms=start,
                          end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),
                          fee_bps=0)
         books = {(1, Side.UP): [(0.15, 10_000)],
                  (1, Side.DOWN): [(0.88, 10_000)]}
-        client = FakeClient([rnd], [(start + 90_000, 100_000.0)], books, {})
+        client = FakeClient([rnd], [(start + 150_000, 100_000.0)], books, {})
         t = self._trader(client)
 
         t._maybe_enter(100.0, "PAPER")
@@ -2147,7 +2157,8 @@ class TestHybridEntry(unittest.TestCase):
                          end_ms=start + m.DEFAULT_ROUND_SECONDS * 1000)
         books = {(1, Side.UP): [(0.70, 10_000)],
                  (1, Side.DOWN): [(0.70, 10_000)]}
-        client = FakeClient([rnd], [(start + 90_000, 100_000.0)], books, {})
+        # Past straddle_entry_window_s, which this profile puts at 120s.
+        client = FakeClient([rnd], [(start + 150_000, 100_000.0)], books, {})
         t = build_trader(client, straddle_cfg(db_path=self.db), self.db)
         t._maybe_enter_straddle(100.0, "PAPER")
         self.assertIn(1, t._seen)

@@ -369,9 +369,10 @@ class StraddleMixin:
             worth buying, where "worth" means as good as the price the open
             leg itself got. That is the path this profile actually trades.
 
-        Opening is confined to straddle_entry_window_s -- the first minute,
-        so the rest of the round is completion time. Completing is not, and
-        runs until straddle_hedge_deadline_s before settlement.
+        Opening is confined to straddle_entry_window_s -- the opening
+        stretch of the round, so the rest of it is completion time.
+        Completing is not, and runs until straddle_hedge_deadline_s before
+        settlement.
 
         Legs are separate MARKET FOK orders -- this venue has no limit order
         type -- so in live mode every leg is quoted and re-tested against the

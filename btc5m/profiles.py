@@ -347,28 +347,37 @@ PROFILES: dict[str, dict] = {
     # bankroll produced a per-leg stake under min_stake_usdt and the profile
     # silently never traded.
     "straddle": {"straddle": True, "straddle_stake_pct": 0.20,
-                 # The first minute, and then four minutes to hedge in.
-                 # Opening late is what strands legs.
-                 "straddle_entry_window_s": 60.0,
+                 # The first two minutes, and then three to hedge in.
+                 #
+                 # The window is a straight trade between the two things a
+                 # straddle needs, and it is worth naming which end each
+                 # second comes from. Spend it opening and the entry can be
+                 # cheaper, because a side only drifts toward 0.25 once spot
+                 # has left the strike, and that takes minutes. Spend it
+                 # completing and the leg is likelier to find its other half
+                 # before the hedge deadline. 120 of a 300s round splits it
+                 # roughly evenly and still leaves three minutes of runway --
+                 # far more than the straddle_hedge_deadline_s floor needs.
+                 "straddle_entry_window_s": 120.0,
                  # 0.25 -- a 4x payout -- rather than the 0.40 default.
                  #
                  # Read this together with the window above, because the two
-                 # pull against each other. A minute into a round spot has
-                 # barely left the strike and both sides still price near
-                 # 0.50, so the cheaper the ceiling the fewer rounds can open
-                 # at all; 0.40 was chosen as the price an early book
-                 # actually offers. 0.25 asks the first minute for a price
-                 # the first minute does not usually show, and the failure
-                 # mode is not a bad fill -- it is silence. A profile that
-                 # opens nothing looks identical to a broken feed.
+                 # are one decision. At round open spot IS the strike, both
+                 # sides price near 0.50, and no ceiling this side of 0.50
+                 # can be met; a side reaches 0.25 only after spot has moved
+                 # well away, which is a matter of minutes. So a cheap
+                 # ceiling needs a long window to be reachable at all, and
+                 # the failure mode when it is not reachable is not a bad
+                 # fill -- it is silence. A profile that opens nothing looks
+                 # identical to a broken feed.
                  #
-                 # It is set here deliberately anyway. What a leg costs is
-                 # what the round can pay, and the second leg is measured
-                 # against whatever the first one filled at, so a cheap
-                 # opener is worth more than a frequent one. The "no trade in
-                 # N rounds" summary is the instrument that says whether this
-                 # is patience or paralysis -- watch it, and raise this back
-                 # toward 0.40 if the answer is paralysis.
+                 # 0.25 is worth that patience. What a leg costs is what the
+                 # round can pay, and the second leg is measured against
+                 # whatever the first one filled at, so a cheap opener is
+                 # worth more than a frequent one. The "no trade in N rounds"
+                 # summary is the instrument that says whether this is
+                 # patience or paralysis -- watch it, and raise this toward
+                 # 0.40 if the answer is paralysis.
                  "straddle_first_leg_max_price": 0.25,
                  # No side is ever picked by price here, so these bands are
                  # left at their widest legal setting rather than inherited
