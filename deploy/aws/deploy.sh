@@ -61,6 +61,19 @@ case "$PROFILE" in
   scalp|straddle|last_minute|model|buffer|hybrid) ;;
   *) echo "FATAL: unknown PROFILE '$PROFILE'" >&2; exit 1 ;;
 esac
+# How many tasks the service should run when this finishes. 1 starts trading
+# as soon as the rollout lands; 0 builds the image, registers the task
+# definition and points the service at it WITHOUT starting anything, so the
+# run is a preparation and the decision to trade stays a separate, deliberate
+# `aws ecs update-service --desired-count 1`.
+#
+# Only ever 0 or 1. See note 1: two tasks trade the same account twice.
+DESIRED_COUNT="${DESIRED_COUNT:-1}"
+case "$DESIRED_COUNT" in
+  0|1) ;;
+  *) echo "FATAL: DESIRED_COUNT must be 0 or 1, got '$DESIRED_COUNT'" >&2
+     exit 1 ;;
+esac
 
 export AWS_DEFAULT_REGION="$REGION"
 
@@ -317,21 +330,33 @@ DEPLOY_CFG="maximumPercent=100,minimumHealthyPercent=0,deploymentCircuitBreaker=
 if [ "$(aws ecs describe-services --cluster "$CLUSTER" --services "$APP" \
         --query 'services[0].status' --output text)" = "ACTIVE" ]; then
   aws ecs update-service --cluster "$CLUSTER" --service "$APP" \
-    --task-definition "$TASK_DEF_ARN" --desired-count 1 \
+    --task-definition "$TASK_DEF_ARN" --desired-count "$DESIRED_COUNT" \
     --network-configuration "$NETWORK" --deployment-configuration "$DEPLOY_CFG" \
     --enable-execute-command >/dev/null
   echo "service updated"
 else
   aws ecs create-service --cluster "$CLUSTER" --service-name "$APP" \
-    --task-definition "$TASK_DEF_ARN" --desired-count 1 \
+    --task-definition "$TASK_DEF_ARN" --desired-count "$DESIRED_COUNT" \
     --launch-type FARGATE --platform-version LATEST \
     --network-configuration "$NETWORK" --deployment-configuration "$DEPLOY_CFG" \
     --enable-execute-command --propagate-tags SERVICE >/dev/null
   echo "service created"
 fi
 
-cat <<EOF
+if [ "$DESIRED_COUNT" = "0" ]; then
+  cat <<EOF
+
+PREPARED $TAG -- nothing is running.
+The service points at the new task definition with desired-count 0. Start it:
+  MSYS_NO_PATHCONV=1 aws ecs update-service --cluster $CLUSTER \
+    --service $APP --desired-count 1 --region $REGION
+Then follow boot, verify and preflight with:
+  MSYS_NO_PATHCONV=1 aws logs tail $LOG_GROUP --follow --region $REGION
+EOF
+else
+  cat <<EOF
 
 Deploying $TAG. Follow boot, verify and preflight with:
   MSYS_NO_PATHCONV=1 aws logs tail $LOG_GROUP --follow --region $REGION
 EOF
+fi
