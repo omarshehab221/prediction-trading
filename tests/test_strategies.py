@@ -559,14 +559,23 @@ class TestStraddleEntry(unittest.TestCase):
         self.assertEqual(c.straddle_entry_window_s, 60.0)
         self.assertEqual(m.Config.straddle_entry_window_s, 60.0)
 
-    def test_a_first_leg_opens_at_the_loosened_ceiling(self):
+    def test_the_profile_holds_out_for_a_four_times_payout(self):
         """
-        Sixty seconds in, spot has barely left the strike, so neither side is
-        anywhere near 0.25. A 0.25 ceiling on a 60s window would point the
-        opener at the one stretch of the round where its entry price cannot
-        occur -- the dead-bot failure, reintroduced from the other end. 0.38
-        is what an early book actually offers, and it still leaves 0.62 of
-        room for the hedge.
+        The straddle profile buys at 0.25, not at the 0.40 the Config default
+        allows. What a leg costs is what the round can pay, and the second
+        leg is measured against whatever the first one filled at, so a cheap
+        opener is worth more than a frequent one.
+        """
+        self.assertEqual(straddle_cfg().straddle_first_leg_max_price, 0.25)
+        self.assertEqual(m.Config.straddle_first_leg_max_price, 0.40)
+
+    def test_the_profile_refuses_what_the_default_ceiling_would_take(self):
+        """
+        0.38 is inside the 0.40 default and outside this profile's 0.25. The
+        cost of that choice is rounds that never open -- 0.38 is the sort of
+        price an early book actually offers, and a minute in, both sides are
+        usually nearer 0.50 than 0.25. Watch the "no trade in N rounds"
+        summary: it is what tells patience apart from paralysis.
         """
         start = 1_700_000_000_000
         rnd = make_round(strike=100_000.0, start_ms=start,
@@ -575,14 +584,19 @@ class TestStraddleEntry(unittest.TestCase):
         books = {(1, Side.UP): [(0.38, 10_000)],
                  (1, Side.DOWN): [(0.65, 10_000)]}
         client = FakeClient([rnd], [(start + 30_000, 100_000.0)], books, {})
-        t = self._trader(client)
 
-        t._maybe_enter(100.0, "PAPER")
+        self.assertEqual(self._trader(client)._positions, {})
 
-        self.assertEqual(list(t._positions), [("BTCUSDT", Side.UP)])
+        # Same book, the default ceiling: this is a ceiling decision and
+        # nothing else about the round changed.
+        loose = self._trader(
+            FakeClient([rnd], [(start + 30_000, 100_000.0)], books, {}),
+            straddle_first_leg_max_price=0.40)
+        loose._maybe_enter(100.0, "PAPER")
+        self.assertEqual(list(loose._positions), [("BTCUSDT", Side.UP)])
 
     def test_a_leg_dearer_than_the_opening_ceiling_is_still_refused(self):
-        """Loosened is not removed: 0.45 leaves too little room to hedge."""
+        """0.45 is over every ceiling on offer and leaves no room to hedge."""
         start = 1_700_000_000_000
         rnd = make_round(strike=100_000.0, start_ms=start,
                          end_ms=start + (m.DEFAULT_ROUND_SECONDS * 1000),

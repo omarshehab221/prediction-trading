@@ -56,7 +56,7 @@ DB_PATH="${DB_PATH:-/var/data/$DEFAULT_DB}"
 # The strategy the bot runs. Only used when the config file is first written
 # -- entrypoint.sh keeps an existing one -- so switching profiles means
 # regenerating /var/data/config.json as well as setting this.
-PROFILE="${PROFILE:-scalp}"
+PROFILE="${PROFILE:-straddle}"
 case "$PROFILE" in
   scalp|straddle|last_minute|model|buffer|hybrid) ;;
   *) echo "FATAL: unknown PROFILE '$PROFILE'" >&2; exit 1 ;;

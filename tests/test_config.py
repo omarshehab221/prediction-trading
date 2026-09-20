@@ -178,7 +178,7 @@ class TestProfileDefaults(unittest.TestCase):
                          m.DEFAULT_PROFILE)
 
     def test_default_profile_is_the_scalp_one(self):
-        self.assertEqual(m.DEFAULT_PROFILE, "scalp")
+        self.assertEqual(m.DEFAULT_PROFILE, "straddle")
 
     def test_default_profile_exists(self):
         self.assertIn(m.DEFAULT_PROFILE, m.PROFILES)

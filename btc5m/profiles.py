@@ -348,10 +348,28 @@ PROFILES: dict[str, dict] = {
     # silently never traded.
     "straddle": {"straddle": True, "straddle_stake_pct": 0.20,
                  # The first minute, and then four minutes to hedge in.
-                 # Opening late is what strands legs; opening early is only
-                 # possible at a price the early book offers, which is why
-                 # this moves together with straddle_first_leg_max_price.
+                 # Opening late is what strands legs.
                  "straddle_entry_window_s": 60.0,
+                 # 0.25 -- a 4x payout -- rather than the 0.40 default.
+                 #
+                 # Read this together with the window above, because the two
+                 # pull against each other. A minute into a round spot has
+                 # barely left the strike and both sides still price near
+                 # 0.50, so the cheaper the ceiling the fewer rounds can open
+                 # at all; 0.40 was chosen as the price an early book
+                 # actually offers. 0.25 asks the first minute for a price
+                 # the first minute does not usually show, and the failure
+                 # mode is not a bad fill -- it is silence. A profile that
+                 # opens nothing looks identical to a broken feed.
+                 #
+                 # It is set here deliberately anyway. What a leg costs is
+                 # what the round can pay, and the second leg is measured
+                 # against whatever the first one filled at, so a cheap
+                 # opener is worth more than a frequent one. The "no trade in
+                 # N rounds" summary is the instrument that says whether this
+                 # is patience or paralysis -- watch it, and raise this back
+                 # toward 0.40 if the answer is paralysis.
+                 "straddle_first_leg_max_price": 0.25,
                  # No side is ever picked by price here, so these bands are
                  # left at their widest legal setting rather than inherited
                  # from another profile -- nothing below should silently
@@ -575,4 +593,11 @@ PROFILES: dict[str, dict] = {
 # The default strategy, declared once. Previously six literals across four
 # files each carried their own copy of this, which is precisely how a default
 # drifts: change five and the sixth silently disagrees.
-DEFAULT_PROFILE = "scalp"
+#
+# Straddle, because it is the only profile here that does not need the model
+# to be right. Every other one buys a side and is correct or is not; this one
+# buys both and is paid by the SPREAD between what the two legs cost, so a
+# completed round is a profit no matter which way BTC went. That makes it the
+# safe thing to be running when nobody is watching, which is exactly what a
+# default is for.
+DEFAULT_PROFILE = "straddle"

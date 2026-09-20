@@ -228,9 +228,9 @@ the model; `straddle`, `scalp` and `lastminute` do not consult it at all.
 | `micro` | 0.35–0.75 | 20% | — | 200–25s | $7 |
 | `balanced` | 0.10–0.90 | 5% | — | 150–25s | $100 |
 | `convex` | 0.05–0.35 | 2% | — | 280–30s | $100 |
-| `straddle` | both sides | 20% per leg | — | 60s from open | $100 |
+| `straddle` *(default)* | both sides, first leg ≤0.25 | 20% per leg | — | 60s from open | $100 |
 | `scalp` | 0.15–0.85 | 5% per round trip | — | 300–75s, flat at 60s | $100 |
-| `lastminute` *(default)* | any | 10% per round | — | 60–5s | $100 |
+| `lastminute` | any | 10% per round | — | 60–5s | $100 |
 | `hybrid` | straddle, else 0.55–0.80 | 20% per leg / 10%, floored at $1 | ≥0.75σ | 60s from open, then 240–30s | $10 |
 
 **`buffer`** encodes "wait for a buffer to open, back the side it favours,
@@ -252,7 +252,19 @@ not chosen.
 
 **`straddle`** buys *both* sides of a round, at two different moments, and only
 when the pair's worst case still pays back more than it cost. No side is ever
-picked, so direction stops mattering.
+picked, so direction stops mattering. It is the default because it is the only
+profile here that does not need the model to be right: a completed round is
+paid by the spread between what the two legs cost, whichever way BTC went.
+
+The first leg opens inside the first 60 s and will not pay more than **0.25**
+— a 4x payout. That ceiling is the profile's main tension: a minute into a
+round spot has barely left the strike, both sides still price near 0.50, and
+the cheaper the ceiling the fewer rounds can open at all. The failure mode is
+not a bad fill, it is silence, and a profile that opens nothing looks exactly
+like a broken feed. `Config.straddle_first_leg_max_price` defaults to 0.40 for
+that reason; this profile overrides it down. Watch the "no trade in N rounds"
+summary — it is what tells patience apart from paralysis — and raise it back
+toward 0.40 if the answer is paralysis.
 
 **`scalp`** follows the perpetual future instead of the model, and trades the
 token's price over a few seconds rather than the round's outcome: many small
